@@ -132,7 +132,7 @@ def main():
                     else:
                         print(f'ok   {mode:18s} {s:>4}x  step {mx:.3f}')
     if not FACE.exists():
-        print('note: tests/miya_face.webp missing -- face sweep skipped '
+        print('note: tests/miya_face32x11.webp missing -- face sweep skipped '
               '(tests/make_miya_fixtures.py with the miya asset present)')
     print('PASS' if not fails else f'{fails} FAILURES')
     return 1 if fails else 0
