@@ -41,6 +41,53 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
+## v4.6: deblur gate is sigma-aware -- wide intentional blur really unblurs
+
+Report: `-m autodeblur -k bspline -c exp -r 3 -s 100 -A 10 -g 8 -D push`
+(blur intentionally wide to erase pixel stepladders, deblur supposed to
+restore the edges) produced the blurred base unchanged. Diagnosis, two
+stacked causes:
+
+- **gate blindness**: the v4.3 edge gate (|grad| / window-range over
+  [.08,.18], window 1.25 src px) classifies transitions by implied
+  width; ramps from a sigma=3 fit are ~2.5*3 = 7.5 src px wide, i.e.
+  ordered-of-magnitude past the gate -- every blurred edge was
+  misread as "smooth shading" and left alone even at k=8.
+- **inertia on linear ramps**: even with the gate open, the remap is
+  inert where u == .5, which holds everywhere on a *linear* gradient
+  (safety property by construction); wide gaussian ramps need the
+  spatial redistribution of the push method plus a working gate.
+
+Fix, active only when the blur is actually wide (`scale*max(1,sigma) > 4`):
+
+- analysis window widens with the fitted sigma (cap 64 px);
+- the gate compares implied ramp width against the full width of a
+  gaussian ramp of the fitted sigma (2.5*sigma*scale px), so a blurred
+  step is an edge at ANY blur level while unbounded shading still falls
+  outside the gate;
+- push displacement is capped to the window (at -g 8, sigma 3 the
+  22 px displacement overshot the R=15 window and the range clamp
+  quantised everything to the window extremes).
+
+Measured on the reported command (miya_face, 4x, sigma 3, -g 8): strong-edge
+mean slope x0.99 (v4.5) -> x1.44 (v4.6 push) / x1.88 (v4.6 remap); max
+slope unchanged (no new extrema: no halos, by the same range-clamp
+argument as v4.3). Visually: hair/skin boundary, bang tips, beauty mark,
+eyebrow go from ~10px gradient to defined edges, zero fringe.
+
+Invariant: whenever `scale*max(1,sigma) <= 4` the v4.3 formulas evaluate
+bit-exactly, so default 2x..4x autodeblur, the tuned miya/badge looks,
+and all v4.4/v4.5 comparisons are byte-identical (verified); torture HG
+metrics unchanged (diag .00142). The wide branch also repairs high
+scales: at 8x+ the old fixed-px gate mapped to <1 src px and the
+steepening was nearly shut there too.
+
+Recipe (blur-wide-then-unblur, e.g. sawtooth-y sources):
+
+```sh
+./celup_lab in.webp out.webp 4 -m autodeblur -k bspline -c exp -r 3 -g 8 -D remap
+```
+
 ## v4.5: every automatic parameter is manually pinnable; complete --help
 
 "Can these params be set manually? In help there is no list of all

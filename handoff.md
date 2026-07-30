@@ -1,5 +1,50 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.6 update (2026-07-31): sigma-aware deblur gate (wide-blur unblur fixed)
+
+User report with exact command:
+`miya_facehalf.webp -> 4, --mode autodeblur --max-mib 2048 -D push -c exp
+-k bspline -r 3 -s 100 -A 10 -g 8` -- "blur is intentionally wide to
+remove pixel stepladders, supposed to be unblurred but no."
+
+Forensics (v4.5 binary): on the sigma=3 base the deblur differed on only
+4.7% of pixels, strong-edge slope x0.99 -- inert despite k=8. Causes:
+
+1. Gate blindness. The v4.3 gate (rel = |grad|/range over a 1.25-src-px
+   window, smoothstep [.08,.18]) opens only for implied ramp widths
+   1/(2*rel) in ~[2.8, 6.25] output px. sigma=3 ramps are ~30 output px
+   wide (measured median implied width 19.9 px on miya lineart) -> gate
+   w p50 = 0.0 -- intentionally blurred edges are classified as smooth
+   shading at any k. Same bug hits high scales at default sigma: the
+   fixed-px gate equals <1 src px at 8x+, steepening nearly shut.
+2. Push quantisation in the wide regime: (u-.5)(k-1)*1.6*scale = 22.4 px
+   at k=8/4x overshoots the R=15 window, so the range clamp collapsed
+   samples to window extremes.
+
+Fix (v4.6): when scale*max(1,fitted_sigma) > 4 the pass switches to a
+sigma-aware branch: window widens with sigma (cap 64), gate compares
+implied ramp width range/(2|grad|) against the fitted gaussian ramp
+width (open <= .53*2.5*sigma*scale, closed >= 1.05x that), push
+displacement is capped to +/-R. At scale*sigma <= 4 the v4.3 formulas
+run bit-exactly -- default 2x..4x outputs, the tuned miya/badge looks,
+-adaptive/-sdf/-autoblur paths all byte-identical (verified on an
+8-combination matrix incl. -e 1.5, -D push -g 6 pins).
+
+Verification of the reported case (miya_face 320x300, 4x, sigma 3, -g 8,
+-c exp -k bspline): strong-edge mean slope x0.99 (v4.5) -> x1.44 (push)
+and x1.88 (remap); max slope unchanged (no new extrema -> no halos, same
+range-clamp argument as v4.3); 1:1/2x-nearest crops show hair boundary,
+bang tips, beauty mark, eyebrow going from ~10 px gradients to defined
+edges with zero fringing (docs/review_v46_wide_gate.png, gitignored).
+tests/test_scales.py full sweep PASS; hourglass_metric autodeblur rows
+unchanged at torture scale (diag HG .00142, checker .00589, corner
+.00244 = v4.4 numbers).
+
+Caveat: in the wide regime the gate opens on any bounded-width
+transition, including soft shading feet (blush shoulders): at -g 8 those
+may reshape slightly -- inherent to "unblur everything this wide";
+lower -g or smaller -r narrows the reach.
+
 # v4.5 update (2026-07-31): manual pins for every auto parameter; complete help
 
 User question: "can these params be set manually? in help there is no

@@ -2343,16 +2343,32 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
       gnx[(size_t)y * dw + x] = gx * inv;
       gny[(size_t)y * dw + x] = gy * inv;
     }
-  int R = clampi((int)(1.25f * scale + .5f), 2, 12);
-  /* Steepness priority: explicit --deblur-steepness pins k exactly;
-     otherwise the -s formula (k = 1 + .25*(s-1), clamped to 3), unless
-     --edge-goal adapts k per edge below. */
   float kfix = deblur_steepness > 0.f
                    ? deblur_steepness
                    : clampf(1.f + .25f * (compress_strength - 1.f), 1.f, 3.f);
   last_deblur_k = deblur_steepness > 0.f   ? deblur_steepness
                   : edge_goal > 0.f        ? 0.f
                                            : kfix;
+  /* Sigma-aware analysis (v4.6).  -r/-e can push the fitted blur far past
+     1 src px; the v4.3 gate -- gradient relative to a fixed 1.25 src px
+     window, absolute [.08,.18] range -- reads such intentionally wide
+     ramps as "smooth shading" and the steepening silently dies (report:
+     "-r 3 -g 8 does not unblur").  When scale*sigma exceeds the
+     v4.3-calibrated 4 output px: widen the window WITH the fitted sigma
+     (cap 64) and gate on implied ramp width range/(2*|grad|) measured
+     against the full width of a gaussian ramp of the fitted sigma
+     (2.5*sigma*scale px): a blurred step counts as an edge at ANY blur
+     level, while unbounded shading keeps falling outside the gate.
+     Whenever scale*max(1,sigma) <= 4 the original formulas below run
+     bit-exactly as v4.3..v4.5, so default low-scale outputs and the
+     tuned miya/badge looks are unchanged. */
+  float sref = fitted_sigma > 1.f ? fitted_sigma : 1.f;
+  int wide = scale * sref > 4.001f;
+  int R = wide ? clampi((int)(1.25f * scale * sref + .5f), 2, 64)
+               : clampi((int)(1.25f * scale + .5f), 2, 12);
+  float wfull = 2.5f * scale * sref;
+  float wopen = fmaxf(1.f / (2.f * .18f), .53f * wfull);
+  float wclos = fmaxf(1.f / (2.f * .08f), 1.05f * wfull);
   float flatmix = .25f; /* diffusion-noise flattening in gate-zero zones */
   for (int y = 0; y < dh; y++)
     for (int x = 0; x < dw; x++) {
@@ -2379,8 +2395,18 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           cstar = c;
         }
       float rel = gm[(size_t)y * dw + x] / (range + 1e-6f);
-      float w = clampf((rel - .08f) * (1.f / .10f), 0.f, 1.f);
-      w = w * w * (3.f - 2.f * w); /* smoothstep */
+      float w;
+      if (wide) {
+        /* v4.6 wide-blur branch: gate on implied ramp width in output
+           px -- opens on edges up to ~wopen wide, fully closed past
+           wclos (true shading). */
+        float width_px = range / (2.f * gm[(size_t)y * dw + x] + 1e-6f);
+        w = clampf((wclos - width_px) / (wclos - wopen + 1e-6f), 0.f, 1.f);
+        w = w * w * (3.f - 2.f * w);
+      } else {
+        w = clampf((rel - .08f) * (1.f / .10f), 0.f, 1.f);
+        w = w * w * (3.f - 2.f * w); /* smoothstep */
+      }
       float fw = clampf((.025f - range) * (1.f / .017f), 0.f, 1.f);
       fw = fw * fw * (3.f - 2.f * fw) * (1.f - w);
       float o[4];
@@ -2406,6 +2432,12 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
         float rc0 = range, u =
             clampf((o[cstar] - lo[cstar]) / rc0, 0.f, 1.f);
         float off = (u - .5f) * (k - 1.f) * 1.6f * scale;
+        if (wide)
+          /* v4.6: on wide ramps (u-.5)(k-1)*1.6*scale overshoots the
+             analysis window (e.g. 22 px vs R=15 at sigma 3/-g 8), so the
+             range clamp quantised everything to the window extremes.
+             Keep the sample inside the measured support. */
+          off = clampf(off, -(float)R, (float)R);
         float px = (float)x + off * gnx[(size_t)y * dw + x],
               py = (float)y + off * gny[(size_t)y * dw + x], smp[4];
         sample_pm(out, dw, dh, px, py, smp);
@@ -4101,7 +4133,7 @@ static uint8_t *slurp(const char *name, size_t *n) {
 static void print_help(const char *argv0) {
   printf(
       "celup_lab -- premultiplied-linear WebP upscaler (research build "
-      "v4.5)\n"
+      "v4.6)\n"
       "\n"
       "Usage: %s in.webp out.webp SCALE [options]\n"
       "  SCALE is the upsampling factor, real number in (1,32] "
@@ -4185,7 +4217,10 @@ static void print_help(const char *argv0) {
       "  steepness    -s formula, or -e per edge        -g K (exact, 1..8)\n"
       "  Only the unpinned parameters are fitted.  Every effective value is\n"
       "  echoed to stderr, so an automatic run can be reproduced exactly by\n"
-      "  re-running with its reported values pinned.\n"
+      "  re-running with its reported values pinned.  The deblur analysis\n"
+      "  window and edge gate scale with the effective sigma: wide\n"
+      "  intentional blur (-r 2+, or -e escalation) is still unblurred\n"
+      "  instead of being read as smooth shading.\n"
       "\n"
       "Output is always lossless WebP.  Hourglass/speckle suppression in the\n"
       "compress family and adaptive/sdf only acts on directed gradients;\n"
