@@ -41,6 +41,38 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
+## v4.3: autodeblur mode (gradient-slope steepening on the fitted blur base)
+
+Addresses the "AI-upscaled anime-art cleanup" case: diffusion-rendered /
+internally-upscaled art arrives with mushy 1-2px AA, salt noise in flats
+and lossy block boundaries; the goal is to clean AND upscale with zero new
+artifacts. `-m autodeblur` renders the fitted autoblur base (which the
+user judges better than triangle on anime for consistency/detail), then
+steepens transitions directly in gradient space as requested:
+
+- per pixel, over a ~1.25 src px window: robust per-channel range
+  [lo,hi], normalised u, slope remap u' = .5 + (u-.5)*k with k from
+  `--strength` (k = 1 + .25*(s-1), clamped 3). MONOTONE and
+  range-anchored: halos/ringing/hourglass/quantized new colours are
+  structurally impossible.
+- blend weight = smoothstep of |grad|/local-range over [.08,.18]: real
+  edges get the full steepening, smooth shading/blush (low relative
+  slope) is never touched (no posterization, unlike shock filters or
+  Krita's unblur brush),
+- true flat/near-flat windows are instead pulled toward their local mean
+  (flat-flatten), mopping up diffusion salt without staining edge
+  surrounds (range-gated; v1 of the pass painted edge halos, fixed),
+- premultiplied invariant rgb <= alpha restored per pixel.
+
+References implemented/considered: Anime4K's iterative gradient-ascent
+push (heightmap gradient maximization without overshoot/ringing),
+Osher-Rudin shock filters (staircase-prone; avoided the sign-hard
+update), anime-encoder descaling (fit-the-blur then render -- the
+autoblur base IS the fitted descale). MAE == autoblur to 1e-4 (sharpened
+variant trades nothing measurable), HG == autoblur except edges
+(diag HG .00142 vs sdf .00529), all 192 scale-sweep tests pass
+(1.5x..24x incl. the miya face strip).
+
 ## v4.2: gradient-only suppression, sdf halo guard, alpha cleanup, CLI
 
 - **Hourglass/speckle suppression only touches directed gradients, never
@@ -103,6 +135,12 @@ Run `./celup_lab --help` for the full grouped help with short-flag aliases
   resolution (v3 blurred the source grid, which degenerated to blocky cells
   and staircase tracking at large scales), so 8x upscales are smooth: no
   mosaic ("blurry pixels"), no sawtooth on wandering lines.
+- **autodeblur** (v4.3) is the anime/AI-art default: autoblur's fitted
+  clean base + gradient-slope steepening with a monotone, range-anchored
+  remap (zero new artifacts by construction) and flat-zone salt
+  flattening. Crisper than autoblur, safer than every sharpening mode;
+  tune edge steepness with `-s` (2 subtle, 6 assertive, 10+ approaches
+  posterization). See the v4.3 section for the mechanics and references.
 - **sdf** (v4.1) is the smooth-geometry sharp option. Every confident
   coherent-edge pixel's fitted t-plane is a *signed-distance plane*
   (sub-pixel, oriented); the mode kernel-averages all candidate planes into

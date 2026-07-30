@@ -1,8 +1,8 @@
-celup_lab.c                  v4.2 C source: gradient-only suppression gates, sdf halo
-                             guard, alpha-garbage cleanup, short-flag CLI; plane-field
-                             sdf + speckle suppression + autoblur renderer + v3/v2/v1
-README_lab.md                Mode usage notes, v4.2 recommendations, options/help
-handoff.md                   v4.2/v4.1/v4/v3/v2 updates (what changed + measurements) + v1 history
+celup_lab.c                  v4.3 C source: autodeblur (gradient-slope steepening on
+                             fitted autoblur base), gradient-only suppression gates,
+                             sdf halo guard, alpha cleanup, short-flag CLI, v4/v3/v2/v1
+README_lab.md                Mode usage notes, v4.3 recommendations, options/help
+handoff.md                   v4.3..v2 updates (what changed + measurements) + v1 history
 evaluate_upscalers.py        Text metric evaluator (MAE, pm-linear)
 hourglass_metric.py          Artifact metric (HG amplitude, CHK) + torture scenes
 make_lab_comparison_sheets.py Sheet generator; checker/crosshatch/rings + classmap + autoblur + sdf
@@ -21,7 +21,7 @@ comparison_sheets/comparison_sheet.png
                              regenerate with make_lab_comparison_sheets.py)
 
 Git: this snapshot is delivered as a git bundle of the whole lab repo
-(celup_lab_v4.2.bundle). Clone it with: git clone celup_lab_v4.2.bundle celup_lab
+(celup_lab_v4.3.bundle). Clone it with: git clone celup_lab_v4.3.bundle celup_lab
 The repo contains code and text only: images, generated sheets, fixtures and
 build outputs are gitignored and reproduced by the scripts above
 (test images: tests/make_test_sources.py; sheets/examples: make_lab_comparison_sheets.py).

@@ -1,5 +1,67 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.3 update (2026-07-30): autodeblur -- gradient-slope steepening for AI-upscaled art
+
+User context: the miya art is diffusion-generated and ALREADY internally
+upscaled by the generator; it arrives with mushy AA, diffusion salt and
+lossy block boundaries that must be CLEANED during upscale. autoblur is
+their favourite base ("better than triangle: consistency + detail
+preserving"); adding artifacts at all is unacceptable; they asked for an
+"autodeblur that doesn't use 5x5 patches, instead analyzes gradients and
+increases their slope, and uses autoblur".
+
+Research (all three line up with that request):
+
+- Anime4K (bloc97, 2019) -- iterative gradient-ascent on the colour
+  heightmap: "push pixels towards probable edges ... maximizing the
+  gradients ... equivalent to minimizing blur, but without overshoot or
+  ringing artifacts commonly found on traditional unblurring and
+  sharpening approaches"; line-detector gating so textures are untouched.
+  https://github.com/bloc97/Anime4K (preprint/results), discussion
+  https://news.ycombinator.com/item?id=20698721
+- Osher-Rudin shock filters -- the classic gradient-slope steepener; the
+  sign-hard update staircases (this is the quantization/region artifacts
+  the user saw in Krita's unblur brush). Adaptive-gradient variants exist
+  to suppress exactly those (J. Visual Comm. 2016).
+- Anime-encoder descaling (guide.encode.moe/encoding/descaling.html) --
+  fit the wrong-kernel upscale, invert to native res, rescale with a sane
+  kernel; validate by re-upscaling and comparing. Our autoblur fit plays
+  the descale-fit role, continuously rather than per-known-kernel.
+
+`--mode autodeblur` design (v4.3): render the autoblur base, then per
+pixel over a ~1.25-src-px window take the robust per-channel range
+[lo,hi], normalise u = (v-lo)/(hi-lo), remap u' = .5+(u-.5)*k
+(k = 1+.25*(s-1), clamp 3, from --strength) and write back inside the
+SAME range. Monotone + range-anchored => halos/ringing/hourglass/new
+colours impossible by construction. Blend weight = smoothstep(|grad|/
+range in [.08,.18]): true edges steepen fully, low-relative-slope shading
+(blush etc.) untouched so it cannot posterize. True flats are instead
+pulled toward the window mean (range gate .008..025 pm) to mop up
+diffusion salt. Premultiplied invariant rgb <= alpha re-asserted per
+pixel (channel-independent remaps briefly broke it near alpha~0; put()
+then quantizes to saturated junk -- 644k such px vs 1.3M in autoblur
+base after the fix, i.e. BELOW the inherent straight-alpha quantization
+floor of this asset).
+
+Bugs caught by the evaluator during development: (1) ungated flat-
+flatten stained a soft halo band around every line where window means
+mix both sides of an edge -- range-gating removed it (diag MAE .01251
+-> .01028 == autoblur); (2) the premultiplied-invariant break above.
+
+Measured: MAE identical to autoblur to 1e-4 on all 9 scenes (sharpness
+is a free addition at these k); HG identical to autoblur except slightly
+higher on sharpened edges, still far under sdf (diag .00142 vs .00529;
+crosshatch .00377 vs .00884; rings/corners similar dark-horse levels).
+Badge rounded-rect inner corner at 8x: sdf-grade smooth rounded corner,
+which was the exact sdf behaviour the user praised. No new artifact
+class observed on miya 3x/10x sweep; 192/192 scale-sweep tests pass.
+
+Verdict-for-user: on this content autodeblur is the default-recommendable
+anime mode; sdf remains the max-precision geometry option; deblurcompress
+remains the raw-detail option (its consistent hourglass texture read
+"somewhat good" to the user -- noted as accepted there).
+
+# v4.2 update (2026-07-30): gradient-only suppression, sdf halo guard, alpha cleanup, CLI
 # v4.2 update (2026-07-30): gradient-only suppression, sdf halo guard, alpha cleanup, CLI
 
 Driven by a new user asset (miya_normal.webp, 768x1376 RGBA chibi art,

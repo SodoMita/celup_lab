@@ -2132,6 +2132,129 @@ static int upscale_autoblur(const uint8_t *in, int sw, int sh, uint8_t *out,
 }
 
 /* ---------------------------------------------------------------------------
+   autodeblur (v4.3): gradient-slope enhancement on the fitted autoblur base.
+
+   Motivation: AI-upscaled / diffusion-rendered art arrives with mushy 1-2px
+   anti-aliasing, salt noise in flats and lossy block boundaries; the user
+   wants those CLEANED while upscaling, with zero added artifacts.  Classic
+   references converge on the same answer:
+   - Anime4K (bloc97 2019) treats colour as a heightmap and iteratively
+     pushes pixels up their gradient ("maximizing the gradients ... without
+     overshoot or ringing artifacts commonly found on traditional
+     unblurring"),
+   - shock filters (Osher-Rudin 1990) steepen sign(L_u)-directed slopes but
+     staircase hard (visible in e.g. Krita's unblur brush),
+   - anime descaling inverts the wrong-kernel upscale to native res and
+     rescales with a sane kernel.
+   This mode combines the useful halves.  Base = autoblur (fits the actual
+   blur the source carries, kills mosquito/block noise consistently).  Then
+   every pixel gets a MONOTONE local slope remap: over a window of ~1.25
+   src px radius, find the robust per-channel range [lo,hi]; normalise the
+   pixel to u in [0,1]; map u' = .5 + (u-.5)*k (k = slope multiplier from
+   --strength), clamped; write back v' = lo + u'(hi-lo).  Being monotone
+   and range-anchored, it CANNOT overshoot: no halos, no ringing, no
+   hourglass, no new colours -- the whole v2-v4.2 artifact class is gone by
+   construction.  The blend weight w rises from 0 to 1 across
+   |grad|/range in [.08,.18], so smooth shading/blush gradients (low
+   relative slope) are untouched (no posterization, unlike shock filters
+   and quantization unblurs) and near-flat zones are instead gently pulled
+   toward their local mean (flat-flatten) to mop up diffusion salt. */
+static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
+                              int dw, int dh) {
+  if (!upscale_autoblur(in, sw, sh, out, dw, dh))
+    return 0;
+  size_t n = (size_t)dw * dh;
+  float *t = malloc(n * sizeof *t), *gm = malloc(n * sizeof *gm);
+  if (!t || !gm) {
+    free(t);
+    free(gm);
+    return 0;
+  }
+  for (int y = 0; y < dh; y++)
+    for (int x = 0; x < dw; x++) {
+      float q[4];
+      raw_pm(out, dw, dh, x, y, q);
+      t[(size_t)y * dw + x] = (q[0] + q[1] + q[2]) * (1.f / 3.f);
+    }
+  /* Sobel gradient magnitude of the luminance proxy (built-in [1,2,1]
+     smoothing in the tangential direction; robust to 1px residue). */
+  for (int y = 0; y < dh; y++)
+    for (int x = 0; x < dw; x++) {
+      int xl = x > 0 ? x - 1 : 0, xr = x + 1 < dw ? x + 1 : dw - 1,
+          yu = y > 0 ? y - 1 : 0, yd = y + 1 < dh ? y + 1 : dh - 1;
+      float gx = t[(size_t)yu * dw + xr] + 2 * t[(size_t)y * dw + xr] +
+                 t[(size_t)yd * dw + xr] - t[(size_t)yu * dw + xl] -
+                 2 * t[(size_t)y * dw + xl] - t[(size_t)yd * dw + xl],
+            gy = t[(size_t)yd * dw + xl] + 2 * t[(size_t)yd * dw + x] +
+                 t[(size_t)yd * dw + xr] - t[(size_t)yu * dw + xl] -
+                 2 * t[(size_t)yu * dw + x] - t[(size_t)yu * dw + xr];
+      gm[(size_t)y * dw + x] = sqrtf(gx * gx + gy * gy) * (1.f / 16.f);
+    }
+  int R = clampi((int)(1.25f * (float)dw / sw + .5f), 2, 12);
+  float k = clampf(1.f + .25f * (compress_strength - 1.f), 1.f, 3.f);
+  float flatmix = .25f; /* diffusion-noise flattening in gate-zero zones */
+  for (int y = 0; y < dh; y++)
+    for (int x = 0; x < dw; x++) {
+      float lo[4] = {1e30f, 1e30f, 1e30f, 1e30f},
+            hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f}, mean[4] = {0, 0, 0, 0};
+      float q[4], cnt = 0.f;
+      for (int j = -R; j <= R; j++)
+        for (int i = -R; i <= R; i++) {
+          raw_pm(out, dw, dh, x + i, y + j, q);
+          cnt += 1.f;
+          for (int c = 0; c < 4; c++) {
+            mean[c] += q[c];
+            if (q[c] < lo[c])
+              lo[c] = q[c];
+            if (q[c] > hi[c])
+              hi[c] = q[c];
+          }
+        }
+      float range = 0.f;
+      for (int c = 0; c < 3; c++)
+        if (hi[c] - lo[c] > range)
+          range = hi[c] - lo[c];
+      float rel = gm[(size_t)y * dw + x] / (range + 1e-6f);
+      float w = clampf((rel - .08f) * (1.f / .10f), 0.f, 1.f);
+      w = w * w * (3.f - 2.f * w); /* smoothstep */
+      /* Flat-flatten must only act in TRUE flats: pulling a near-edge,
+         low-gradient pixel toward a window mean that mixes both sides of
+         the edge stains a soft halo band around every line (MAE and
+         visible).  Gate it by local range: only windows whose whole span
+         is noise-level get the mean pull. */
+      float fw = clampf((.025f - range) * (1.f / .017f), 0.f, 1.f);
+      fw = fw * fw * (3.f - 2.f * fw) * (1.f - w);
+      float o[4];
+      raw_pm(out, dw, dh, x, y, o);
+      float res[4];
+      for (int c = 0; c < 4; c++) {
+        float rc_ = hi[c] - lo[c], v = o[c], nv;
+        if (rc_ > 1e-6f) {
+          float u = clampf((v - lo[c]) / rc_, 0.f, 1.f);
+          u = clampf(.5f + (u - .5f) * k, 0.f, 1.f);
+          nv = lo[c] + u * rc_;
+        } else
+          nv = v;
+        float blended = v + w * (nv - v);
+        blended += fw * flatmix * (mean[c] / cnt - v);
+        res[c] = clampf(blended, 0.f, 1.f);
+      }
+      /* Premultiplied invariant: remapping channels independently can leave
+         rgb > alpha in near-transparent pixels (different local ranges and
+         gates), which put() then unpremultiplies into garbage 255 RGB under
+         alpha ~0.  Convexity of every contributing tap guarantees
+         rgb <= alpha, so restore it explicitly. */
+      for (int c = 0; c < 3; c++)
+        if (res[c] > res[3])
+          res[c] = res[3];
+      put(out + 4 * ((size_t)y * dw + x), res[0], res[1], res[2], res[3]);
+    }
+  free(t);
+  free(gm);
+  return 1;
+}
+
+/* ---------------------------------------------------------------------------
    sdf (v4): signed-distance-field edge reconstruction.
 
    Every confident edge pixel of the class map fits a two-colour patch with a
@@ -3763,6 +3886,10 @@ static void print_help(const char *argv0) {
       "  autoblur      fits the blur the source was probably downsampled\n"
       "                through and renders at target resolution -- smooth,\n"
       "                round contours at high scale, no sawtooth\n"
+      "  autodeblur    autoblur base + gradient-slope steepening: sharp\n"
+      "                edges with no halos/ringing; flats gently cleaned.\n"
+      "                Tune with -s (slope multiplier). Best for\n"
+      "                AI-upscaled/diffusion anime art\n"
       "  triangle      softest, no ringing or halos; safe default for art\n"
       "  sdf           fitted signed-distance contour sharpening on top of\n"
       "                adaptive; crispest edges, tune with -s\n"
@@ -3772,6 +3899,8 @@ static void print_help(const char *argv0) {
       "  compress safecompress blurcompress safeblurcompress edgecompress\n"
       "  deblurcompress dehourglass consistentcompress hourglasscompress\n"
       "  scale2x classmap(diagnostic class-map dump)\n"
+      "  (autodeblur lives in Recommended above; it reuses the -k/-c/-p\n"
+      "  autoblur fit options plus -s for steepness)\n"
       "\n"
       "Options:\n"
       "  -m, --mode MODE           reconstruction mode (default: cubic)\n"
@@ -3951,7 +4080,8 @@ int main(int ac, char **av) {
       strcmp(mode, "consistentcompress") && strcmp(mode, "hourglasscompress") &&
       strcmp(mode, "triangle") && strcmp(mode, "adaptive") &&
       strcmp(mode, "classmap") && strcmp(mode, "scale2x") &&
-      strcmp(mode, "autoblur") && strcmp(mode, "sdf")) {
+      strcmp(mode, "autoblur") && strcmp(mode, "sdf") &&
+      strcmp(mode, "autodeblur")) {
     fprintf(stderr, "Unknown mode: %s\n", mode);
     return 2;
   }
@@ -4005,13 +4135,16 @@ int main(int ac, char **av) {
     int classified = iterative || !strcmp(mode, "classmap") ||
                      !strcmp(mode, "sdf");
     double in_bytes =
-        (double)w * h * (classified ? 96.0 : !strcmp(mode, "autoblur") ? 24.0
+        (double)w * h * (classified ? 96.0 : (!strcmp(mode, "autoblur") ||
+                                        !strcmp(mode, "autodeblur")) ? 24.0
                                                                       : 4.0);
     double out_bytes =
         (double)ow * oh * (iterative          ? 36.0
                            : !strcmp(mode, "sdf") ? 36.0 + 40.0 /* adaptive +
                                                        SDF delta/blur buffers */
                            : !strcmp(mode, "autoblur") ? 8.0
+                           : !strcmp(mode, "autodeblur")
+                               ? 8.0 + 12.0 /* remap fields */
                                                        : 4.0);
     double estimated =
         (in_bytes + out_bytes + 32.0 * 1024 * 1024) / (1024.0 * 1024.0);
@@ -4080,6 +4213,8 @@ int main(int ac, char **av) {
     upscale_scale2x(in, w, h, out, ow, oh);
   else if (!strcmp(mode, "autoblur"))
     ok = upscale_autoblur(in, w, h, out, ow, oh);
+  else if (!strcmp(mode, "autodeblur"))
+    ok = upscale_autodeblur(in, w, h, out, ow, oh);
   else if (!strcmp(mode, "sdf"))
     ok = upscale_sdf(in, w, h, out, ow, oh);
   if (!ok) {
