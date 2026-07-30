@@ -1,5 +1,14 @@
 # celup_lab: comparable baseline modes
 
+This repository holds code and text only -- no images or build outputs are
+tracked. Test inputs and review/comparison images are regenerated locally:
+
+```sh
+bash build.sh                          # or the cc line below
+python3 tests/make_test_sources.py     # recreate tests/*.webp fixtures
+python3 make_lab_comparison_sheets.py  # regenerate examples/, comparison_sheets/
+```
+
 ```sh
 cc -O3 -DNDEBUG -std=c99 -march=native celup_lab.c -o celup_lab \
   $(pkg-config --cflags --libs libwebp) -lm

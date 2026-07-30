@@ -1,2 +1,11 @@
+# generated artifacts & binaries -- never commit images or build outputs
 __pycache__/
 *.pyc
+celup_lab
+celup_lab_baseline
+*.o
+examples/
+comparison_sheets/
+docs/*.png
+*.png
+*.webp

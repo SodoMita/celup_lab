@@ -7,12 +7,12 @@ make_lab_comparison_sheets.py Sheet generator; checker/crosshatch/rings + classm
 test_celup3.py               Older regression script (sRGB-space; see handoff v2 notes)
 comparison_sheets.md         Text-only metrics from the latest comparison run (22 mode specs x 11 scenes)
 build.sh                     Simple build command
-docs/review_checker1.png     Visual evidence: Nyquist checker torture, all key modes
-docs/review_crosshatch.png   Visual evidence: crossing thin lines, artifact cleanup
-docs/review_crossing.png     Visual evidence: natural mixed crossing scene + classmap
-docs/review_v4_thin8.png     v4: 1px staircase line at 8x -- bilinear/adaptive/sdf/autoblur
-docs/review_v4_sawtooth8.png v4: wandering diagonal at 8x -- old autoblur vs v4 autoblur vs sdf
-docs/review_v4_grad8.png     v4: smooth gradient at 8x -- old autoblur mosaic vs v4
+tests/make_test_sources.py   Regenerates all test fixtures (torture/pixelart/hline8/
+                             grad8/thin96/parallel96/rings96) bit-exactly
+docs/review_*.png            Visual evidence (gitignored; crops regenerated per release)
 
 Git: this snapshot is delivered as a git bundle of the whole lab repo
 (celup_lab_v4.bundle). Clone it with: git clone celup_lab_v4.bundle celup_lab
+The repo contains code and text only: images, generated sheets, fixtures and
+build outputs are gitignored and reproduced by the scripts above
+(test images: tests/make_test_sources.py; sheets/examples: make_lab_comparison_sheets.py).
