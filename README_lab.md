@@ -41,6 +41,42 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
+## v4.4: tunable edge-width goal (-e), auto-chosen deblur methods (-D)
+
+The autoblur fit's validation proxy is biased to little blur (a sharper
+reconstruction trivially matches the sharp target): on staircase-y sources
+it picked the legal minimum ("not enough blur to get rid of sawtooth
+edges"), and autodeblur then had nothing to work against. Two goal-value
+knobs fix this and expose the trade explicitly:
+
+- `-e, --edge-goal W` (src px, 0..8, default 0 = off): after the fit, the
+  rendered edge width (robust p30 of range/slope over strong edges,
+  calibrated so a gaussian ramp reads ~2.5 sigma) is measured AT TARGET
+  RESOLUTION; if below the goal, sigma escalates x1.35 per step (ceiling
+  2.5) and re-renders until the goal is met -- "increase blur towards
+  smooth edges first of all", spent exactly as much as needed.  Direct
+  target-res enforcement replaced a validation-penalty attempt whose
+  width measurements were miscalibrated by the 2x proxy.  stderr reports
+  every step (badge 8x: s .50 -> 1.37px -> .68 -> 1.61 -> .91 -> 1.84 ->
+  1.23 -> 2.15 OK for -e 2).  In autodeblur, the same value adapts the
+  steepness PER EDGE: wide mushy transitions get k toward 3, edges
+  already at the goal get k=1 (untouched) -- nothing over-sharpens.
+  Warning: goals >= ~1.5 visibly soften genuine 1px line-art; that is the
+  point of the knob, aim it at the content.
+- `-D, --deblur-method auto|remap|push` (default auto): the deblur
+  methods the v4.3 research surfaced, both artifact-guarded, with the
+  best AUTO-CHOSEN per image by the same self-supervised 2x proxy:
+  (1) remap: monotone slope remap u'=.5+(u-.5)k inside the measured local
+  range (Anime4K's "gradient maximization without overshoot", closed
+  form); (2) push: Anime4K-flavoured spatial gradient push (sample the
+  base along the unit gradient by (u-.5)(k-1)*1.6*scale px, clamped to
+  the local range).  Proxy scores and the winner print to stderr (miya:
+  remap .0005225 < push .0005313 -> remap; note remap IMPROVES on the
+  raw autoblur proxy .0005251 -- the deblur is real signal gain, not
+  cosmetics).  Osher-Rudin shock filters remain deliberately unadopted:
+  the references show their staircase signature is exactly what we are
+  removing.
+
 ## v4.3: autodeblur mode (gradient-slope steepening on the fitted blur base)
 
 Addresses the "AI-upscaled anime-art cleanup" case: diffusion-rendered /

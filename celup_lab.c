@@ -1966,6 +1966,92 @@ static uint8_t *downsample_pm_box(const uint8_t *in, int sw, int sh, int dw,
 static double image_pm_mse(const uint8_t *a, const uint8_t *b, int w, int h,
                            int border);
 
+/* Tunable edge-width goal (v4.4): the validation MSE of the blur fit is
+   biased toward LESS blur (a sharper reconstruction trivially matches the
+   sharp target), so the fit tends to pick the minimum blur that tracks the
+   data -- leaving source AA staircases visible as mild sawtooth and giving
+   autodeblur nothing to work against.  --edge-goal W states the user's
+   actual goal: strong edges should be at least W source px wide (smooth),
+   and the fit should spend blur to get there "towards smooth edges first".
+   Width of a rendered edge = local range / local slope, robustified to the
+   30th percentile over strong-edge pixels (we care about the narrowest
+   offenders).  Candidates are scored mse * (1 + PENALTY * deficit^2), so
+   widening edges below the goal is worth more than the MSE it costs, but
+   never free. */
+static float edge_goal = 0.f;
+static float measure_edge_width30(const uint8_t *img, int w, int h,
+                                  float scale_px) {
+  /* Width of a rendered edge = (range over a window that spans the whole
+     ramp) / (slope at ramp centre); a gaussian ramp of sigma s then indeed
+     reads ~2.5 s px, i.e. its real AA width.  Range window: +-1.5 src px
+     (anything narrower reads only the steepest 3px segment and
+     under-measures smooth ramps).  30th percentile over strong-edge pixels:
+     we steer by the narrowest offenders, not the mean. */
+  int Rw = clampi((int)(1.5f * scale_px + .5f), 2, 12);
+  size_t n = (size_t)w * h;
+  float *t = malloc(n * sizeof *t);
+  float *ws = malloc(n * sizeof *ws);
+  if (!t || !ws) {
+    free(t);
+    free(ws);
+    return 0.f;
+  }
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w; x++) {
+      float q[4];
+      raw_pm(img, w, h, x, y, q);
+      t[(size_t)y * w + x] = (q[0] + q[1] + q[2]) * (1.f / 3.f);
+    }
+  size_t m = 0;
+  for (int y = Rw; y + Rw < h; y++)
+    for (int x = Rw; x + Rw < w; x++) {
+      float lo = 1e30f, hi = -1e30f;
+      for (int j = -Rw; j <= Rw; j++)
+        for (int i = -Rw; i <= Rw; i++) {
+          float v = t[(size_t)(y + j) * w + x + i];
+          if (v < lo)
+            lo = v;
+          if (v > hi)
+            hi = v;
+        }
+      float rng = hi - lo;
+      if (rng < .05f)
+        continue;
+      float gx = (t[(size_t)(y - 1) * w + x + 1] + 2 * t[(size_t)y * w + x + 1] +
+                  t[(size_t)(y + 1) * w + x + 1]) -
+                 (t[(size_t)(y - 1) * w + x - 1] + 2 * t[(size_t)y * w + x - 1] +
+                  t[(size_t)(y + 1) * w + x - 1]),
+            gy = (t[(size_t)(y + 1) * w + x - 1] + 2 * t[(size_t)(y + 1) * w + x] +
+                  t[(size_t)(y + 1) * w + x + 1]) -
+                 (t[(size_t)(y - 1) * w + x - 1] + 2 * t[(size_t)(y - 1) * w + x] +
+                  t[(size_t)(y - 1) * w + x + 1]);
+      /* true Sobel slope per px: divide by 8 */
+      float g = sqrtf(gx * gx + gy * gy) * .125f;
+      if (g < .01f)
+        continue;
+      if (m < n)
+        ws[m++] = rng / g;
+    }
+  free(t);
+  if (m < 16) {
+    free(ws);
+    return 0.f;
+  }
+  /* 30th percentile via partial selection. */
+  size_t k30 = m * 30 / 100;
+  for (size_t i = 0; i <= k30; i++) {
+    size_t bj = i;
+    for (size_t j = i + 1; j < m; j++)
+      if (ws[j] < ws[bj])
+        bj = j;
+    float tmp = ws[i];
+    ws[i] = ws[bj];
+    ws[bj] = tmp;
+  }
+  float r = ws[k30];
+  free(ws);
+  return r;
+}
 static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
                                  float *sigma, int *ck, float *cp) {
   int tw = sw / 2, th = sh / 2;
@@ -2128,7 +2214,33 @@ static int upscale_autoblur(const uint8_t *in, int sw, int sh, uint8_t *out,
   fitted_sigma = sigma;
   fitted_curve = ck;
   fitted_cp = cp;
-  return render_soft(in, sw, sh, out, dw, dh, kk, sigma, ck, cp);
+  int ok = render_soft(in, sw, sh, out, dw, dh, kk, sigma, ck, cp);
+  if (ok && edge_goal > 0.f) {
+    /* Goal-first, measured at the TARGET resolution: the validation-proxy
+       fit is systematically biased to little blur (a sharper reconstruction
+       trivially matches the sharp target), so enforce the user's goal
+       directly -- escalate sigma until strong edges are at least
+       --edge-goal source px wide (or the sigma ceiling says the model
+       cannot get wider).  "Increase blur towards smooth edges first of
+       all." */
+    for (int it = 0; it < 5; it++) {
+      float w30 = measure_edge_width30(out, dw, dh, (float)dw / sw) *
+                  (float)sw / dw;
+      fprintf(stderr,
+              "autoblur edge-goal %.2f src px: strong-edge width p30 = %.2f "
+              "(sigma %.2f)%s\n",
+              edge_goal, w30, sigma, w30 >= edge_goal ? " OK" : "");
+      if (w30 >= edge_goal || sigma >= 2.5f)
+        break;
+      sigma = fminf(sigma * 1.35f, 2.5f);
+      fitted_sigma = sigma;
+      if (!render_soft(in, sw, sh, out, dw, dh, kk, sigma, ck, cp)) {
+        ok = 0;
+        break;
+      }
+    }
+  }
+  return ok;
 }
 
 /* ---------------------------------------------------------------------------
@@ -2159,15 +2271,39 @@ static int upscale_autoblur(const uint8_t *in, int sw, int sh, uint8_t *out,
    relative slope) are untouched (no posterization, unlike shock filters
    and quantization unblurs) and near-flat zones are instead gently pulled
    toward their local mean (flat-flatten) to mop up diffusion salt. */
+/* Bilinear sample in premultiplied space (for the gradient push). */
+static void sample_pm(const uint8_t *img, int w, int h, float x, float y,
+                      float q[4]) {
+  int ix = (int)floorf(x), iy = (int)floorf(y);
+  float fx = x - (float)ix, fy = y - (float)iy;
+  q[0] = q[1] = q[2] = q[3] = 0.f;
+  for (int j = 0; j < 2; j++)
+    for (int i = 0; i < 2; i++) {
+      float p[4], wgt = (i ? fx : 1.f - fx) * (j ? fy : 1.f - fy);
+      raw_pm(img, w, h, ix + i, iy + j, p);
+      for (int c = 0; c < 4; c++)
+        q[c] += wgt * p[c];
+    }
+}
+/* deblur method: 0 = auto (validation proxy picks), 1 = monotone slope
+   remap, 2 = Anime4K-style gradient push. */
+static int deblur_method = 0;
 static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
-                              int dw, int dh) {
-  if (!upscale_autoblur(in, sw, sh, out, dw, dh))
-    return 0;
+                              int dw, int dh);
+/* autodeblur core pass on an already-rendered smooth base at dw*dh.  scale =
+   dst px per src px (used for window radius and src-px width accounting);
+   method 1 = slope remap, 2 = gradient push.  Shares gates and the
+   premultiplied-invariant guard either way. */
+static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
+                           int method) {
   size_t n = (size_t)dw * dh;
-  float *t = malloc(n * sizeof *t), *gm = malloc(n * sizeof *gm);
-  if (!t || !gm) {
+  float *t = malloc(n * sizeof *t), *gm = malloc(n * sizeof *gm),
+        *gnx = malloc(n * sizeof *gnx), *gny = malloc(n * sizeof *gny);
+  if (!t || !gm || !gnx || !gny) {
     free(t);
     free(gm);
+    free(gnx);
+    free(gny);
     return 0;
   }
   for (int y = 0; y < dh; y++)
@@ -2176,8 +2312,6 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
       raw_pm(out, dw, dh, x, y, q);
       t[(size_t)y * dw + x] = (q[0] + q[1] + q[2]) * (1.f / 3.f);
     }
-  /* Sobel gradient magnitude of the luminance proxy (built-in [1,2,1]
-     smoothing in the tangential direction; robust to 1px residue). */
   for (int y = 0; y < dh; y++)
     for (int x = 0; x < dw; x++) {
       int xl = x > 0 ? x - 1 : 0, xr = x + 1 < dw ? x + 1 : dw - 1,
@@ -2188,10 +2322,14 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
             gy = t[(size_t)yd * dw + xl] + 2 * t[(size_t)yd * dw + x] +
                  t[(size_t)yd * dw + xr] - t[(size_t)yu * dw + xl] -
                  2 * t[(size_t)yu * dw + x] - t[(size_t)yu * dw + xr];
-      gm[(size_t)y * dw + x] = sqrtf(gx * gx + gy * gy) * (1.f / 16.f);
+      float g = sqrtf(gx * gx + gy * gy) * (1.f / 16.f), inv =
+          g > 1e-8f ? 1.f / (g * 16.f) : 0.f;
+      gm[(size_t)y * dw + x] = g;
+      gnx[(size_t)y * dw + x] = gx * inv;
+      gny[(size_t)y * dw + x] = gy * inv;
     }
-  int R = clampi((int)(1.25f * (float)dw / sw + .5f), 2, 12);
-  float k = clampf(1.f + .25f * (compress_strength - 1.f), 1.f, 3.f);
+  int R = clampi((int)(1.25f * scale + .5f), 2, 12);
+  float kfix = clampf(1.f + .25f * (compress_strength - 1.f), 1.f, 3.f);
   float flatmix = .25f; /* diffusion-noise flattening in gate-zero zones */
   for (int y = 0; y < dh; y++)
     for (int x = 0; x < dw; x++) {
@@ -2211,39 +2349,59 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
           }
         }
       float range = 0.f;
+      int cstar = 0;
       for (int c = 0; c < 3; c++)
-        if (hi[c] - lo[c] > range)
+        if (hi[c] - lo[c] > range) {
           range = hi[c] - lo[c];
+          cstar = c;
+        }
       float rel = gm[(size_t)y * dw + x] / (range + 1e-6f);
       float w = clampf((rel - .08f) * (1.f / .10f), 0.f, 1.f);
       w = w * w * (3.f - 2.f * w); /* smoothstep */
-      /* Flat-flatten must only act in TRUE flats: pulling a near-edge,
-         low-gradient pixel toward a window mean that mixes both sides of
-         the edge stains a soft halo band around every line (MAE and
-         visible).  Gate it by local range: only windows whose whole span
-         is noise-level get the mean pull. */
       float fw = clampf((.025f - range) * (1.f / .017f), 0.f, 1.f);
       fw = fw * fw * (3.f - 2.f * fw) * (1.f - w);
       float o[4];
       raw_pm(out, dw, dh, x, y, o);
-      float res[4];
-      for (int c = 0; c < 4; c++) {
-        float rc_ = hi[c] - lo[c], v = o[c], nv;
-        if (rc_ > 1e-6f) {
-          float u = clampf((v - lo[c]) / rc_, 0.f, 1.f);
-          u = clampf(.5f + (u - .5f) * k, 0.f, 1.f);
-          nv = lo[c] + u * rc_;
-        } else
-          nv = v;
-        float blended = v + w * (nv - v);
-        blended += fw * flatmix * (mean[c] / cnt - v);
-        res[c] = clampf(blended, 0.f, 1.f);
+      /* Tunable edge-width goal (v4.4): with --edge-goal W the steepness
+         adapts per edge -- wide mushy transitions get a strong remap,
+         already-crisp ones barely move; nothing overshoots the goal. */
+      float k = kfix;
+      if (edge_goal > 0.f && gm[(size_t)y * dw + x] > 1e-6f) {
+        float width_src = range / (2.f * gm[(size_t)y * dw + x] + 1e-6f) / scale;
+        k = clampf(width_src / (edge_goal > .4f ? edge_goal : .4f), 1.f, 3.f);
       }
-      /* Premultiplied invariant: remapping channels independently can leave
-         rgb > alpha in near-transparent pixels (different local ranges and
-         gates), which put() then unpremultiplies into garbage 255 RGB under
-         alpha ~0.  Convexity of every contributing tap guarantees
-         rgb <= alpha, so restore it explicitly. */
+      float res[4];
+      if (method == 2 && w > 0.f && range > 1e-6f) {
+        /* Anime4K-style push: sample the base a fraction of the window
+           along the gradient direction, proportional to the pixel's
+           normalised position u within its local range (shared geometry:
+           dominant channel sets u).  Monotone displacement along g; the
+           sampled colour is still clamped to the window range. */
+        float rc0 = range, u =
+            clampf((o[cstar] - lo[cstar]) / rc0, 0.f, 1.f);
+        float off = (u - .5f) * (k - 1.f) * 1.6f * scale;
+        float px = (float)x + off * gnx[(size_t)y * dw + x],
+              py = (float)y + off * gny[(size_t)y * dw + x], smp[4];
+        sample_pm(out, dw, dh, px, py, smp);
+        for (int c = 0; c < 4; c++) {
+          float nv = clampf(smp[c], lo[c], hi[c]);
+          res[c] = clampf(o[c] + w * (nv - o[c]) +
+                              fw * flatmix * (mean[c] / cnt - o[c]),
+                          0.f, 1.f);
+        }
+      } else
+        for (int c = 0; c < 4; c++) {
+          float rc_ = hi[c] - lo[c], v = o[c], nv;
+          if (rc_ > 1e-6f) {
+            float u = clampf((v - lo[c]) / rc_, 0.f, 1.f);
+            u = clampf(.5f + (u - .5f) * k, 0.f, 1.f);
+            nv = lo[c] + u * rc_;
+          } else
+            nv = v;
+          res[c] = clampf(v + w * (nv - v) +
+                              fw * flatmix * (mean[c] / cnt - v),
+                          0.f, 1.f);
+        }
       for (int c = 0; c < 3; c++)
         if (res[c] > res[3])
           res[c] = res[3];
@@ -2251,7 +2409,47 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
     }
   free(t);
   free(gm);
+  free(gnx);
+  free(gny);
   return 1;
+}
+static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
+                              int dw, int dh) {
+  if (!upscale_autoblur(in, sw, sh, out, dw, dh))
+    return 0;
+  int method = deblur_method;
+  if (!method) {
+    /* Auto-choice over the implemented deblur methods with the same
+       self-supervised 2x-downscale proxy the blur fit uses: whichever
+       method reconstructs the source best at 2x wins for the full run. */
+    int tw = sw / 2, th = sh / 2;
+    method = 1;
+    if (tw >= 8 && th >= 8) {
+      uint8_t *train = downsample_pm_box(in, sw, sh, tw, th);
+      uint8_t *recon = malloc((size_t)sw * sh * 4);
+      double bs = 1e300;
+      if (train && recon)
+        for (int m = 1; m <= 2; m++) {
+          if (!render_soft(train, tw, th, recon, sw, sh, fitted_kernel,
+                           fitted_sigma, fitted_curve, fitted_cp))
+            continue;
+          if (!autodeblur_pass(recon, sw, sh, (float)sw / tw, m))
+            continue;
+          double s = image_pm_mse(recon, in, sw, sh, 2);
+          fprintf(stderr, "autodeblur method %s proxy MSE %.8g\n",
+                  m == 1 ? "remap" : "push", s);
+          if (s < bs) {
+            bs = s;
+            method = m;
+          }
+        }
+      free(train);
+      free(recon);
+      fprintf(stderr, "autodeblur auto-selected %s\n",
+              method == 1 ? "remap" : "push");
+    }
+  }
+  return autodeblur_pass(out, dw, dh, (float)dw / sw, method);
 }
 
 /* ---------------------------------------------------------------------------
@@ -3873,7 +4071,7 @@ static uint8_t *slurp(const char *name, size_t *n) {
 static void print_help(const char *argv0) {
   printf(
       "celup_lab -- premultiplied-linear WebP upscaler (research build "
-      "v4.2)\n"
+      "v4.4)\n"
       "\n"
       "Usage: %s in.webp out.webp SCALE [options]\n"
       "  SCALE is the upsampling factor, real number in (1,32] "
@@ -3921,6 +4119,12 @@ static void print_help(const char *argv0) {
       "  -c, --blur-curve C        autoblur gradient curve linear|sigmoid|"
       "cubic|exp|log|sqrt|circle|nearest|auto\n"
       "  -p, --curve-param P       autoblur curve shape parameter 0..40\n"
+      "  -e, --edge-goal W         goal width for strong edges in src px\n"
+      "                            0..8 (default 0=off): steers the autoblur\n"
+      "                            fit toward enough blur for smooth edges, and\n"
+      "                            adapts autodeblur steepness per edge\n"
+      "  -D, --deblur-method M     autodeblur method auto|remap|push\n"
+      "                            (auto = validation proxy picks per image)\n"
       "  -M, --max-mib M           memory budget in MiB 32..65536 (default "
       "512);\n"
       "                            sdf/adaptive need roughly 40..80 B per\n"
@@ -4055,6 +4259,24 @@ int main(int ac, char **av) {
       alpha_clean_floor = strtof(av[i + 1], &e);
       if (*e || alpha_clean_floor < 0.f || alpha_clean_floor > 64.f) {
         fprintf(stderr, "alpha-clean must be in [0,64]\n");
+        return 2;
+      }
+    } else if (!strcmp(av[i], "--edge-goal") || !strcmp(av[i], "-e")) {
+      char *e;
+      edge_goal = strtof(av[i + 1], &e);
+      if (*e || edge_goal < 0.f || edge_goal > 8.f) {
+        fprintf(stderr, "edge-goal must be in [0,8] (src px; 0=off)\n");
+        return 2;
+      }
+    } else if (!strcmp(av[i], "--deblur-method") || !strcmp(av[i], "-D")) {
+      if (!strcmp(av[i + 1], "auto"))
+        deblur_method = 0;
+      else if (!strcmp(av[i + 1], "remap"))
+        deblur_method = 1;
+      else if (!strcmp(av[i + 1], "push"))
+        deblur_method = 2;
+      else {
+        fprintf(stderr, "Unknown deblur method: %s\n", av[i + 1]);
         return 2;
       }
     } else if (!strcmp(av[i], "--max-mib") || !strcmp(av[i], "-M")) {

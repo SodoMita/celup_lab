@@ -1,5 +1,54 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.4 update (2026-07-30): edge-width goal, auto-chosen deblur methods
+
+User feedback: "autoblur chooses not enough blur to get rid of sawtooth
+edges, and not much is left for deblur to do; implement the other deblur
+methods found and auto-choose the best; autoblur alone may be fine but
+tunable goal values would be good, usable in autodeblur to increase blur
+towards smooth edges first of all."
+
+What shipped:
+
+1. `--edge-goal W / -e W` (src px, default 0 = off).  New robust width
+   metric: per strong-edge pixel, width = (range over a +-1.5-src-px
+   window) / (Sobel slope), 30th percentile; calibrated so a gaussian
+   ramp of sigma s reads ~2.5 s (its real AA width).  Enforcement is
+   POST-FIT at target resolution: while width30 < goal and sigma < 2.5,
+   sigma *= 1.35 and re-render.  Two earlier designs failed and were
+   discarded, which is worth recording: (a) a validation-score penalty
+   never moved the pick (MSE landscape gaps >> penalty), and (b)
+   validation-side width goals are miscalibrated because the 2x
+   downsampled train image already carries widened edges, so "goal met"
+   at validation did not translate to the full-res render.  badge 8x
+   -e 2.0 escalation trace: sigma .50 (1.37px) -> .68 (1.61) -> .91
+   (1.84) -> 1.23 (2.15 OK).  miya 3x -e 1.4: fit untouched (1.79px
+   already) -- the goal only spends blur where needed.  Same value feeds
+   autodeblur's steepness (adaptive k per edge = width/goal, clamped
+   [1,3]): mushy transitions steepen, goal-met edges keep their shape.
+2. `--deblur-method auto|remap|push / -D` (default auto).  The v4.3
+   research produced two guarded steepeners; both are in, and the best is
+   chosen per image by the self-supervised 2x-downscale proxy MSE, same
+   criterion as the blur fit: (1) remap = monotone value remap inside the
+   local range (closed-form Anime4K); (2) push = spatial gradient push
+   along the unit gradient scaled by normalised position (Anime4K's
+   actual mechanism), local-range clamped.  Validation renders each
+   candidate at sw and scores reconstruction of the source; miya chose
+   remap (.0005225 vs .0005313; both beat the plain autoblur proxy
+   .0005251 -- measured proof the deblur recovers signal, not just
+   cosmetics).  Shock filters remain rejected (staircasing is the input
+   problem here, not the solution).
+
+Numbers (defaults, -e off = v4.3 behaviour): evaluator MAE table
+identical to v4.3 (autodeblur == autoblur to 1e-4); HG unchanged; scale
+sweep PASS (192 checks, 12 modes incl. autodeblur, scales 1.5-24x +
+32x11 face strip).  Visual: badge inner corner at 8x -- nearest
+staircase -> autoblur e0 faint steps -> autoblur -e2 smooth arc ->
+autodeblur -e2 smooth AND crisp (sdf-grade corner, but by monotone
+remap, so no halo class anywhere).  Thin-line caveat: goals >= ~1.5 src
+px soften true 1px line-art by design; -e stays off by default.
+
+# v4.3 update (2026-07-30): autodeblur -- gradient-slope steepening for AI-upscaled art
 # v4.3 update (2026-07-30): autodeblur -- gradient-slope steepening for AI-upscaled art
 
 User context: the miya art is diffusion-generated and ALREADY internally
