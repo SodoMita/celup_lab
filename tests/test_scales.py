@@ -100,11 +100,11 @@ def main():
     if not FIX.exists():
         make_fixture()
     fails = 0
-    for src, scales in ((FIX, SCALES), (FACE, FACE_SCALES) if FACE.exists()
-                        else ()):
+    jobs = [(FIX, SCALES)]
+    if FACE.exists():
+        jobs.append((FACE, FACE_SCALES))
+    for src, scales in jobs:
         sw, sh = Image.open(src).size
-        if src == FIX and FACE.exists() == False and src != FACE:
-            pass
         print(f'== {src.name} ({sw}x{sh}) ==')
         import tempfile
         with tempfile.TemporaryDirectory() as td:
