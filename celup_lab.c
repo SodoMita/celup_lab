@@ -2205,17 +2205,29 @@ static int upscale_autoblur(const uint8_t *in, int sw, int sh, uint8_t *out,
                             int dw, int dh) {
   int kk = blur_kernel_kind, ck = blur_curve_kind;
   float sigma = blur_radius, cp = curve_param;
-  if (kk == BK_AUTO || ck == CK_AUTO || !blur_radius_set ||
-      (cp <= 0.f && (ck == CK_EXP || ck == CK_LOG || ck == CK_SQRT) &&
-       blur_curve_kind != CK_AUTO))
+  int fit_needed = kk == BK_AUTO || ck == CK_AUTO || !blur_radius_set ||
+                   (cp <= 0.f &&
+                    (ck == CK_EXP || ck == CK_LOG || ck == CK_SQRT) &&
+                    blur_curve_kind != CK_AUTO);
+  if (fit_needed) {
     if (!auto_tune_soft_params(in, sw, sh, &kk, &sigma, &ck, &cp))
       return 0;
+  } else
+    fprintf(stderr,
+            "autoblur manual: kernel=%s sigma=%.2f curve=%s param=%.2f "
+            "(all four pinned by -k/-r/-c/-p; validation fit skipped)\n",
+            kernel_name(kk), sigma, curve_name(ck), cp);
   fitted_kernel = kk;
   fitted_sigma = sigma;
   fitted_curve = ck;
   fitted_cp = cp;
   int ok = render_soft(in, sw, sh, out, dw, dh, kk, sigma, ck, cp);
-  if (ok && edge_goal > 0.f) {
+  if (ok && edge_goal > 0.f && blur_radius_set)
+    fprintf(stderr,
+            "edge-goal %.2f: sigma pinned by -r (%.2f), escalation "
+            "skipped -- manual wins over goal\n",
+            edge_goal, sigma);
+  if (ok && edge_goal > 0.f && !blur_radius_set) {
     /* Goal-first, measured at the TARGET resolution: the validation-proxy
        fit is systematically biased to little blur (a sharper reconstruction
        trivially matches the sharp target), so enforce the user's goal
@@ -2288,6 +2300,9 @@ static void sample_pm(const uint8_t *img, int w, int h, float x, float y,
 /* deblur method: 0 = auto (validation proxy picks), 1 = monotone slope
    remap, 2 = Anime4K-style gradient push. */
 static int deblur_method = 0;
+static float deblur_steepness = 0.f; /* <=0: auto (-e adaptive or -s formula) */
+static int last_deblur_method = 0;   /* effective method of the last run */
+static float last_deblur_k = 0.f;    /* effective fixed steepness (0=adaptive) */
 static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
                               int dw, int dh);
 /* autodeblur core pass on an already-rendered smooth base at dw*dh.  scale =
@@ -2329,7 +2344,15 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
       gny[(size_t)y * dw + x] = gy * inv;
     }
   int R = clampi((int)(1.25f * scale + .5f), 2, 12);
-  float kfix = clampf(1.f + .25f * (compress_strength - 1.f), 1.f, 3.f);
+  /* Steepness priority: explicit --deblur-steepness pins k exactly;
+     otherwise the -s formula (k = 1 + .25*(s-1), clamped to 3), unless
+     --edge-goal adapts k per edge below. */
+  float kfix = deblur_steepness > 0.f
+                   ? deblur_steepness
+                   : clampf(1.f + .25f * (compress_strength - 1.f), 1.f, 3.f);
+  last_deblur_k = deblur_steepness > 0.f   ? deblur_steepness
+                  : edge_goal > 0.f        ? 0.f
+                                           : kfix;
   float flatmix = .25f; /* diffusion-noise flattening in gate-zero zones */
   for (int y = 0; y < dh; y++)
     for (int x = 0; x < dw; x++) {
@@ -2364,9 +2387,12 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
       raw_pm(out, dw, dh, x, y, o);
       /* Tunable edge-width goal (v4.4): with --edge-goal W the steepness
          adapts per edge -- wide mushy transitions get a strong remap,
-         already-crisp ones barely move; nothing overshoots the goal. */
+         already-crisp ones barely move; nothing overshoots the goal.
+         An explicit --deblur-steepness (v4.5) pins k and disables this
+         adaptation: a manual setting always beats a goal heuristic. */
       float k = kfix;
-      if (edge_goal > 0.f && gm[(size_t)y * dw + x] > 1e-6f) {
+      if (deblur_steepness <= 0.f && edge_goal > 0.f &&
+          gm[(size_t)y * dw + x] > 1e-6f) {
         float width_src = range / (2.f * gm[(size_t)y * dw + x] + 1e-6f) / scale;
         k = clampf(width_src / (edge_goal > .4f ? edge_goal : .4f), 1.f, 3.f);
       }
@@ -2418,6 +2444,9 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
   if (!upscale_autoblur(in, sw, sh, out, dw, dh))
     return 0;
   int method = deblur_method;
+  if (method)
+    fprintf(stderr, "autodeblur method %s (manual)\n",
+            method == 1 ? "remap" : "push");
   if (!method) {
     /* Auto-choice over the implemented deblur methods with the same
        self-supervised 2x-downscale proxy the blur fit uses: whichever
@@ -2449,6 +2478,7 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
               method == 1 ? "remap" : "push");
     }
   }
+  last_deblur_method = method;
   return autodeblur_pass(out, dw, dh, (float)dw / sw, method);
 }
 
@@ -4071,67 +4101,91 @@ static uint8_t *slurp(const char *name, size_t *n) {
 static void print_help(const char *argv0) {
   printf(
       "celup_lab -- premultiplied-linear WebP upscaler (research build "
-      "v4.4)\n"
+      "v4.5)\n"
       "\n"
       "Usage: %s in.webp out.webp SCALE [options]\n"
       "  SCALE is the upsampling factor, real number in (1,32] "
       "(e.g. 2, 3, 4.5, 10).\n"
       "\n"
-      "Recommended modes (-m):\n"
+      "Modes (-m MODE, default cubic) -- recommended:\n"
       "  adaptive      natural images and mixed art; classifies each patch\n"
-      "                (edge/checker/junction/gradient) and picks a safe\n"
-      "                interpolation policy per patch\n"
+      "                (edge/checker/junction/line/gradient) and picks a\n"
+      "                safe interpolation policy per patch\n"
       "  autoblur      fits the blur the source was probably downsampled\n"
       "                through and renders at target resolution -- smooth,\n"
       "                round contours at high scale, no sawtooth\n"
       "  autodeblur    autoblur base + gradient-slope steepening: sharp\n"
       "                edges with no halos/ringing; flats gently cleaned.\n"
-      "                Tune with -s (slope multiplier). Best for\n"
-      "                AI-upscaled/diffusion anime art\n"
+      "                Best for AI-upscaled/diffusion anime art\n"
       "  triangle      softest, no ringing or halos; safe default for art\n"
       "  sdf           fitted signed-distance contour sharpening on top of\n"
       "                adaptive; crispest edges, tune with -s\n"
       "  nearest       pixel art / hard 1px texture\n"
       "\n"
-      "Other modes: bilinear cubic(default) mitchell lanczos2 lanczos3 blur\n"
+      "Modes -- other (accepted, but expect artifacts on art):\n"
+      "  bilinear cubic mitchell lanczos2 lanczos3 blur\n"
       "  compress safecompress blurcompress safeblurcompress edgecompress\n"
       "  deblurcompress dehourglass consistentcompress hourglasscompress\n"
-      "  scale2x classmap(diagnostic class-map dump)\n"
-      "  (autodeblur lives in Recommended above; it reuses the -k/-c/-p\n"
-      "  autoblur fit options plus -s for steepness)\n"
+      "  scale2x classmap   (classmap = diagnostic class-map dump)\n"
       "\n"
-      "Options:\n"
-      "  -m, --mode MODE           reconstruction mode (default: cubic)\n"
-      "  -s, --strength N          compress/sharpen strength 1..100 (default "
-      "4)\n"
-      "  -r, --blur-radius R       blur radius .1..40 for *blurcompress modes\n"
-      "  -a, --auto-tune           auto-tune blur radius+strength for the "
-      "*blurcompress modes\n"
-      "  -P, --checker-policy P    adaptive Nyquist-checker policy:\n"
-      "                            lowpass|bilinear|nearest|mitchell|scale2x|"
-      "auto\n"
+      "Options (general):\n"
+      "  -m, --mode MODE           one of the modes listed above\n"
       "  -A, --alpha-clean T       transparent-pixel garbage cleanup 0..64\n"
       "                            (default 10; 0 disables): wipes hidden-RGB\n"
       "                            and isolated semi-transparent salt left by\n"
       "                            lossy encoders in empty regions\n"
-      "  -k, --blur-kernel K       autoblur kernel box|triangle|gaussian|"
-      "bspline|auto\n"
-      "  -c, --blur-curve C        autoblur gradient curve linear|sigmoid|"
-      "cubic|exp|log|sqrt|circle|nearest|auto\n"
-      "  -p, --curve-param P       autoblur curve shape parameter 0..40\n"
-      "  -e, --edge-goal W         goal width for strong edges in src px\n"
-      "                            0..8 (default 0=off): steers the autoblur\n"
-      "                            fit toward enough blur for smooth edges, and\n"
-      "                            adapts autodeblur steepness per edge\n"
-      "  -D, --deblur-method M     autodeblur method auto|remap|push\n"
-      "                            (auto = validation proxy picks per image)\n"
-      "  -M, --max-mib M           memory budget in MiB 32..65536 (default "
-      "512);\n"
-      "                            sdf/adaptive need roughly 40..80 B per\n"
-      "                            output pixel -- big images at 3x+ need -M\n"
-      "                            2048 or more\n"
-      "  -d, --adaptive-debug N    class-map debug level 0..7\n"
+      "  -M, --max-mib M           memory budget in MiB 32..65536 (default\n"
+      "                            512); sdf/adaptive need roughly 40..80 B\n"
+      "                            per output pixel -- big images at 3x+ need\n"
+      "                            -M 2048 or more\n"
       "  -h, --help                this text\n"
+      "\n"
+      "Options (compress family / adaptive / sdf):\n"
+      "  -s, --strength N          compress/sharpen strength 1..100 (default\n"
+      "                            4); in autodeblur it sets slope steepness\n"
+      "                            k = 1+.25*(N-1), clamped to 3 (N>=9 max),\n"
+      "                            unless -g or -e overrides (see table)\n"
+      "  -r, --blur-radius R       blur radius .1..40 (default 1): radius\n"
+      "                            for *blurcompress modes; ALSO pins the\n"
+      "                            autoblur/autodeblur sigma exactly\n"
+      "  -a, --auto-tune           auto-tune -r and -s for the *blurcompress\n"
+      "                            modes only (implies -m deblurcompress)\n"
+      "  -P, --checker-policy P    adaptive checker policy: lowpass|bilinear|\n"
+      "                            nearest|mitchell|scale2x|auto\n"
+      "  -d, --adaptive-debug N    class-map debug bitmask 0..15: 1 drops\n"
+      "                            the edge class, 2 checker, 4 junction,\n"
+      "                            8 line; 0 = normal render\n"
+      "\n"
+      "Options (autoblur / autodeblur):\n"
+      "  -k, --blur-kernel K       kernel box|triangle|gaussian|bspline|auto\n"
+      "                            (default auto = fit)\n"
+      "  -c, --blur-curve C        gradient curve linear|sigmoid|cubic|exp|\n"
+      "                            log|sqrt|circle|nearest|auto (default fit)\n"
+      "  -p, --curve-param P       curve shape parameter 0..40 (0 = family\n"
+      "                            default/fit; exp/log = k, sqrt = p)\n"
+      "  -e, --edge-goal W         goal width for strong edges in src px\n"
+      "                            0..8 (default 0=off): escalates the\n"
+      "                            autoblur fit toward enough blur for smooth\n"
+      "                            edges, and adapts autodeblur steepness\n"
+      "                            per edge\n"
+      "  -D, --deblur-method M     autodeblur method auto|remap|push\n"
+      "                            (default auto = 2x proxy picks per image)\n"
+      "  -g, --deblur-steepness K  autodeblur slope multiplier 1..8 (default\n"
+      "                            0=auto); overrides -s and -e per-edge\n"
+      "                            adaptation\n"
+      "\n"
+      "autoblur/autodeblur: what is automatic, and how to pin it\n"
+      "  parameter    chosen automatically by...        pin manually with\n"
+      "  kernel       validation-proxy fit              -k (any value but auto)\n"
+      "  sigma        fit, then -e escalation           -r R (exact; -e then\n"
+      "                                                 backs off: manual wins)\n"
+      "  curve        validation-proxy fit              -c (any value but auto)\n"
+      "  curve param  fit                               -p P\n"
+      "  method       2x-downscale proxy MSE            -D remap|push\n"
+      "  steepness    -s formula, or -e per edge        -g K (exact, 1..8)\n"
+      "  Only the unpinned parameters are fitted.  Every effective value is\n"
+      "  echoed to stderr, so an automatic run can be reproduced exactly by\n"
+      "  re-running with its reported values pinned.\n"
       "\n"
       "Output is always lossless WebP.  Hourglass/speckle suppression in the\n"
       "compress family and adaptive/sdf only acts on directed gradients;\n"
@@ -4250,8 +4304,8 @@ int main(int ac, char **av) {
     } else if (!strcmp(av[i], "--adaptive-debug") || !strcmp(av[i], "-d")) {
       char *e;
       adaptive_debug = (int)strtol(av[i + 1], &e, 10);
-      if (*e || adaptive_debug < 0 || adaptive_debug > 7) {
-        fprintf(stderr, "adaptive-debug must be in [0,7]\n");
+      if (*e || adaptive_debug < 0 || adaptive_debug > 15) {
+        fprintf(stderr, "adaptive-debug must be in [0,15]\n");
         return 2;
       }
     } else if (!strcmp(av[i], "--alpha-clean") || !strcmp(av[i], "-A")) {
@@ -4266,6 +4320,14 @@ int main(int ac, char **av) {
       edge_goal = strtof(av[i + 1], &e);
       if (*e || edge_goal < 0.f || edge_goal > 8.f) {
         fprintf(stderr, "edge-goal must be in [0,8] (src px; 0=off)\n");
+        return 2;
+      }
+    } else if (!strcmp(av[i], "--deblur-steepness") || !strcmp(av[i], "-g")) {
+      char *e;
+      deblur_steepness = strtof(av[i + 1], &e);
+      if (*e || (deblur_steepness != 0.f &&
+                 (deblur_steepness < 1.f || deblur_steepness > 8.f))) {
+        fprintf(stderr, "deblur-steepness must be 0 (auto) or in [1,8]\n");
         return 2;
       }
     } else if (!strcmp(av[i], "--deblur-method") || !strcmp(av[i], "-D")) {
@@ -4465,10 +4527,18 @@ int main(int ac, char **av) {
     static const char *names[] = {"lowpass", "bilinear", "nearest",
                                   "mitchell", "scale2x", "auto"};
     printf(", checker-policy=%s", names[checker_policy]);
-  } else if (!strcmp(mode, "autoblur")) {
+  } else if (!strcmp(mode, "autoblur") || !strcmp(mode, "autodeblur")) {
     printf(", kernel=%s sigma=%.2f curve=%s param=%.2f",
            kernel_name(fitted_kernel), fitted_sigma, curve_name(fitted_curve),
            fitted_cp);
+    if (!strcmp(mode, "autodeblur")) {
+      printf(", method=%s", last_deblur_method == 2 ? "push" : "remap");
+      if (last_deblur_k > 0.f)
+        printf(", steepness=%.2f%s", last_deblur_k,
+               deblur_steepness > 0.f ? "(manual)" : "");
+      else
+        printf(", steepness=adaptive(-e %.2f)", edge_goal);
+    }
   }
   printf("\n");
   return 0;

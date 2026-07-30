@@ -41,6 +41,54 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
+## v4.5: every automatic parameter is manually pinnable; complete --help
+
+"Can these params be set manually? In help there is no list of all
+possibilities." Now yes, and the help lists everything (all 23 modes,
+every value set per option, defaults, and the pin table below).
+Most pins existed since v4.2/v4.4 but were undocumented or mislabelled
+(`-r` was described as "*blurcompress only" while it also pins the
+autoblur sigma); v4.5 fixes the docs, adds the one genuinely missing
+knob, and makes manual settings authoritative:
+
+| parameter (echoed to stderr) | automatic choice          | manual pin                        |
+|------------------------------|---------------------------|-----------------------------------|
+| kernel                       | validation-proxy fit      | `-k box\|triangle\|gaussian\|bspline` |
+| sigma                        | fit, then `-e` escalation | `-r R` (exact; `-e` then backs off) |
+| curve                        | validation-proxy fit      | `-c linear\|sigmoid\|cubic\|exp\|log\|sqrt\|circle\|nearest` |
+| curve param                  | fit                       | `-p P` (0..40)                    |
+| deblur method                | 2x proxy MSE              | `-D remap\|push` (auto = proxy)   |
+| steepness k                  | `-s` formula or `-e`/edge | `-g K` (exact 1..8) -- NEW        |
+
+- Only UNPINNED parameters are fitted, so partial pins work
+  (`-k gaussian -r .75` keeps those two and still fits curve/param).
+  When all four autoblur parameters are pinned the validation fit is
+  skipped entirely (faster) and the run prints
+  `autoblur manual: kernel=... sigma=... curve=... param=...`.
+- Every effective value is echoed to stderr/stdout, so an automatic run
+  can be reproduced exactly later by pinning its reported numbers.
+- NEW `-g, --deblur-steepness K` (1..8, default 0 = auto): sets the
+  autodeblur slope multiplier directly instead of via the `-s` formula
+  (k = 1+.25*(s-1), clamp 3). Priority: `-g` > `-e` per-edge adaptation
+  > `-s` formula. With `-g` and `-e` together, `-e` still steers the
+  BLUR fit; only the steepness adaptation is pinned.
+- FIX: `--edge-goal` escalation no longer overrides a sigma the user
+  pinned with `-r` ("manual wins over goal", one stderr note).
+- FIX: `-d/--adaptive-debug` accepted only 0..7, but bit 8 (drop the
+  line class) existed in the renderer -- range is now 0..15 and the
+  bits are documented (1 edge, 2 checker, 4 junction, 8 line).
+- Default behaviour is unchanged: v4.4 vs v4.5 binaries produce
+  bit-identical outputs on autoblur/autodeblur/adaptive/sdf spot runs;
+  scale sweep 204/204 PASS.
+
+Quick recipe -- pin what an auto run chose:
+
+```sh
+./celup_lab in.webp probe.webp 4 -m autodeblur            # note stderr
+./celup_lab in.webp final.webp 4 -m autodeblur \
+  -k bspline -r 1.23 -c linear -D remap -g 2.5            # exact rerun
+```
+
 ## v4.4: tunable edge-width goal (-e), auto-chosen deblur methods (-D)
 
 The autoblur fit's validation proxy is biased to little blur (a sharper

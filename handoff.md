@@ -1,5 +1,41 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.5 update (2026-07-31): manual pins for every auto parameter; complete help
+
+User question: "can these params be set manually? in help there is no
+list of all possibilities."
+
+Audit answer: the autoblur/autodeblur run-time parameters (kernel,
+sigma, curve, curve param) were already pinnable individually since
+v4.2 (`-k/-r/-c/-p`; the fit skips pinned dimensions), method since
+v4.4 (`-D`) -- but the help never said so, and `-r` was mislabelled
+"*blurcompress modes" only. Steepness was only indirectly reachable
+through the `-s` formula. v4.5 closes all of that:
+
+- `--help` rewritten: all 23 modes enumerated, every option with its
+  complete value set and defaults, plus a "what is automatic / how to
+  pin it" table mapping each auto-chosen parameter to its flag.
+- NEW `-g, --deblur-steepness K` (1..8, 0=auto): exact autodeblur slope
+  multiplier. Priority `-g` > `-e` per-edge adaptation > `-s` formula;
+  `-e` still steers the blur fit when combined with `-g`.
+- Manual is authoritative: `-e` sigma escalation now skips when `-r`
+  pins sigma (one stderr note); full pin (`-k -r -c -p`) skips the
+  validation fit entirely and reports `autoblur manual: ...`.
+- Effective values are echoed (stderr + Done line now includes
+  method/steepness for autodeblur), so an auto run can be replayed
+  exactly by pinning its reported numbers.
+- `-d/--adaptive-debug` is a bitmask; bit 8 (line class) existed in the
+  renderer but the parser capped at 7 -- range fixed to 0..15 and the
+  bits documented in help.
+- No default change: v4.4 and v4.5 binaries are bit-identical on
+  autodeblur 2x/4x(-e 1.5), autoblur, adaptive, sdf spot checks; scale
+  sweep 204/204 PASS; clean -Wall -Wextra -Wshadow build.
+- Verified interactions: `-e 2 -r .5` (escalation skipped, manual
+  sigma), `-e 2 -g 5` (blur still goal-escalated, steepness pinned),
+  `-g 9` rejected with exit 2. Visual: miya face strip at 8x
+  `-g 1 / auto / -g 8 -e 2` -- monotone soft->crisp, no halo fringes
+  at max steepness (review/mf_steepness.png, gitignored).
+
 # v4.4 update (2026-07-30): edge-width goal, auto-chosen deblur methods
 
 User feedback: "autoblur chooses not enough blur to get rid of sawtooth

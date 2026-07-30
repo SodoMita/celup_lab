@@ -1,8 +1,10 @@
-celup_lab.c                  v4.4 C source: edge-width goal (-e) + auto-chosen deblur
-                             methods (-D) on fitted autoblur base; gradient-only
-                             suppression, sdf halo guard, alpha cleanup, short CLI
-README_lab.md                Mode usage notes, v4.4 recommendations, options/help
-handoff.md                   v4.4..v2 updates (what changed + measurements) + v1 history
+celup_lab.c                  v4.5 C source: all auto parameters manually pinnable
+                             (-k/-r/-c/-p/-D/-g), complete --help, manual-wins-over-goal;
+                             v4.4 edge-width goal (-e) + auto deblur methods on fitted
+                             autoblur base; gradient-only suppression, sdf halo guard,
+                             alpha cleanup, short CLI
+README_lab.md                Mode usage notes, v4.5 pin table + v4.4 recommendations
+handoff.md                   v4.5..v2 updates (what changed + measurements) + v1 history
 evaluate_upscalers.py        Text metric evaluator (MAE, pm-linear)
 hourglass_metric.py          Artifact metric (HG amplitude, CHK) + torture scenes
 make_lab_comparison_sheets.py Sheet generator; checker/crosshatch/rings + classmap + autoblur + sdf
@@ -21,7 +23,7 @@ comparison_sheets/comparison_sheet.png
                              regenerate with make_lab_comparison_sheets.py)
 
 Git: this snapshot is delivered as a git bundle of the whole lab repo
-(celup_lab_v4.4.bundle). Clone it with: git clone celup_lab_v4.4.bundle celup_lab
+(celup_lab_v4.5.bundle). Clone it with: git clone celup_lab_v4.5.bundle celup_lab
 The repo contains code and text only: images, generated sheets, fixtures and
 build outputs are gitignored and reproduced by the scripts above
 (test images: tests/make_test_sources.py; sheets/examples: make_lab_comparison_sheets.py).
