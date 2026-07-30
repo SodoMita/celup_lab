@@ -38,6 +38,44 @@ cc -O3 -DNDEBUG -std=c99 -march=native celup_lab.c -o celup_lab \
 ```
 
 All modes use linear-light premultiplied RGBA and lossless WebP output.
+Run `./celup_lab --help` for the full grouped help with short-flag aliases
+(`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
+
+## v4.2: gradient-only suppression, sdf halo guard, alpha cleanup, CLI
+
+- **Hourglass/speckle suppression only touches directed gradients, never
+  symmetric inputs.** Both cleanup passes (`remove_hourglass_basis` and the
+  v4.1 loner/domino speckle pass) are now multiplied by a structure-tensor
+  *direction gate*: the 3x3 gradient outer-products must align behind one
+  dominant orientation (edges/ramps/line flanks) for suppression to apply.
+  Symmetric centres -- dots, star cusps, checker phases, junction
+  crossings, isolated Nyquist pixels -- pass through verbatim. On the miya
+  art asset this removed the dark ring adaptive used to draw around
+  symmetric dots and the speckles sdf left near them; torture-set HG is
+  essentially unchanged (crosshatch .00878->.00884, checker2 .00319->
+  .00397, checker1 unchanged, rings/diag/corner unchanged).
+- **sdf halo guard**: the re-thresholded colour is clamped to the local
+  3x3 source envelope (union with the base pixel's own excursion). Any
+  overshoot beyond what the source neighbourhood supports is a halo by
+  definition and is clipped -- kills the bright fringes/dark notches sdf
+  could draw along strong edges. MAE impact ~1e-4; sharpening preserved.
+- **Alpha garbage cleanup** (`-A T, --alpha-clean T`, default 10, 0=off):
+  lossy web assets hide bright RGB under alpha 0 and sprinkle isolated
+  semi-transparent salt (alpha 1..~150) over "empty" regions; resampling
+  reproduces it and sharpening amplifies it. At load, alpha==0 pixels are
+  zeroed, isolated <=T dust is wiped, and fully isolated mid-alpha specks
+  (no neighbour at half their alpha) are removed. Genuine faint glows and
+  >=2px sparkles (which always have comparable-alpha neighbours) survive.
+  On miya: semi-transparent background dust 46710 -> 2241 px (nearest).
+- **CLI overhaul**: `-h/--help` prints a full grouped help (recommended
+  modes, every option, ranges, defaults). Every long option has a short
+  alias: `-m -s -r -a -P -A -k -c -p -M -d`. Old long flags unchanged.
+- **Scale testing**: `tests/test_scales.py` sweeps every mode at 1.5, 2-6,
+  8, 10, 12, 16, 20, 24x (yes, past 20x) on a synthetic AA circle plus a
+  32x11 face strip at 2/4/8/16/22x -- asserting dimensions, zero staircase
+  treads and bounded AA steps. 187/187 pass. Extreme scales only need a
+  small source window to expose artifact patterns; full-frame 22x renders
+  are pointless for that.
 
 ## Which mode should I use? (v4)
 

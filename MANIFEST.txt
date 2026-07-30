@@ -1,7 +1,8 @@
-celup_lab.c                  v4.1 C source: plane-field sdf + speckle suppression +
-                             autoblur continuous renderer + all v3/v2/v1 modes
-README_lab.md                Mode usage notes, v4.1 recommendations, autoblur options
-handoff.md                   v4.1/v4/v3/v2 updates (what changed + measurements) + v1 history
+celup_lab.c                  v4.2 C source: gradient-only suppression gates, sdf halo
+                             guard, alpha-garbage cleanup, short-flag CLI; plane-field
+                             sdf + speckle suppression + autoblur renderer + v3/v2/v1
+README_lab.md                Mode usage notes, v4.2 recommendations, options/help
+handoff.md                   v4.2/v4.1/v4/v3/v2 updates (what changed + measurements) + v1 history
 evaluate_upscalers.py        Text metric evaluator (MAE, pm-linear)
 hourglass_metric.py          Artifact metric (HG amplitude, CHK) + torture scenes
 make_lab_comparison_sheets.py Sheet generator; checker/crosshatch/rings + classmap + autoblur + sdf
@@ -10,13 +11,17 @@ comparison_sheets.md         Text-only metrics from the latest comparison run (2
 build.sh                     Simple build command
 tests/make_test_sources.py   Regenerates all test fixtures (torture/pixelart/hline8/
                              grad8/thin96/parallel96/rings96) bit-exactly
+tests/test_scales.py         Scale-sweep regression: all modes x 1.5..24x on a synthetic
+                             AA circle + miya face strip at 2..22x (dims/staircase/AA-step)
+tests/make_miya_fixtures.py  Derives the miya face fixtures when the user asset
+                             tests/miya_normal.webp is present (skips quietly otherwise)
 docs/review_*.png            Visual evidence (gitignored; crops regenerated per release)
 comparison_sheets/comparison_sheet.png
                              Combined all-modes x all-scenes image (gitignored;
                              regenerate with make_lab_comparison_sheets.py)
 
 Git: this snapshot is delivered as a git bundle of the whole lab repo
-(celup_lab_v4.1.bundle). Clone it with: git clone celup_lab_v4.1.bundle celup_lab
+(celup_lab_v4.2.bundle). Clone it with: git clone celup_lab_v4.2.bundle celup_lab
 The repo contains code and text only: images, generated sheets, fixtures and
 build outputs are gitignored and reproduced by the scripts above
 (test images: tests/make_test_sources.py; sheets/examples: make_lab_comparison_sheets.py).

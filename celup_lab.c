@@ -2455,8 +2455,37 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
       acc[4] += Abs[ka] - Abs[kb];
     }
   }
+  /* v4.2 halo guard: precompute the per-source-pixel 3x3 premultiplied
+     channel envelope.  The re-thresholded colour must stay inside what the
+     source's own local neighbourhood supports (+ a rounding epsilon); any
+     overshoot past it is *by definition* a halo -- bright fringes above the
+     max, dark notches below the min.  sdf only re-places the contour, it
+     may never invent colours brighter/darker than everything around. */
+  float *env = malloc(n * 8 * sizeof *env);
+  if (env)
+    for (int yy = 0; yy < sh; yy++)
+      for (int xx = 0; xx < sw; xx++) {
+        float lo[4] = {1e30f, 1e30f, 1e30f, 1e30f},
+              hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
+        for (int j = -1; j <= 1; j++)
+          for (int i = -1; i <= 1; i++) {
+            float q[4];
+            raw_pm(in, sw, sh, xx + i, yy + j, q);
+            for (int c = 0; c < 4; c++) {
+              if (q[c] < lo[c])
+                lo[c] = q[c];
+              if (q[c] > hi[c])
+                hi[c] = q[c];
+            }
+          }
+        for (int c = 0; c < 4; c++) {
+          env[8 * ((size_t)yy * sw + xx) + c] = lo[c];
+          env[8 * ((size_t)yy * sw + xx) + 4 + c] = hi[c];
+        }
+      }
   for (int x = 0; x < dw; x++) {
     float acc[5] = {0, 0, 0, 0, 0};
+    int sx0 = clampi((int)floorf((x + .5f) * (float)sw / dw), 0, sw - 1);
     for (int y = -R; y <= R; y++) {
       size_t k = (size_t)clampi(y, 0, dh - 1) * dw + x;
       for (int c = 0; c < 4; c++)
@@ -2471,6 +2500,17 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
       float w = a / (a + .5f * m + 1e-8f);
       for (int c = 0; c < 4; c++)
         q[c] = clampf(base[c] + D[4 * k + c] - w * acc[c] * invw, 0.f, 1.f);
+      if (env) {
+        int sy0 = clampi((int)floorf((y + .5f) * (float)sh / dh), 0, sh - 1);
+        const float *e = env + 8 * ((size_t)sy0 * sw + sx0);
+        for (int c = 0; c < 4; c++) {
+          /* The base itself may already exceed the source envelope (its own
+             sharpening); sdf may not exceed the base's own excursion. */
+          float lo = e[c] < base[c] ? e[c] : base[c],
+                hi = e[4 + c] > base[c] ? e[4 + c] : base[c];
+          q[c] = clampf(q[c], lo - 1.5e-3f, hi + 1.5e-3f);
+        }
+      }
       put(out + 4 * k, q[0], q[1], q[2], q[3]);
       int ya = clampi(y + R + 1, 0, dh - 1), yb = clampi(y - R, 0, dh - 1);
       size_t ka = (size_t)ya * dw + x, kb = (size_t)yb * dw + x;
@@ -2479,6 +2519,7 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
       acc[4] += M[ka] - M[kb];
     }
   }
+  free(env);
   free(Abs);
   free(M);
   free(D);
@@ -2913,11 +2954,59 @@ static int refine_downsample_consistency(float *hr, const uint8_t *in, int sw,
    checker/junction-ambiguous cells (the w_hg gate) a strong loner is the
    leftover signature of bow-tie/hourglass phase, and the basis fit alone
    cannot remove it because it is already orthogonal to the smooth bases. */
+/* Directed-gradient gate for suppression passes (v4.2).  User directive:
+   hourglass/speckle removal must only act on *gradients*, never on
+   symmetric inputs.  A symmetric feature (dot, star cusp, checker cell,
+   junction crossing, isolated Nyquist pixel) has gradient directions that
+   cancel or split; a clean edge/ramp/line flank has one dominant gradient
+   orientation.  Measure that with the 3x3 structure tensor of the pm
+   luminance proxy: gate = coherence * mag-reliability, where
+   coherence = sqrt((Jxx-Jyy)^2 + 4 Jxy^2) / (Jxx+Jyy)  (1 = single
+   orientation, 0 = isotropic/cross) and the reliability term
+   Jsum/(Jsum+K) asks for real gradient energy above flat noise.  Result:
+   edges, ramps and thin-line flanks keep full suppression; symmetric
+   centres, dot fields and checker phases get ~none. */
+static float *build_direction_gate(const uint8_t *in, int sw, int sh) {
+  size_t n = (size_t)sw * sh;
+  float *t = malloc(n * sizeof *t), *g = malloc(n * sizeof *g);
+  if (!t || !g) {
+    free(t);
+    free(g);
+    return NULL;
+  }
+  for (int y = 0; y < sh; y++)
+    for (int x = 0; x < sw; x++) {
+      float q[4];
+      raw_pm(in, sw, sh, x, y, q);
+      t[(size_t)y * sw + x] = (q[0] + q[1] + q[2]) * (1.f / 3.f);
+    }
+  for (int y = 0; y < sh; y++)
+    for (int x = 0; x < sw; x++) {
+      float jxx = 0.f, jxy = 0.f, jyy = 0.f;
+      for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++) {
+          int cx = clampi(x + i, 1, sw - 2), cy = clampi(y + j, 1, sh - 2);
+          float gx = t[(size_t)cy * sw + cx + 1] - t[(size_t)cy * sw + cx - 1],
+                gy = t[(size_t)(cy + 1) * sw + cx] -
+                     t[(size_t)(cy - 1) * sw + cx];
+          jxx += gx * gx;
+          jxy += gx * gy;
+          jyy += gy * gy;
+        }
+      float dxx = jxx - jyy,
+            coh = sqrtf(dxx * dxx + 4.f * jxy * jxy) / (jxx + jyy + 1e-12f);
+      float mag = jxx + jyy;
+      g[(size_t)y * sw + x] = coh * mag / (mag + .02f);
+    }
+  free(t);
+  return g;
+}
 static void suppress_speckle_pm(float *hr, int dw, int dh, const uint8_t *in,
                                 int sw, int sh, float amount,
                                 const float *gate) {
   if (amount <= 0.f)
     return;
+  float *dgate = build_direction_gate(in, sw, sh); /* NULL: ungated fallback */
   (void)in; /* signature parity with remove_hourglass_basis */
   float xscale = (float)sw / dw, yscale = (float)sh / dh;
   /* Snapshot for detection so replacements do not cascade. */
@@ -2927,11 +3016,16 @@ static void suppress_speckle_pm(float *hr, int dw, int dh, const uint8_t *in,
     return;
   memcpy(snap, hr, n * 4 * sizeof *snap);
 #define SPK_G(x, y)                                                            \
-  (gate ? gate[(size_t)clampi((int)floorf(((y) + .5f) * yscale - .5f), 0,      \
-                              sh - 1) *                                        \
-                  sw +                                                         \
-              clampi((int)floorf(((x) + .5f) * xscale - .5f), 0, sw - 1)]      \
-        : 1.f)
+  ((gate ? gate[(size_t)clampi((int)floorf(((y) + .5f) * yscale - .5f), 0,     \
+                               sh - 1) *                                       \
+                   sw +                                                        \
+               clampi((int)floorf(((x) + .5f) * xscale - .5f), 0, sw - 1)]     \
+        : 1.f) *                                                               \
+   (dgate ? dgate[(size_t)clampi((int)floorf(((y) + .5f) * yscale - .5f), 0,  \
+                                 sh - 1) *                                     \
+                     sw +                                                      \
+                 clampi((int)floorf(((x) + .5f) * xscale - .5f), 0, sw - 1)]   \
+          : 1.f))
 #define SPK_P(img, x, y) ((img) + 4 * ((size_t)(y) * dw + (x)))
   for (int y = 1; y + 1 < dh; y++)
     for (int x = 1; x + 1 < dw; x++) {
@@ -3041,6 +3135,7 @@ static void suppress_speckle_pm(float *hr, int dw, int dh, const uint8_t *in,
   free(snap);
 #undef SPK_G
 #undef SPK_P
+  free(dgate);
 }
 /* gate: optional per-source-pixel multiplier map (class map w_hg) that
    focuses the removal on genuinely ambiguous cells; pass NULL for the
@@ -3052,8 +3147,12 @@ static void remove_hourglass_basis(float *hr, int dw, int dh, const uint8_t *in,
   float *mean = calloc(cells * 2, sizeof *mean), *cnt = calloc(cells, sizeof *cnt),
         *gram = calloc(cells * 3, sizeof *gram),
         *acc = calloc(cells * 8, sizeof *acc);
+  /* v4.2: suppression is restricted to directed gradients (see
+     build_direction_gate): symmetric cells -- dots, checker phases, junction
+     crossings, star cusps -- keep their content verbatim. */
+  float *dgate = build_direction_gate(in, sw, sh);
   if (!mean || !cnt || !gram || !acc) {
-    free(mean); free(cnt); free(gram); free(acc);
+    free(mean); free(cnt); free(gram); free(acc); free(dgate);
     return;
   }
   /* Pass 0: basis means on the actual sampled points in each interpolation
@@ -3127,6 +3226,8 @@ static void remove_hourglass_basis(float *hr, int dw, int dh, const uint8_t *in,
       float a = amount;
       if (gate)
         a *= .05f + .95f * gate[k];
+      if (dgate)
+        a *= dgate[k];
       if (a <= 1e-4f)
         continue;
       if (det > 1e-12f) {
@@ -3141,7 +3242,7 @@ static void remove_hourglass_basis(float *hr, int dw, int dh, const uint8_t *in,
       }
     }
   }
-  free(mean); free(cnt); free(gram); free(acc);
+  free(mean); free(cnt); free(gram); free(acc); free(dgate);
   clamp_hr_to_source_neighbourhood(hr, dw, dh, in, sw, sh);
 }
 
@@ -3564,6 +3665,70 @@ static int upscale(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
   free(cache);
   return 1;
 }
+/* Input hygiene for web-asset sources (v4.2, default on).
+   Lossy WebP encoders leave garbage in fully- and nearly-transparent
+   pixels: random bright RGB under alpha 0, plus semi-transparent salt
+   (alpha 1..~150) sprinkled over "empty" regions.  Straight resampling
+   reproduces that as confetti and every sharpening mode amplifies it.
+   alpha_despeckle (threshold from --alpha-clean/-A, 0 disables):
+   1. alpha == 0         -> zero RGB (cosmetic; pm math ignores it anyway);
+   2. 0 < alpha <= floor -> zero unless part of a connected faint region
+      (needs >2 of 8 neighbours above floor);
+   3. isolated salt      -> zero mid-alpha specks: alpha in (floor, 160],
+      alpha brighter than every neighbour by > 3x + 24 and no neighbour
+      reaching half its alpha.  Genuine dots/sparkles are >= 2 px and
+      always have a comparable-alpha neighbour, so they survive. */
+static float alpha_clean_floor = 10.f;
+static void alpha_despeckle(uint8_t *px, int w, int h, int floor_) {
+  size_t n = (size_t)w * h;
+  for (size_t k = 0; k < n; k++)
+    if (px[4 * k + 3] == 0)
+      px[4 * k + 0] = px[4 * k + 1] = px[4 * k + 2] = 0;
+  if (floor_ <= 0)
+    return;
+  uint8_t *al = malloc(n), *zero = malloc(n);
+  if (!al || !zero) {
+    free(al);
+    free(zero);
+    return;
+  }
+  for (size_t k = 0; k < n; k++)
+    al[k] = px[4 * k + 3];
+  memset(zero, 0, n);
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w; x++) {
+      size_t k = (size_t)y * w + x;
+      int a = al[k];
+      if (!a)
+        continue;
+      int above = 0, nmax = 0, half = 0;
+      for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++) {
+          if (!i && !j)
+            continue;
+          int ax = x + i, ay = y + j;
+          if (ax < 0 || ax >= w || ay < 0 || ay >= h)
+            continue;
+          int na = al[(size_t)ay * w + ax];
+          if (na > floor_)
+            above++;
+          if (na > nmax)
+            nmax = na;
+          if (na >= (a + 1) / 2)
+            half++;
+        }
+      if (a <= floor_) {
+        if (above <= 2)
+          zero[k] = 1;
+      } else if (a <= 160 && a > 3 * nmax + 24 && !half)
+        zero[k] = 1;
+    }
+  for (size_t k = 0; k < n; k++)
+    if (zero[k])
+      memset(px + 4 * k, 0, 4);
+  free(al);
+  free(zero);
+}
 static uint8_t *slurp(const char *name, size_t *n) {
   FILE *f = fopen(name, "rb");
   long z;
@@ -3582,29 +3747,82 @@ static uint8_t *slurp(const char *name, size_t *n) {
   *n = (size_t)z;
   return p;
 }
+static void print_help(const char *argv0) {
+  printf(
+      "celup_lab -- premultiplied-linear WebP upscaler (research build "
+      "v4.2)\n"
+      "\n"
+      "Usage: %s in.webp out.webp SCALE [options]\n"
+      "  SCALE is the upsampling factor, real number in (1,32] "
+      "(e.g. 2, 3, 4.5, 10).\n"
+      "\n"
+      "Recommended modes (-m):\n"
+      "  adaptive      natural images and mixed art; classifies each patch\n"
+      "                (edge/checker/junction/gradient) and picks a safe\n"
+      "                interpolation policy per patch\n"
+      "  autoblur      fits the blur the source was probably downsampled\n"
+      "                through and renders at target resolution -- smooth,\n"
+      "                round contours at high scale, no sawtooth\n"
+      "  triangle      softest, no ringing or halos; safe default for art\n"
+      "  sdf           fitted signed-distance contour sharpening on top of\n"
+      "                adaptive; crispest edges, tune with -s\n"
+      "  nearest       pixel art / hard 1px texture\n"
+      "\n"
+      "Other modes: bilinear cubic(default) mitchell lanczos2 lanczos3 blur\n"
+      "  compress safecompress blurcompress safeblurcompress edgecompress\n"
+      "  deblurcompress dehourglass consistentcompress hourglasscompress\n"
+      "  scale2x classmap(diagnostic class-map dump)\n"
+      "\n"
+      "Options:\n"
+      "  -m, --mode MODE           reconstruction mode (default: cubic)\n"
+      "  -s, --strength N          compress/sharpen strength 1..100 (default "
+      "4)\n"
+      "  -r, --blur-radius R       blur radius .1..40 for *blurcompress modes\n"
+      "  -a, --auto-tune           auto-tune blur radius+strength for the "
+      "*blurcompress modes\n"
+      "  -P, --checker-policy P    adaptive Nyquist-checker policy:\n"
+      "                            lowpass|bilinear|nearest|mitchell|scale2x|"
+      "auto\n"
+      "  -A, --alpha-clean T       transparent-pixel garbage cleanup 0..64\n"
+      "                            (default 10; 0 disables): wipes hidden-RGB\n"
+      "                            and isolated semi-transparent salt left by\n"
+      "                            lossy encoders in empty regions\n"
+      "  -k, --blur-kernel K       autoblur kernel box|triangle|gaussian|"
+      "bspline|auto\n"
+      "  -c, --blur-curve C        autoblur gradient curve linear|sigmoid|"
+      "cubic|exp|log|sqrt|circle|nearest|auto\n"
+      "  -p, --curve-param P       autoblur curve shape parameter 0..40\n"
+      "  -M, --max-mib M           memory budget in MiB 32..65536 (default "
+      "512);\n"
+      "                            sdf/adaptive need roughly 40..80 B per\n"
+      "                            output pixel -- big images at 3x+ need -M\n"
+      "                            2048 or more\n"
+      "  -d, --adaptive-debug N    class-map debug level 0..7\n"
+      "  -h, --help                this text\n"
+      "\n"
+      "Output is always lossless WebP.  Hourglass/speckle suppression in the\n"
+      "compress family and adaptive/sdf only acts on directed gradients;\n"
+      "symmetric content (dots, checkerboards, junctions) is passed through\n"
+      "verbatim.\n",
+      argv0);
+}
 int main(int ac, char **av) {
   const char *mode = "cubic";
   int mode_explicit = 0;
+  for (int i = 1; i < ac; i++)
+    if (!strcmp(av[i], "-h") || !strcmp(av[i], "--help")) {
+      print_help(av[0]);
+      return 0;
+    }
   if (ac < 4) {
-    fprintf(stderr,
-            "Usage: %s in.webp out.webp scale [--mode MODE] [--strength "
-            "1..100] [--blur-radius R] [--auto-blurcompress] "
-            "[--checker-policy P] [--blur-kernel K] [--blur-curve C] "
-            "[--curve-param K2] [--max-mib M]\n"
-            "Modes: adaptive autoblur sdf nearest bilinear cubic mitchell "
-            "lanczos2 lanczos3 blur compress safecompress blurcompress "
-            "safeblurcompress edgecompress deblurcompress dehourglass "
-            "consistentcompress hourglasscompress triangle scale2x classmap\n"
-            "Checker policies (adaptive): lowpass bilinear nearest mitchell "
-            "scale2x auto\n"
-            "Blur kernels (autoblur): box triangle gaussian bspline auto\n"
-            "Gradient curves (autoblur): linear sigmoid cubic exp log sqrt "
-            "circle nearest auto\n",
-            av[0]);
+    fprintf(stderr, "Usage: %s in.webp out.webp scale [options]\n"
+                    "Try '%s --help' for modes and options.\n",
+            av[0], av[0]);
     return 2;
   }
   for (int i = 4; i < ac;) {
-    if (!strcmp(av[i], "--auto-blurcompress") || !strcmp(av[i], "--auto-tune")) {
+    if (!strcmp(av[i], "--auto-blurcompress") ||
+        !strcmp(av[i], "--auto-tune") || !strcmp(av[i], "-a")) {
       auto_blurcompress = 1;
       if (!mode_explicit)
         mode = "deblurcompress";
@@ -3615,18 +3833,18 @@ int main(int ac, char **av) {
       fprintf(stderr, "Missing option value for %s\n", av[i]);
       return 2;
     }
-    if (!strcmp(av[i], "--mode")) {
+    if (!strcmp(av[i], "--mode") || !strcmp(av[i], "-m")) {
       mode = av[i + 1];
       mode_explicit = 1;
     }
-    else if (!strcmp(av[i], "--strength")) {
+    else if (!strcmp(av[i], "--strength") || !strcmp(av[i], "-s")) {
       char *e;
       compress_strength = strtof(av[i + 1], &e);
       if (*e || compress_strength < 1.f || compress_strength > 100.f) {
         fprintf(stderr, "Strength must be in [1,100]\n");
         return 2;
       }
-    } else if (!strcmp(av[i], "--blur-radius")) {
+    } else if (!strcmp(av[i], "--blur-radius") || !strcmp(av[i], "-r")) {
       char *e;
       blur_radius = strtof(av[i + 1], &e);
       if (*e || blur_radius < .1f || blur_radius > 40.f) {
@@ -3634,7 +3852,7 @@ int main(int ac, char **av) {
         return 2;
       }
       blur_radius_set = 1;
-    } else if (!strcmp(av[i], "--blur-kernel")) {
+    } else if (!strcmp(av[i], "--blur-kernel") || !strcmp(av[i], "-k")) {
       if (!strcmp(av[i + 1], "box"))
         blur_kernel_kind = BK_BOX;
       else if (!strcmp(av[i + 1], "triangle"))
@@ -3649,7 +3867,7 @@ int main(int ac, char **av) {
         fprintf(stderr, "Unknown blur kernel: %s\n", av[i + 1]);
         return 2;
       }
-    } else if (!strcmp(av[i], "--blur-curve")) {
+    } else if (!strcmp(av[i], "--blur-curve") || !strcmp(av[i], "-c")) {
       if (!strcmp(av[i + 1], "linear"))
         blur_curve_kind = CK_LINEAR;
       else if (!strcmp(av[i + 1], "sigmoid"))
@@ -3672,14 +3890,14 @@ int main(int ac, char **av) {
         fprintf(stderr, "Unknown blur curve: %s\n", av[i + 1]);
         return 2;
       }
-    } else if (!strcmp(av[i], "--curve-param")) {
+    } else if (!strcmp(av[i], "--curve-param") || !strcmp(av[i], "-p")) {
       char *e;
       curve_param = strtof(av[i + 1], &e);
       if (*e || curve_param < 0.f || curve_param > 40.f) {
         fprintf(stderr, "curve-param must be in [0,40]\n");
         return 2;
       }
-    } else if (!strcmp(av[i], "--checker-policy")) {
+    } else if (!strcmp(av[i], "--checker-policy") || !strcmp(av[i], "-P")) {
       if (!strcmp(av[i + 1], "lowpass"))
         checker_policy = POLICY_LOWPASS;
       else if (!strcmp(av[i + 1], "bilinear"))
@@ -3696,14 +3914,21 @@ int main(int ac, char **av) {
         fprintf(stderr, "Unknown checker policy: %s\n", av[i + 1]);
         return 2;
       }
-    } else if (!strcmp(av[i], "--adaptive-debug")) {
+    } else if (!strcmp(av[i], "--adaptive-debug") || !strcmp(av[i], "-d")) {
       char *e;
       adaptive_debug = (int)strtol(av[i + 1], &e, 10);
       if (*e || adaptive_debug < 0 || adaptive_debug > 7) {
         fprintf(stderr, "adaptive-debug must be in [0,7]\n");
         return 2;
       }
-    } else if (!strcmp(av[i], "--max-mib")) {
+    } else if (!strcmp(av[i], "--alpha-clean") || !strcmp(av[i], "-A")) {
+      char *e;
+      alpha_clean_floor = strtof(av[i + 1], &e);
+      if (*e || alpha_clean_floor < 0.f || alpha_clean_floor > 64.f) {
+        fprintf(stderr, "alpha-clean must be in [0,64]\n");
+        return 2;
+      }
+    } else if (!strcmp(av[i], "--max-mib") || !strcmp(av[i], "-M")) {
       char *e;
       max_mib = strtof(av[i + 1], &e);
       if (*e || max_mib < 32.f || max_mib > 65536.f) {
@@ -3711,7 +3936,7 @@ int main(int ac, char **av) {
         return 2;
       }
     } else {
-      fprintf(stderr, "Unknown option: %s\n", av[i]);
+      fprintf(stderr, "Unknown option: %s (see --help)\n", av[i]);
       return 2;
     }
     i += 2;
@@ -3757,6 +3982,7 @@ int main(int ac, char **av) {
     fprintf(stderr, "WebP decode failed\n");
     return 1;
   }
+  alpha_despeckle(in, w, h, (int)(alpha_clean_floor + .5f));
   int ow = (int)(w * scale + .5), oh = (int)(h * scale + .5);
   if (ow < 1 || oh < 1 || ow > 16384 || oh > 16384 ||
       (size_t)ow * oh > SIZE_MAX / 4) {
