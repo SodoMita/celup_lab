@@ -1812,114 +1812,148 @@ static float shape_curve(int kind, float k, float u) {
   }
 }
 
-/* 1D kernel profiles with roughly comparable spreads at equal sigma. */
-static int build_1d_kernel(int kind, float sigma, float *ker) {
-  int r = 1;
-  float sum = 0.f;
-  if (sigma < .05f)
-    sigma = .05f;
+/* Continuous 1D kernel profiles (source-pixel units), v4.
+
+   v3 blurred the source *at its own resolution* and then sampled with a
+   shaped 2x2 tap.  For the small sigmas the self-supervised fit prefers,
+   that discrete blur degenerated to ~identity, so at large scale factors
+   every source pixel rendered as an individually shaded block (C1 seams at
+   each cell border -> the "blurry pixels" mosaic), and anti-aliased
+   staircases were tracked as hard one-scale-phase steps ("sawtooth" along
+   slightly wandering horizontal/vertical lines).
+
+   Splatting the *analytic* kernel at the target resolution removes both by
+   construction: transitions always span the true kernel support, never the
+   source grid.  Each profile carries a floor so the support never collapses
+   below ~1 source pixel; kernels are non-negative and the coordinate warp
+   fixes cell endpoints, so the result stays monotone and cannot ring. */
+static float kernel_profile_1d(int kind, float sigma, float x) {
+  float a = fabsf(x);
   switch (kind) {
-  case BK_BOX:
-    r = clampi((int)ceilf(1.5f * sigma), 1, 8);
-    for (int i = -r; i <= r; i++)
-      ker[i + r] = 1.f;
-    break;
-  case BK_TRIANGLE:
-    r = clampi((int)ceilf(2.2f * sigma), 1, 8);
-    for (int i = -r; i <= r; i++)
-      ker[i + r] = (float)(r + 1 - abs(i));
-    break;
+  case BK_BOX: {
+    /* h >= .75: always overlaps 1..2 source pixels (h=.5 would degenerate
+       to nearest-neighbour at continuous coordinates). */
+    float h = 1.5f * sigma;
+    if (h < .75f)
+      h = .75f;
+    return a <= h ? .5f / h : 0.f;
+  }
+  case BK_TRIANGLE: {
+    /* Integer version tapered to 0 at r+1 ~ 2.2 sigma + 1: support s.
+       s >= 1 guarantees the two nearest taps always overlap. */
+    float s = 1.1f * sigma + .5f;
+    if (s < 1.f)
+      s = 1.f;
+    return a < s ? (s - a) / (s * s) : 0.f;
+  }
   case BK_BSPLINE: {
-    r = clampi((int)ceilf(2.5f * sigma), 1, 8);
-    float sc = 1.f / (.9f * sigma + .25f);
-    for (int i = -r; i <= r; i++) {
-      float x = fabsf((float)i * sc);
-      ker[i + r] = x < 1.f ? (4.f - 6.f * x * x + 3.f * x * x * x) / 6.f
-                 : x < 2.f ? (2.f - x) * (2.f - x) * (2.f - x) / 6.f
-                           : 0.f;
-    }
-    break;
+    float s = .9f * sigma + .25f, u, b;
+    if (s < .7f)
+      s = .7f;
+    u = a / s;
+    b = u < 1.f ? (4.f - 6.f * u * u + 3.f * u * u * u) / 6.f
+      : u < 2.f ? (2.f - u) * (2.f - u) * (2.f - u) / 6.f
+                : 0.f;
+    return b / s;
   }
   default: { /* BK_GAUSSIAN */
-    r = clampi((int)ceilf(3.f * sigma), 1, 8);
-    float inv2 = 1.f / (2.f * sigma * sigma);
-    for (int i = -r; i <= r; i++)
-      ker[i + r] = expf(-(float)(i * i) * inv2);
-    break;
+    float s = sigma < .5f ? .5f : sigma;
+    return expf(-.5f * x * x / (s * s)) / (s * 2.5066282746f);
   }
   }
-  for (int i = 0; i <= 2 * r; i++)
-    sum += ker[i];
-  if (sum > 1e-20f)
-    for (int i = 0; i <= 2 * r; i++)
-      ker[i] /= sum;
-  return r;
 }
 
-static float *alloc_kernel_blur_pm(const uint8_t *in, int sw, int sh, int kind,
-                                   float sigma) {
-  float ker[17];
-  int r = build_1d_kernel(kind, sigma, ker);
-  size_t n = (size_t)sw * sh;
-  float *tmp = malloc(n * 4 * sizeof *tmp), *dst = malloc(n * 4 * sizeof *dst);
-  if (!tmp || !dst) {
-    free(tmp);
-    free(dst);
-    return NULL;
+static int kernel_support_1d(int kind, float sigma) {
+  switch (kind) {
+  case BK_BOX: {
+    float h = 1.5f * sigma;
+    return clampi((int)ceilf(h < .75f ? .75f : h), 1, 8);
   }
-  for (int y = 0; y < sh; y++)
-    for (int x = 0; x < sw; x++) {
-      float *q = tmp + 4 * ((size_t)y * sw + x);
-      q[0] = q[1] = q[2] = q[3] = 0.f;
-      for (int i = -r; i <= r; i++) {
-        float p[4];
-        raw_pm(in, sw, sh, x + i, y, p);
-        for (int c = 0; c < 4; c++)
-          q[c] += ker[i + r] * p[c];
-      }
-    }
-  for (int y = 0; y < sh; y++)
-    for (int x = 0; x < sw; x++) {
-      float *q = dst + 4 * ((size_t)y * sw + x);
-      q[0] = q[1] = q[2] = q[3] = 0.f;
-      for (int j = -r; j <= r; j++)
-        for (int c = 0; c < 4; c++)
-          q[c] += ker[j + r] *
-                  tmp[4 * ((size_t)clampi(y + j, 0, sh - 1) * sw + x) + c];
-    }
-  free(tmp);
-  return dst;
+  case BK_TRIANGLE: {
+    float s = 1.1f * sigma + .5f;
+    return clampi((int)ceilf(s < 1.f ? 1.f : s), 1, 8);
+  }
+  case BK_BSPLINE: {
+    float s = .9f * sigma + .25f;
+    if (s < .7f)
+      s = .7f;
+    return clampi((int)ceilf(2.f * s), 1, 8);
+  }
+  default: {
+    float s = sigma < .5f ? .5f : sigma;
+    return clampi((int)ceilf(3.f * s), 1, 8);
+  }
+  }
 }
 
-static void shaped_blur_sample(const float *img, int sw, int sh, float sx,
-                               float sy, int ck, float cp, float q[4]) {
-  int ix = (int)floorf(sx), iy = (int)floorf(sy);
-  float fx = shape_curve(ck, cp, sx - ix), fy = shape_curve(ck, cp, sy - iy);
-  q[0] = q[1] = q[2] = q[3] = 0.f;
-  for (int j = 0; j < 2; j++)
-    for (int i = 0; i < 2; i++) {
-      float ww = (i ? fx : 1.f - fx) * (j ? fy : 1.f - fy);
-      const float *p = img + 4 * ((size_t)clampi(iy + j, 0, sh - 1) * sw +
-                                  clampi(ix + i, 0, sw - 1));
-      for (int c = 0; c < 4; c++)
-        q[c] += ww * p[c];
-    }
+/* Smoothness rank for near-tie fit decisions: box/triangle reach raw MSE
+   minima on crisp sources but render harsher; among candidates within a few
+   percent of the best validation score we deliberately pick the smoother
+   one (artifact-free beats the last epsilon of MAE). */
+static int kernel_smooth_rank(int k) {
+  return k == BK_BSPLINE ? 3 : k == BK_GAUSSIAN ? 2 : k == BK_TRIANGLE ? 1 : 0;
 }
 
+/* Direct continuous rendering: the gradient curve warps the sample
+   coordinate inside each source cell (endpoints fixed, so the warp itself
+   introduces no seams), and the analytic kernel is convolved at the warped
+   position.  Separable: one vertical gather per output row, one horizontal
+   dot per output pixel.  Taps are border-clamped and weights renormalized
+   per output point, so truncation/borders only rebalance existing mass. */
 static int render_soft(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
                        int dh, int kk, float sigma, int ck, float cp) {
-  float *img = alloc_kernel_blur_pm(in, sw, sh, kk, sigma);
-  if (!img)
+  int r = kernel_support_1d(kk, sigma), nt = 2 * r + 1;
+  float *col = malloc((size_t)sw * 4 * sizeof *col);
+  float *wy = malloc((size_t)nt * sizeof *wy);
+  float yscale = (float)sh / dh, xscale = (float)sw / dw;
+  if (!col || !wy) {
+    free(col);
+    free(wy);
     return 0;
+  }
   for (int y = 0; y < dh; y++) {
-    float sy = (y + .5f) * (float)sh / dh - .5f;
+    float sy = (y + .5f) * yscale - .5f;
+    int iy = (int)floorf(sy);
+    float syw = (float)iy + shape_curve(ck, cp, sy - (float)iy);
+    int jy = (int)floorf(syw);
+    float wsum = 0.f;
+    for (int j = -r; j <= r; j++) {
+      wy[j + r] = kernel_profile_1d(kk, sigma, syw - (float)(jy + j));
+      wsum += wy[j + r];
+    }
+    float winv = wsum > 1e-20f ? 1.f / wsum : 0.f;
+    for (int x = 0; x < sw; x++) {
+      float *q = col + 4 * (size_t)x;
+      q[0] = q[1] = q[2] = q[3] = 0.f;
+      for (int j = -r; j <= r; j++) {
+        float p[4];
+        raw_pm(in, sw, sh, x, clampi(jy + j, 0, sh - 1), p);
+        float w = wy[j + r] * winv;
+        for (int c = 0; c < 4; c++)
+          q[c] += w * p[c];
+      }
+    }
     for (int x = 0; x < dw; x++) {
-      float sx = (x + .5f) * (float)sw / dw - .5f, q[4];
-      shaped_blur_sample(img, sw, sh, sx, sy, ck, cp, q);
-      put(out + 4 * ((size_t)y * dw + x), q[0], q[1], q[2], q[3]);
+      float sx = (x + .5f) * xscale - .5f;
+      int ix = (int)floorf(sx);
+      float sxw = (float)ix + shape_curve(ck, cp, sx - (float)ix);
+      int jx = (int)floorf(sxw);
+      float q[4] = {0.f, 0.f, 0.f, 0.f}, ws = 0.f;
+      for (int i = -r; i <= r; i++) {
+        float w =
+            kernel_profile_1d(kk, sigma, sxw - (float)(jx + i));
+        const float *p = col + 4 * (size_t)clampi(jx + i, 0, sw - 1);
+        ws += w;
+        for (int c = 0; c < 4; c++)
+          q[c] += w * p[c];
+      }
+      float inv = ws > 1e-20f ? 1.f / ws : 0.f;
+      put(out + 4 * ((size_t)y * dw + x), q[0] * inv, q[1] * inv, q[2] * inv,
+          q[3] * inv);
     }
   }
-  free(img);
+  free(col);
+  free(wy);
   return 1;
 }
 
@@ -1958,7 +1992,14 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
   int best_c = *ck == CK_AUTO ? CK_LINEAR : *ck;
   double best = 1e300;
 
-  /* Stage 1: kernel + sigma with a linear gradient curve. */
+  /* Stage 1: kernel + sigma with a linear gradient curve.  Record every
+     candidate score, then apply the smoothness prior: among candidates
+     within 3% of the raw best (statistical ties -- the MSE-vs-sharp-target
+     criterion cannot see blockiness) pick the largest sigma and then the
+     smoothest kernel family. */
+  double s1[4 * 6];
+  for (size_t i = 0; i < sizeof s1 / sizeof s1[0]; i++)
+    s1[i] = -1.0;
   for (size_t ki = 0; ki < sizeof kernels / sizeof kernels[0]; ki++) {
     if (*kk != BK_AUTO && kernels[ki] != *kk)
       continue;
@@ -1969,6 +2010,7 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
                        CK_LINEAR, 0.f))
         continue;
       double score = image_pm_mse(recon, in, sw, sh, 2);
+      s1[ki * 6 + si] = score;
       if (score < best) {
         best = score;
         best_k = kernels[ki];
@@ -1976,11 +2018,38 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
       }
     }
   }
-  /* Stage 2: gradient curve family + parameter. */
+  if (best < 1e300) {
+    double thr = best == 0.0 ? 1e-12 : best * 1.03;
+    int brank = -1;
+    for (size_t ki = 0; ki < sizeof kernels / sizeof kernels[0]; ki++) {
+      if (*kk != BK_AUTO && kernels[ki] != *kk)
+        continue;
+      for (size_t si = 0; si < sizeof sigmas / sizeof sigmas[0]; si++) {
+        if (blur_radius_set && fabsf(sigmas[si] - *sigma) > 1e-6f)
+          continue;
+        double score = s1[ki * 6 + si];
+        if (score <= 0 || score > thr)
+          continue;
+        int rank = kernel_smooth_rank(kernels[ki]);
+        if (sigmas[si] > best_s + 1e-6f ||
+            (fabsf(sigmas[si] - best_s) <= 1e-6f && rank > brank)) {
+          best_s = sigmas[si];
+          best_k = kernels[ki];
+          brank = rank;
+        }
+      }
+    }
+  }
+  /* Stage 2: gradient curve family + parameter.  Same near-tie policy:
+     `nearest` (hard step) must win outright by >3%, otherwise the smoothest
+     tied family is kept. */
   if (*ck != CK_AUTO || best == 1e300) {
     best_c = *ck == CK_AUTO ? best_c : *ck;
   } else {
     double best2 = 1e300;
+    double s2[11];
+    for (size_t i = 0; i < sizeof s2 / sizeof s2[0]; i++)
+      s2[i] = -1.0;
     for (size_t ci = 0; ci < sizeof curves / sizeof curves[0]; ci++) {
       if (*ck != CK_AUTO && curves[ci].kind != *ck)
         continue;
@@ -1989,11 +2058,42 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
       if (!render_soft(train, tw, th, recon, sw, sh, best_k, best_s,
                        curves[ci].kind, curves[ci].param))
         continue;
-      double score = image_pm_mse(recon, in, sw, sh, 2);
+      /* Validation MSE is blind to blockiness/sawtooth at large scales:
+         steep curves + a floored kernel track the source staircase at any
+         scale and score equally well.  Penalize the warp's maximum slope,
+         so a steep curve must *truly* fit better (pixel art, where the MSE
+         gap is huge), and smooth content always renders smooth. */
+      float steep = 0.f;
+      for (int g = 0; g < 64; g++) {
+        float u0 = (float)g / 64.f, u1 = (float)(g + 1) / 64.f;
+        float d = (shape_curve(curves[ci].kind, curves[ci].param, u1) -
+                   shape_curve(curves[ci].kind, curves[ci].param, u0)) *
+                  64.f;
+        if (d > steep)
+          steep = d;
+      }
+      double score =
+          image_pm_mse(recon, in, sw, sh, 2) * (1. + .30 * (steep - 1.));
+      s2[ci] = score;
       if (score < best2) {
         best2 = score;
         best_c = curves[ci].kind;
         best_cp = curves[ci].param;
+      }
+    }
+    if (best2 < 1e300) {
+      double thr = best2 == 0.0 ? 1e-12 : best2 * 1.03;
+      for (size_t ci = 0; ci < sizeof curves / sizeof curves[0]; ci++) {
+        if (*ck != CK_AUTO && curves[ci].kind != *ck)
+          continue;
+        if (*cp > 0.f && fabsf(curves[ci].param - *cp) > 1e-6f)
+          continue;
+        double score = s2[ci];
+        if (score > 0 && score <= thr && curves[ci].kind != CK_NEAREST &&
+            best_c == CK_NEAREST) {
+          best_c = curves[ci].kind;
+          best_cp = curves[ci].param;
+        }
       }
     }
     best = best2;
@@ -2025,6 +2125,290 @@ static int upscale_autoblur(const uint8_t *in, int sw, int sh, uint8_t *out,
   fitted_curve = ck;
   fitted_cp = cp;
   return render_soft(in, sw, sh, out, dw, dh, kk, sigma, ck, cp);
+}
+
+/* ---------------------------------------------------------------------------
+   sdf (v4): signed-distance-field edge reconstruction.
+
+   Every confident edge pixel of the class map fits a two-colour patch with a
+   t-plane (blend coordinate as a linear function of space).  From each such
+   fit we extract the sub-pixel position where the plane crosses t=0.5 -- a
+   point on the edge's mid-contour -- the local ramp width 1/|grad t|, and
+   the two premultiplied endpoint colours.  A two-pass vectorial distance
+   transform then gives every source pixel a *signed* distance to the nearest
+   mid-contour (sign = which side its seed pixel was on).
+
+   The signed distance, width, endpoints and seed confidence are upsampled at
+   the target resolution (bounded Mitchell).  The output colour is the
+   bounded-Mitchell base plus a bounded delta that re-thresholds the edge:
+
+     t'      = smoothstep(clamp(.5 + d' / w'_eff, 0, 1))     (SDF iso-crossing)
+     t_base  = projection of the base sample onto A'->B'
+     out     = base + conf' * (t' - t_base) * (B' - A')
+
+   Because the delta is a *difference of threshold coordinates*, it
+   self-annihilates everywhere the SDF is unreliable: flat regions (both t
+   saturated on the same side), junctions/lines/checker pixels (no seeds,
+   conf'=0), and far from any contour (confidence falls off as a Gaussian of
+   the distance).  The reconstruction can only sharpen WHERE an edge was
+   actually measured, along a smooth contour that cannot staircase; the only
+   band it alters is the edge's own ramp, so it cannot ring either.
+--------------------------------------------------------------------------- */
+
+/* Mitchell sampler for an n-channel float field (border-clamped, weight
+   renormalized).  Used to upsample the gathered SDF fields. */
+static void field_mitchell_sample(const float *f, int sw, int sh, int nch,
+                                  float sx, float sy, float *q) {
+  int ix = (int)floorf(sx), iy = (int)floorf(sy);
+  float wx[4], wy[4], sum = 0.f;
+  for (int k = 0; k < 4; k++) {
+    wx[k] = kernel_mitchell(sx - (float)(ix + k - 1));
+    wy[k] = kernel_mitchell(sy - (float)(iy + k - 1));
+  }
+  for (int c = 0; c < nch; c++)
+    q[c] = 0.f;
+  for (int j = 0; j < 4; j++) {
+    int cy = clampi(iy + j - 1, 0, sh - 1);
+    for (int i = 0; i < 4; i++) {
+      int cx = clampi(ix + i - 1, 0, sw - 1);
+      float ww = wx[i] * wy[j];
+      const float *p = f + (size_t)nch * ((size_t)cy * sw + cx);
+      sum += ww;
+      for (int c = 0; c < nch; c++)
+        q[c] += ww * p[c];
+    }
+  }
+  if (fabsf(sum) > 1e-8f) {
+    float inv = 1.f / sum;
+    for (int c = 0; c < nch; c++)
+      q[c] *= inv;
+  }
+}
+
+/* Bilinear sampler for the signed-distance/width/confidence channels:
+   Mitchell's negative lobes ring a signed distance field (the zero-crossing
+   wobbles), and the wobble renders as edge weave. */
+static void field_bilinear_sample(const float *f, int sw, int sh, int nch,
+                                  float sx, float sy, float *q) {
+  int ix = (int)floorf(sx), iy = (int)floorf(sy);
+  float fx = sx - (float)ix, fy = sy - (float)iy;
+  for (int c = 0; c < nch; c++)
+    q[c] = 0.f;
+  for (int j = 0; j < 2; j++)
+    for (int i = 0; i < 2; i++) {
+      const float *p =
+          f + (size_t)nch * ((size_t)clampi(iy + j, 0, sh - 1) * sw +
+                             clampi(ix + i, 0, sw - 1));
+      float w = (i ? fx : 1.f - fx) * (j ? fy : 1.f - fy);
+      for (int c = 0; c < nch; c++)
+        q[c] += w * p[c];
+    }
+}
+
+static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
+                       int dh) {
+  class_map_t cm;
+  if (!build_class_map(in, sw, sh, &cm))
+    return 0;
+  size_t n = (size_t)sw * sh;
+  /* Distance-transform state: offset to nearest seed contour point + id. */
+  float *ox = malloc(n * sizeof *ox), *oy = malloc(n * sizeof *oy);
+  int *sid = malloc(n * sizeof *sid);
+  float *fld = malloc(n * 11 * sizeof *fld); /* d, width, A4, B4, conf */
+  if (!ox || !oy || !sid || !fld) {
+    free(ox);
+    free(oy);
+    free(sid);
+    free(fld);
+    free_class_map(&cm);
+    return 0;
+  }
+  /* Seed: confident coherent-edge pixels whose t-plane is a usable ramp. */
+  for (int y = 0; y < sh; y++)
+    for (int x = 0; x < sw; x++) {
+      size_t k = (size_t)y * sw + x;
+      /* Checker/Nyquist ambiguity suppresses seeding outright: re-fitting
+         geometry there invents structure the class policy says we cannot
+         know. */
+      float c = cm.w_edge[k] * (1.f - cm.w_checker[k]);
+      float gx = cm.edge_gx[k], gy = cm.edge_gy[k];
+      float g2 = gx * gx + gy * gy;
+      if (c > .35f && g2 > .12f * .12f && g2 < 1.4f * 1.4f) {
+        float g = sqrtf(g2);
+        float d0 = (cm.edge_t0[k] - .5f) / g; /* signed, source px */
+        d0 = clampf(d0, -1.2f, 1.2f);
+        ox[k] = -d0 * gx / g;
+        oy[k] = -d0 * gy / g;
+        sid[k] = (int)k;
+      } else {
+        ox[k] = oy[k] = 0.f;
+        sid[k] = -1;
+      }
+    }
+  /* Two-pass vectorial distance transform (8SSEDT neighbourhood). */
+#define SDF_TRY(k, nk, dx, dy)                                                  \
+  do {                                                                          \
+    if (sid[nk] >= 0) {                                                         \
+      float cx_ = ox[nk] + (dx), cy_ = oy[nk] + (dy);                           \
+      float nd = cx_ * cx_ + cy_ * cy_;                                         \
+      if (sid[k] < 0 || nd < ox[k] * ox[k] + oy[k] * oy[k]) {                   \
+        ox[k] = cx_;                                                            \
+        oy[k] = cy_;                                                            \
+        sid[k] = sid[nk];                                                       \
+      }                                                                         \
+    }                                                                           \
+  } while (0)
+  for (int y = 0; y < sh; y++)
+    for (int x = 0; x < sw; x++) {
+      size_t k = (size_t)y * sw + x;
+      if (x > 0)
+        SDF_TRY(k, k - 1, -1.f, 0.f);
+      if (y > 0) {
+        SDF_TRY(k, k - sw, 0.f, -1.f);
+        if (x > 0)
+          SDF_TRY(k, k - sw - 1, -1.f, -1.f);
+        if (x + 1 < sw)
+          SDF_TRY(k, k - sw + 1, 1.f, -1.f);
+      }
+    }
+  for (int y = sh - 1; y >= 0; y--)
+    for (int x = sw - 1; x >= 0; x--) {
+      size_t k = (size_t)y * sw + x;
+      if (x + 1 < sw)
+        SDF_TRY(k, k + 1, 1.f, 0.f);
+      if (y + 1 < sh) {
+        SDF_TRY(k, k + sw, 0.f, 1.f);
+        if (x + 1 < sw)
+          SDF_TRY(k, k + sw + 1, 1.f, 1.f);
+        if (x > 0)
+          SDF_TRY(k, k + sw - 1, -1.f, 1.f);
+      }
+    }
+#undef SDF_TRY
+  /* Gather per-source-pixel SDF fields from the winning seeds.  The sign is
+     the *query pixel's own* side of the seed's colour axis, not the seed's
+     side: between the two flank contours of a thin bright feature both
+     flanks' seeds may sit on opposite t sides, and seed-side signing put a
+     phantom zero-crossing down the feature's midline. */
+  for (int y = 0; y < sh; y++)
+    for (int x = 0; x < sw; x++) {
+      size_t k = (size_t)y * sw + x;
+      float *f = fld + 11 * k;
+      int s = sid[k];
+      if (s < 0) {
+        for (int c = 0; c < 11; c++)
+          f[c] = 0.f;
+        continue;
+      }
+      float dmag = sqrtf(ox[k] * ox[k] + oy[k] * oy[k]);
+      const float *A = cm.edge_side + 8 * (size_t)s;
+      float p[4], tp = 0.f, aa = 0.f;
+      raw_pm(in, sw, sh, x, y, p);
+      for (int c = 0; c < 4; c++) {
+        float ax = A[4 + c] - A[c];
+        tp += (p[c] - A[c]) * ax;
+        aa += ax * ax;
+      }
+      float side = aa > 1e-8f && tp < .5f * aa ? -1.f : 1.f;
+      float g = sqrtf(cm.edge_gx[s] * cm.edge_gx[s] +
+                      cm.edge_gy[s] * cm.edge_gy[s]);
+      float conf = cm.w_edge[s] * (1.f - cm.w_checker[s]) *
+                   expf(-(dmag * dmag) / (2.f * 1.5f * 1.5f));
+      f[0] = side * dmag;
+      f[1] = clampf(1.f / g, .6f, 3.f);
+      for (int c = 0; c < 4; c++) {
+        f[2 + c] = A[c];
+        f[6 + c] = A[4 + c];
+      }
+      f[10] = conf;
+    }
+  /* Straighten the stairs: a [1,2,1]^2 pass over the signed distance lets
+     stair-stepped seed polylines relax to their chord (a straight smooth
+     contour) instead of weaving the rendered edge by +-1 input pixel. */
+  {
+    float *d0 = malloc(n * sizeof *d0), *d1 = malloc(n * sizeof *d1);
+    if (d0 && d1) {
+      for (size_t k = 0; k < n; k++)
+        d0[k] = fld[11 * k];
+      for (int y = 0; y < sh; y++)
+        for (int x = 0; x < sw; x++) {
+          size_t k = (size_t)y * sw + x;
+          d1[k] = (d0[(size_t)y * sw + clampi(x - 1, 0, sw - 1)] +
+                   2.f * d0[k] +
+                   d0[(size_t)y * sw + clampi(x + 1, 0, sw - 1)]) *
+                  .25f;
+        }
+      for (int y = 0; y < sh; y++)
+        for (int x = 0; x < sw; x++) {
+          size_t k = (size_t)y * sw + x;
+          fld[11 * k] =
+              (d1[(size_t)clampi(y - 1, 0, sh - 1) * sw + x] + 2.f * d1[k] +
+               d1[(size_t)clampi(y + 1, 0, sh - 1) * sw + x]) *
+              .25f;
+        }
+    }
+    free(d0);
+    free(d1);
+  }
+  /* Render: bounded-Mitchell base + bounded SDF re-threshold delta. */
+  float wfac = 1.f - .12f * compress_strength;
+  wfac = clampf(wfac, .45f, 1.f);
+  float yscale = (float)sh / dh, xscale = (float)sw / dw;
+  for (int y = 0; y < dh; y++) {
+    float sy = (y + .5f) * yscale - .5f;
+    for (int x = 0; x < dw; x++) {
+      float sx = (x + .5f) * xscale - .5f;
+      float base[4], fm[11], f[11], q[4];
+      mitchell_bounded_sample(in, sw, sh, sx, sy, base);
+      field_bilinear_sample(fld, sw, sh, 11, sx, sy, f);
+      field_mitchell_sample(fld, sw, sh, 11, sx, sy, fm);
+      f[2] = fm[2];         /* endpoint colours keep the smoother kernel; */
+      f[3] = fm[3];
+      f[4] = fm[4];
+      f[5] = fm[5];
+      f[6] = fm[6];
+      f[7] = fm[7];
+      f[8] = fm[8];
+      f[9] = fm[9];
+      float conf = clampf(f[10], 0.f, 1.f);
+      if (conf > 1e-4f) {
+        float w = f[1] * wfac;
+        if (w < .25f)
+          w = .25f;
+        float t = clampf(.5f + f[0] / w, 0.f, 1.f);
+        if (!getenv("CELUP_SDF_LINEAR_RAMP"))
+          t = t * t * (3.f - 2.f * t);
+        /* Project the base sample onto the local colour axis. */
+        const float *A = f + 2, *B = f + 6;
+        float ax[4], aa = 0.f, tb = 0.f;
+        for (int c = 0; c < 4; c++) {
+          ax[c] = B[c] - A[c];
+          aa += ax[c] * ax[c];
+        }
+        if (aa > 1e-8f) {
+          for (int c = 0; c < 4; c++)
+            tb += (base[c] - A[c]) * ax[c];
+          tb = clampf(tb / aa, 0.f, 1.f);
+          float dt = conf * (t - tb);
+          for (int c = 0; c < 4; c++)
+            q[c] = clampf(base[c] + dt * ax[c], 0.f, 1.f);
+        } else {
+          for (int c = 0; c < 4; c++)
+            q[c] = base[c];
+        }
+      } else {
+        for (int c = 0; c < 4; c++)
+          q[c] = base[c];
+      }
+      put(out + 4 * ((size_t)y * dw + x), q[0], q[1], q[2], q[3]);
+    }
+  }
+  free(ox);
+  free(oy);
+  free(sid);
+  free(fld);
+  free_class_map(&cm);
+  return 1;
 }
 
 /* Robust continuous edge compressor.  The first edgecompress attempt used
@@ -2986,7 +3370,7 @@ int main(int ac, char **av) {
             "1..100] [--blur-radius R] [--auto-blurcompress] "
             "[--checker-policy P] [--blur-kernel K] [--blur-curve C] "
             "[--curve-param K2] [--max-mib M]\n"
-            "Modes: adaptive autoblur nearest bilinear cubic mitchell "
+            "Modes: adaptive autoblur sdf nearest bilinear cubic mitchell "
             "lanczos2 lanczos3 blur compress safecompress blurcompress "
             "safeblurcompress edgecompress deblurcompress dehourglass "
             "consistentcompress hourglasscompress triangle scale2x classmap\n"
@@ -3121,7 +3505,7 @@ int main(int ac, char **av) {
       strcmp(mode, "consistentcompress") && strcmp(mode, "hourglasscompress") &&
       strcmp(mode, "triangle") && strcmp(mode, "adaptive") &&
       strcmp(mode, "classmap") && strcmp(mode, "scale2x") &&
-      strcmp(mode, "autoblur")) {
+      strcmp(mode, "autoblur") && strcmp(mode, "sdf")) {
     fprintf(stderr, "Unknown mode: %s\n", mode);
     return 2;
   }
@@ -3171,7 +3555,8 @@ int main(int ac, char **av) {
                     !strcmp(mode, "consistentcompress") ||
                     !strcmp(mode, "hourglasscompress") ||
                     !strcmp(mode, "adaptive");
-    int classified = iterative || !strcmp(mode, "classmap");
+    int classified = iterative || !strcmp(mode, "classmap") ||
+                     !strcmp(mode, "sdf");
     double in_bytes =
         (double)w * h * (classified ? 96.0 : !strcmp(mode, "autoblur") ? 24.0
                                                                       : 4.0);
@@ -3245,6 +3630,8 @@ int main(int ac, char **av) {
     upscale_scale2x(in, w, h, out, ow, oh);
   else if (!strcmp(mode, "autoblur"))
     ok = upscale_autoblur(in, w, h, out, ow, oh);
+  else if (!strcmp(mode, "sdf"))
+    ok = upscale_sdf(in, w, h, out, ow, oh);
   if (!ok) {
     fprintf(stderr, "Allocation failed\n");
     free(out);

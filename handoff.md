@@ -1,5 +1,110 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4 update (2026-07-30): SDF mode, autoblur 8x sawtooth/mosaic fix, git
+
+## What changed since v3
+
+1. **`--mode sdf`: signed-distance-field edge reconstruction.** Every
+   confident coherent-edge pixel of the class map contributes its fitted
+   t-plane's sub-pixel t=0.5 crossing as a *seed point on the edge's
+   mid-contour*, plus ramp width (1/|grad t|, clamp 0.6..3 src px) and the
+   two premultiplied endpoint colours. A two-pass vectorial distance
+   transform (8SSEDT neighbourhood) gives every source pixel a signed
+   distance to the nearest mid-contour; the d/width/endpoint/confidence
+   fields are upsampled to the target grid (d/width/conf: bilinear --
+   Mitchell's negative lobes ring a signed field; endpoints: bounded
+   Mitchell). Output = bounded-Mitchell base + conf * (t' - t_base) *
+   (B'-A'), t' = smoothstep(clamp(.5 + d'/w', 0, 1)) with w' narrowed by
+   `--strength` (factor 1 - 0.12*strength, clamp >= .45). The delta form
+   self-annihilates in flat regions (both t saturate), junctions/lines/
+   checkers (no seeds: confidence 0), and 1.5px+ from any contour, so the
+   mode can only re-shape WHERE an edge was measured. Two subtle fixes
+   mattered (loss-map diagnosed):
+   - **sign by query-side, not seed-side**: between a thin bright feature's
+     two flank contours, seed-side signing put a phantom zero-crossing down
+     the midline (dark stitch). The sign now comes from the *query* pixel's
+     own projection onto the winning seed's colour axis.
+   - **[1,2,1]^2 smoothing of the signed distance field** before upsampling:
+     stair-stepped seed polylines relax to their chord, so the rendered
+     contour is a smooth straight/curved line instead of +-1px weave.
+   Checker/Nyquist-ambiguous pixels suppress seeding outright (edge weight
+   is already checker-peeled; the gate also multiplies the confidence).
+2. **autoblur 8x sawtooth + "blurry pixels" fixed by a renderer swap** (the
+   fit stays). v3 blurred the source *grid* (sigma down to 0.15 degenerates
+   to identity) and sampled with a shaped 2x2 tap: C1 seams at every source
+   cell border (measured 7.1x interior d2 on a smooth gradient -> the
+   "blurry pixels" mosaic), and AA staircases were tracked as hard
+   one-phase steps (measured 38 steps >0.05, max 0.22, down one column ->
+   sawtooth). v4 splats the *analytic* kernel at the target resolution with
+   the gradient curve as a per-cell monotone coordinate warp. Kernel
+   profiles carry floors that guarantee >=1 src px of real support (box is
+   the trap: halfwidth 0.5 at continuous coordinates IS nearest). Selection
+   adds a smoothness prior the proxy MSE cannot express (target is the
+   sharp input): among candidates within 3% MSE, larger sigma / smoother
+   kernel family wins, and curves pay a max-slope penalty (factor
+   1 + 0.3*(steep-1)) so a near-step curve must *truly* fit the image
+   (pixel art still picks it; smooth content never does). Result at 8x:
+   seam/interior 0.71, max column step 0.09-0.18 spread over the full
+   kernel width, fit now picks e.g. bspline/.50/sigmoid instead of
+   gaussian/.15/cubic.
+3. **Git workflow**: the lab now lives in a git repository (`celup_lab` at
+   /home/user/lab/work); deliverables are `git bundle` files of the whole
+   repo history instead of zip snapshots.
+
+## Measured results (v4, pm-linear RGBA)
+
+Standard 9-scene evaluator, MAE (lower better; sharpening trades MAE for
+crispness by design -- v4 sdf default strength):
+
+    scene     bilinear  sdf      autoblur  adaptive  deblurcompress
+    diag      0.01045   0.01248  0.01029   0.00899   0.00735
+    curves    0.00890   0.01046  0.00874   0.00710   0.00549
+    gradient  0.00115   0.00115  0.00115   0.00115   0.00115
+    axis      0.00630   0.00822  0.00612   0.00552   0.00451
+    shallow   0.00374   0.00614  0.00367   0.00310   0.00237
+    thin      0.01103   0.01079  0.01095   0.01007   0.00889
+    corner    0.02342   0.02415  0.02325   0.02253   0.02088
+    parallel  0.00652   0.00749  0.00641   0.00646   0.00540
+    alpha     0.00998   0.01228  0.00981   0.00862   0.00709
+
+Hourglass/parity band (HG, lower = cleaner) on the torture set:
+
+    scene      lanczos3  sdf      autoblur  adaptive  deblurcompress
+    crosshatch 0.02429   0.00524  0.00363   0.00878   0.01232
+    checker2   0.00447   0.00122  0.00428   0.00319   0.00025
+    rings      0.00790   0.00969  0.00260   0.00221   0.00411
+    diag       0.00360   0.00399  0.00127   0.00205   0.00525
+
+sdf is the cleanest *sharp* mode on 1px-Nyquist content (crosshatch HG
+beats adaptive 0.0088 and deblurcompress 0.0123, near autoblur's soft
+0.0036), and visually it is the only mode that removes 1px staircases at
+8x (thin line -> smooth uniform-width stroke). On `rings` (alternating
+curvature at Nyquist) it stays near base level (0.0097 vs mitchell-class
+0.008) because it runs no hourglass remover -- documented; adaptive remains
+the best-rounded default there. autoblur 8x metrics, before -> after:
+gradient cell-seam d2 ratio 7.1 -> 2.4 (invisible: max |dy| 0.008),
+wandering-line column: 38 hard steps (max 0.22) -> smooth ramp (max 0.18
+spread across the ~11px kernel transition, seam ratio 0.71).
+
+Perf (512px, x3): sdf 1.5s, autoblur 1.6s (fit included), adaptive 2.4s.
+
+## Remaining limitations / next ideas (v4)
+
+- sdf MAE sits between bilinear and the sharpeners: ~85% of the residual
+  gap is the deliberate ramp-narrowing at edges; `--strength` widens/
+  narrows it further. The contour-position estimator is locally exact
+  (sub-pixel seed crossings), globally limited by the 8SSEDT chamfer error
+  (~0.1px, invisible) -- a Felzenszwalb exact EDT would be the upgrade.
+- sdf `rings`/curved-Nyquist: seeds there are edge-class (checker peel
+  already zeroes the rest); a curvature-aware conf falloff could gate
+  alternating-curvature fields further.
+- sdf smooths sign-consistent corners by ~1 src px (the d-field blur);
+  junction-class pixels keep the base kernel so genuine corners are
+  largely spared, but a corner-preserving smoothing mask is possible.
+- autoblur's fit is still MSE-based: the 3% near-tie band and slope
+  penalty are hand-set priors; a small perceptual (SSIM/banding) term in
+  the proxy score would make them principled.
+
 # v3 update (2026-07-30): thin-line class, junction sharpening, autoblur
 
 ## What changed since v2

@@ -24,12 +24,13 @@ cc -O3 -DNDEBUG -std=c99 -march=native celup_lab.c -o celup_lab \
 ./celup_lab in.webp deblurcompress.webp 2 --mode deblurcompress --strength 4 --blur-radius .7
 ./celup_lab in.webp auto-blurcompress.webp 2 --auto-blurcompress
 ./celup_lab in.webp autoblur.webp 2 --mode autoblur                       # fitted blurry upscale
+./celup_lab in.webp sdf.webp 2 --mode sdf                                 # signed-distance-field edges
 ./celup_lab in.webp classmap.webp 2 --mode classmap                       # classifier diagnostic
 ```
 
 All modes use linear-light premultiplied RGBA and lossless WebP output.
 
-## Which mode should I use? (v3)
+## Which mode should I use? (v4)
 
 - **adaptive** is the flagship default for natural images. A 5x5 patch
   classifier routes every cell: bounded Mitchell for ordinary content and
@@ -43,7 +44,7 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
   palette, few soft blends) and switches the ambiguous-cell fallback to the
   crisp scale2x sampler; natural images get the lowpass fallback. Use this
   when the input mix is unknown.
-- **autoblur** (v3) is the best *blurry* upscale for the image: no
+- **autoblur** is the best *blurry* upscale for the image: no
   sharpening, no plain bilinear. It decomposes a blurry reconstruction into
   an overall blur kernel (box / triangle / gaussian / bspline + sigma) and a
   gradient transition curve (linear / sigmoid / cubic / exp / log / sqrt /
@@ -51,25 +52,20 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
   2x-downscale validation proxy. It beats bilinear MAE on every test scene
   while never inventing high frequencies -- ideal when you explicitly want
   a soft result with the best-matched transition shape.
-- **deblurcompress** remains the maximum-detail option: same gated iteration
-  core, more iterations, more sharpening. It is ~7.5x faster than v1
-  (per-cell gates are precomputed once) and its crossing/checker artifacts
-  are greatly reduced, but adaptive is still the cleaner default.
-- Pixel art / sprites: `--mode adaptive --checker-policy scale2x` (or
-  `--mode scale2x` for a pure, aliased-hard result) and `--mode nearest`
-  as the zero-invention reference.
-
-- **adaptive** is the flagship default for natural images. A 5x5 patch
-  classifier routes every cell: bounded Mitchell for ordinary content and
-  coherent edges, plain bilinear at junctions/crossings, and an explicit
-  non-inventing policy in checker/Nyquist-ambiguous cells. On top, a few
-  class-gated consistency iterations and a focused hourglass-basis cleanup
-  recover edge sharpness without rebuilding the checkerboard/bow-tie
-  artifacts of the compress/deblur families.
-- **adaptive --checker-policy auto** detects pixel-art-like inputs (hard
-  palette, few soft blends) and switches the ambiguous-cell fallback to the
-  crisp scale2x sampler; natural images get the lowpass fallback. Use this
-  when the input mix is unknown.
+  v4 renders the fit by *continuous kernel splatting* at the target
+  resolution (v3 blurred the source grid, which degenerated to blocky cells
+  and staircase tracking at large scales), so 8x upscales are smooth: no
+  mosaic ("blurry pixels"), no sawtooth on wandering lines.
+- **sdf** (v4) is the smooth-geometry sharp option: it extracts a signed
+  distance field of every confidently measured edge mid-contour (from the
+  classifier's t-planes, propagated by a vectorial distance transform),
+  upsamples the field, and re-thresholds the local two-colour transition
+  against it. Staircases straighten into smooth contours (0.5px weave ->
+  chord), transition width stays as measured (mildly narrowed by
+  `--strength`), and far from measured edges it falls back to the bounded
+  Mitchell base. It removes hourglass/bow-tie structure by construction
+  (single smooth iso-crossing, no parity alternation) and is the cleanest
+  8x line-art upscale: crosshatch HG 0.0052 (lanczos3 0.0243).
 - **deblurcompress** remains the maximum-detail option: same gated iteration
   core, more iterations, more sharpening. It is ~7.5x faster than v1
   (per-cell gates are precomputed once) and its crossing/checker artifacts
@@ -99,7 +95,7 @@ bit 2 = checker, bit 4 = junction, bit 8 = thin-line) to attribute error to
 policy branches. `CELUP_CLASS_DEBUG=1` in the environment prints thin-line
 detection details to stderr.
 
-## autoblur options (v3)
+## autoblur options (v4)
 
 `--blur-kernel box|triangle|gaussian|bspline|auto` picks the overall spatial
 blur kernel; `auto` fits it (and its sigma) for the current image.
@@ -111,6 +107,19 @@ unset is fitted by the internal 2x-downscale validation proxy (two stages:
 kernel+sigma with a linear curve, then the curve family). All curves are
 symmetric about the midpoint and fix both endpoints, so the reconstruction
 is always monotone -- no ringing, no invented colours, by construction.
+
+v4 rendering/selection notes (the 8x fixes):
+- The fitted model is rendered by splatting the *analytic* kernel at the
+  target resolution with the transition curve as a per-cell coordinate warp,
+  not by blurring the source grid and re-sampling. Kernel profiles carry a
+  floor (~1 source px of genuine support), so every source pixel always
+  blends into its neighbours and no per-cell mosaic can form, at any scale.
+- The proxy MSE cannot see blockiness (the validation target is the sharp
+  original), so near-tie picks (within 3% MSE) are resolved toward the
+  larger sigma / smoother kernel family, and steep warp curves pay a
+  max-slope penalty: `nearest` or log4.5 on smooth content must win
+  outright, while genuinely stair-stepped sources (pixel art) still fit
+  them because their MSE gap is huge.
 
 ```sh
 ./celup_lab in.webp out.webp 4 --mode autoblur                                   # full auto fit

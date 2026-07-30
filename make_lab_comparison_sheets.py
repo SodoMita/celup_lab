@@ -48,6 +48,7 @@ MODE_SPECS = (
     ("adaptive auto", "adaptive", ("--checker-policy", "auto")),
     ("adaptive s2x", "adaptive", ("--checker-policy", "scale2x")),
     ("autoblur", "autoblur", ()),
+    ("sdf", "sdf", ()),
 )
 MODE_LABELS = tuple(label for label, _, _ in MODE_SPECS)
 # Classifier visualization is not a MAE candidate; appended to sheets as a

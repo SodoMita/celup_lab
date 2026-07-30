@@ -1,12 +1,18 @@
-celup_lab.c                  v3 C source: thin-line class + autoblur + all v2/v1 modes
-README_lab.md                Mode usage notes, v3 recommendations, autoblur options
-handoff.md                   v3/v2 updates (what changed + measurements) + v1 history
+celup_lab.c                  v4 C source: sdf mode + autoblur continuous renderer + all v3/v2/v1 modes
+README_lab.md                Mode usage notes, v4 recommendations, autoblur options
+handoff.md                   v4/v3/v2 updates (what changed + measurements) + v1 history
 evaluate_upscalers.py        Text metric evaluator (MAE, pm-linear)
 hourglass_metric.py          Artifact metric (HG amplitude, CHK) + torture scenes
-make_lab_comparison_sheets.py Sheet generator; checker/crosshatch/rings + classmap + autoblur
+make_lab_comparison_sheets.py Sheet generator; checker/crosshatch/rings + classmap + autoblur + sdf
 test_celup3.py               Older regression script (sRGB-space; see handoff v2 notes)
-comparison_sheets.md         Text-only metrics from the latest comparison run (21 modes x 11 scenes)
+comparison_sheets.md         Text-only metrics from the latest comparison run (22 mode specs x 11 scenes)
 build.sh                     Simple build command
 docs/review_checker1.png     Visual evidence: Nyquist checker torture, all key modes
 docs/review_crosshatch.png   Visual evidence: crossing thin lines, artifact cleanup
 docs/review_crossing.png     Visual evidence: natural mixed crossing scene + classmap
+docs/review_v4_thin8.png     v4: 1px staircase line at 8x -- bilinear/adaptive/sdf/autoblur
+docs/review_v4_sawtooth8.png v4: wandering diagonal at 8x -- old autoblur vs v4 autoblur vs sdf
+docs/review_v4_grad8.png     v4: smooth gradient at 8x -- old autoblur mosaic vs v4
+
+Git: this snapshot is delivered as a git bundle of the whole lab repo
+(celup_lab_v4.bundle). Clone it with: git clone celup_lab_v4.bundle celup_lab
