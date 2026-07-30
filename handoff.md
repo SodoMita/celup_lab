@@ -1,5 +1,146 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.1 update (2026-07-30): SDF rewrite (plane fields, no Voronoi), speckle suppression
+
+## Why
+
+User feedback on v4.0: the sdf mode was "the worst algorithm here,
+producing lots of artifacts". Crop forensics (CELUP_SDF_DUMP field dumps
++ loss maps on examples/*_source_96) found five artifact classes, all
+rooted in the seeded-contour + Voronoi distance-transform design:
+
+1. **Washboard banding** parallel to strong edges: Voronoi wins
+   alternated from one source row to the next, rippling d along the
+   contour; the large endpoint axes of distant blobs then painted
+   stripes for tens of pixels.
+2. **Rainbow stripes in flat semi-transparent interiors**
+   (curves_alpha): sub-LSB premultiplied noise, amplified by the
+   bounded-Mitchell base, was routed into smooth junction branches where
+   the sdf delta still re-thresholded (confidence ~1e-12 but not 0).
+3. **Phantom midline contours** inside thin features (seed-side signing
+   remnants between the two flank contours).
+4. **Halo pairs** straddling hard edges: the sdf contour position
+   disagreed with where the base kernel put the step.
+5. **Ghost extensions**: a short measured segment's plane extrapolated
+   far beyond its support.
+
+A reference SDF/MSDF implementation from another agent was also
+reviewed: colour-aware Sobel edge mask -> 2-pass chamfer distance
+transform -> sign from the pixel's own alpha>0.5, then *snap to nearest
+neighbour* near the edge (MSDF = same with 3 direction-binned distance
+channels + median combine). The DT+snap approach discards precisely the
+sub-pixel contour position information the plane fit provides, so its
+output is nearest-neighbour plus staircases ("same result as nearest").
+Not adopted; but it out-MAE'd v4.0 sdf on synthetic diagonals
+(0.00846 vs 0.01248), which confirmed v4.0 sdf's deltas were mostly
+noise. The rewrite keeps the fitted sub-pixel information instead.
+
+## What changed in `sdf` (v4.1)
+
+1. **No distance transform, no Voronoi.** Every confident coherent-edge
+   pixel of the class map (w_edge*(1-w_checker) > .35, |grad t| in
+   [.12,1.4]) splats its fitted t-plane as a *signed-distance plane*
+   d_k(p) = (t0 - .5 + g.(p - p0))/|g| into its 9x9 source
+   neighbourhood with a Gaussian weight (sigma 1.5 src px). d, ramp
+   width, endpoints A/B and confidence accumulate as weighted means: an
+   edge votes for a local linear contour model, nothing global.
+2. **Anti-ghost truncation**: splat weight is 0 where |d_k(p)| > 2.6
+   src px, so a short segment cannot paint its plane across the image.
+3. **Ramp-width de-dilution**: the 5-tap LS slope saturates at 0.3 for
+   true AA ramps narrower than ~1.6 px, so naive w = 1/|g| overestimates
+   the width ~2x and dilutes the sharpening. w = g>=.295 ? 1.2 :
+   (1/g < 4.3 ? 1/g - 2.1 : 1/g), clamp [.6,5].
+4. **[1,2,1]^2 d smoothing** + a gradient-coherence gate
+   (|grad d| inside [.5,.8]) folded into conf: regions where splatted
+   planes disagree (crossings, gratings) abstain instead of averaging
+   into mush.
+5. **Render base = full `upscale_adaptive` output**, not bounded
+   Mitchell: out = adaptive + conf * (t' - t_base(decoded adaptive px))
+   * axis, t' = smoothstep(clamp(.5 + d'/w', 0, 1)), w' narrowed by
+   --strength (1 - 0.12*strength, clamp >= .45). sdf thereby inherits
+   adaptive's entire checker/junction/flat policy: Nyquist checkers and
+   crossings are *bit-identical* to adaptive, and artifact classes
+   2/3/4 are gone structurally (the delta only acts where an edge was
+   measured, against the same base that rendered the rest).
+6. **Tone conservation**: the delta's local DC over a box of radius
+   2.5 src px * scale is subtracted, but gated per pixel with
+   w_k = |D_k|/(|D_k| + 0.5*mean|D|). The ungated version injected
+   inverse halos into flat regions (curves_alpha max deviation 74.6 ->
+   normal levels).
+
+`sdf` hourglass/compression call sites also run the new speckle pass
+(below). Perf: 2.66 s on 512x512 at 3x (adaptive 2.0 s); memory = the
+adaptive output plus ~36+40 floats per source pixel of fields.
+
+## Speckle suppression (hourglass removal follow-up)
+
+User-suggested pattern implemented, plus one related one found on the
+torture results. `suppress_speckle_pm()` runs after every
+`remove_hourglass_basis()` call (adaptive .60 gated; deblur .95;
+consistent .80; hourglasscompress .95/.55):
+
+- **loner**: centre pixel deviates from all 8 neighbours by
+  dev > 4*spread + 2.5e-3 (pm units) -> overwrite with the 8-neighbour
+  mean. This is the requested "single pixel surrounded by another
+  colour in a 3x3 grid".
+- **domino**: an axis-aligned pixel *pair* whose mean deviates from an
+  otherwise uniform 10-pixel ring by the same test -> both overwritten
+  with the ring mean (fresh snapshot, so pairs don't mask each other).
+
+Both are gated by w_hg (checker + .65*junction) and share the basis
+remover's policy guard (skipped for nearest/scale2x bases), so genuine
+thin lines survive. Measured: adaptive torture loner count 81 -> 0,
+deblurcompress 5909 -> 0; MAE and HG/CHK unchanged (the pass removes
+isolated specks, not edge amplitude). Other patterns were scanned for
+(1px zippers along edge flanks, etc.); nothing else was safely
+suppressible without eating real 1px detail, so the pass stays minimal.
+
+## Measured results (v4.1, pm-linear RGBA)
+
+Standard 9-scene evaluator, MAE (lower better; sdf at default
+strength):
+
+    scene     bilinear  sdf      autoblur  adaptive  deblurcompress
+    diag      0.01045   0.00876  0.01029   0.00899   0.00735
+    curves    0.00890   0.00636  0.00874   0.00710   0.00549
+    gradient  0.00115   0.00115  0.00115   0.00115   0.00115
+    axis      0.00630   0.00571  0.00612   0.00552   0.00451
+    shallow   0.00374   0.00289  0.00367   0.00310   0.00237
+    thin      0.01103   0.01007  0.01095   0.01007   0.00889
+    corner    0.02342   0.02287  0.02325   0.02253   0.02088
+    parallel  0.00652   0.00637  0.00641   0.00646   0.00540
+    alpha     0.00998   0.00807  0.00981   0.00862   0.00709
+
+sdf beats adaptive on 5/9 (diag, curves, shallow, parallel, alpha),
+ties thin/gradient, trails on axis/corner (junction-dominated scenes
+where sdf abstains and adaptive's junction smoothing is already good).
+Versus v4.0 sdf: diag .01248->.00876, curves .01046->.00636, axis
+.00822->.00571, shallow .00614->.00289, alpha .01228->.00807, corner
+.02415->.02287.
+
+Hourglass amplitude (HG, lower = cleaner), torture set:
+
+    scene      adaptive  sdf      note
+    checker1   0.00540   0.00540  sdf == adaptive (inherited checker policy)
+    checker2   0.00319   0.00319  sdf == adaptive
+    crosshatch 0.00878   0.00878  sdf == adaptive
+    rings      0.00221   0.00337
+    diag       0.00205   0.00529  sharpening delta adds some amplitude
+    corner     0.00060   0.00282  back vs adaptive -- the known trade
+
+## Remaining limitations / next ideas (v4.1)
+
+- sdf's residual HG on sharpened diagonals/corners is the price of the
+  re-threshold; the coherence gate already abstains where planes
+  disagree. Next lever would be a per-pixel strength ramp from the
+  junction class map rather than the global conf product.
+- The de-dilution width curve is hand-shaped from the observed slope
+  saturation; a learned/iterated width estimate might do better.
+- Combined comparison image: `comparison_sheets/comparison_sheet.png`
+  (22 mode specs x 11 scenes, 9600x4994). It is *not in git* by design
+  (no image files in the repo); regenerate with
+  `python3 make_lab_comparison_sheets.py`.
+
 # v4 update (2026-07-30): SDF mode, autoblur 8x sawtooth/mosaic fix, git
 
 ## What changed since v3

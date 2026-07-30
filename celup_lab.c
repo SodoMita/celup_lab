@@ -1504,6 +1504,9 @@ static int refine_downsample_consistency(float *hr, const uint8_t *in, int sw,
 static void remove_hourglass_basis(float *hr, int dw, int dh,
                                    const uint8_t *in, int sw, int sh,
                                    float amount, const float *gate);
+static void suppress_speckle_pm(float *hr, int dw, int dh, const uint8_t *in,
+                                int sw, int sh, float amount,
+                                const float *gate);
 static void write_hr_rgba(const float *hr, int dw, int dh, uint8_t *out);
 
 /* Flagship adaptive mode (v2), two stages.
@@ -1675,6 +1678,7 @@ static int upscale_adaptive(const uint8_t *in, int sw, int sh, uint8_t *out,
        keep.  Only soft policies need this cleanup. */
     if (policy != POLICY_SCALE2X && policy != POLICY_NEAREST)
       remove_hourglass_basis(hr, dw, dh, in, sw, sh, .60f, cm.w_hg);
+    suppress_speckle_pm(hr, dw, dh, in, sw, sh, .60f, cm.w_hg);
     write_hr_rgba(hr, dw, dh, out);
   }
   free(hr);
@@ -2155,35 +2159,8 @@ static int upscale_autoblur(const uint8_t *in, int sw, int sh, uint8_t *out,
    band it alters is the edge's own ramp, so it cannot ring either.
 --------------------------------------------------------------------------- */
 
-/* Mitchell sampler for an n-channel float field (border-clamped, weight
-   renormalized).  Used to upsample the gathered SDF fields. */
-static void field_mitchell_sample(const float *f, int sw, int sh, int nch,
-                                  float sx, float sy, float *q) {
-  int ix = (int)floorf(sx), iy = (int)floorf(sy);
-  float wx[4], wy[4], sum = 0.f;
-  for (int k = 0; k < 4; k++) {
-    wx[k] = kernel_mitchell(sx - (float)(ix + k - 1));
-    wy[k] = kernel_mitchell(sy - (float)(iy + k - 1));
-  }
-  for (int c = 0; c < nch; c++)
-    q[c] = 0.f;
-  for (int j = 0; j < 4; j++) {
-    int cy = clampi(iy + j - 1, 0, sh - 1);
-    for (int i = 0; i < 4; i++) {
-      int cx = clampi(ix + i - 1, 0, sw - 1);
-      float ww = wx[i] * wy[j];
-      const float *p = f + (size_t)nch * ((size_t)cy * sw + cx);
-      sum += ww;
-      for (int c = 0; c < nch; c++)
-        q[c] += ww * p[c];
-    }
-  }
-  if (fabsf(sum) > 1e-8f) {
-    float inv = 1.f / sum;
-    for (int c = 0; c < nch; c++)
-      q[c] *= inv;
-  }
-}
+/* (v4.1: fitted plane-weighted fields are smooth by construction, so
+   bilinear upsampling suffices; v4.0's Mitchell field sampler is gone.) */
 
 /* Bilinear sampler for the signed-distance/width/confidence channels:
    Mitchell's negative lobes ring a signed distance field (the zero-crossing
@@ -2211,120 +2188,106 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
   if (!build_class_map(in, sw, sh, &cm))
     return 0;
   size_t n = (size_t)sw * sh;
-  /* Distance-transform state: offset to nearest seed contour point + id. */
-  float *ox = malloc(n * sizeof *ox), *oy = malloc(n * sizeof *oy);
-  int *sid = malloc(n * sizeof *sid);
-  float *fld = malloc(n * 11 * sizeof *fld); /* d, width, A4, B4, conf */
-  if (!ox || !oy || !sid || !fld) {
-    free(ox);
-    free(oy);
-    free(sid);
+  float *fld = calloc(n * 11, sizeof *fld); /* d, width, A4, B4, conf */
+  float *accw = calloc(n, sizeof *accw);    /* total splat weight         */
+  if (!fld || !accw) {
     free(fld);
+    free(accw);
     free_class_map(&cm);
     return 0;
   }
-  /* Seed: confident coherent-edge pixels whose t-plane is a usable ramp. */
+  /* SDF v2: the signed-distance field is *fitted*, not chamfered.  Each
+     confident coherent-edge pixel's t-plane defines a signed-distance plane
+     d_k(p) = (t0_k - .5 + g_k . (p - k)) / |g_k| oriented by its gradient.
+     v1 seeded the plane's own zero crossing into a distance transform and
+     gathered fields from the single nearest seed: Voronoi wins alternated
+     per source row, which rippled d (washboard banding in saturation
+     zones), and near-ridge sign logic put phantom contours down thin
+     features.  Instead, splat every plane into its 2-sigma neighbourhood
+     and accumulate a weighted mean of ALL candidate planes: d, the
+     premultiplied endpoint colours, ramp width and confidence are all
+     kernel-weighted averages, so the field is C1-smooth by construction,
+     endpoint quilts cannot form, and the contour is the consensus of every
+     stair segment's fit. */
   for (int y = 0; y < sh; y++)
     for (int x = 0; x < sw; x++) {
       size_t k = (size_t)y * sw + x;
       /* Checker/Nyquist ambiguity suppresses seeding outright: re-fitting
          geometry there invents structure the class policy says we cannot
          know. */
-      float c = cm.w_edge[k] * (1.f - cm.w_checker[k]);
+      float ck = cm.w_edge[k] * (1.f - cm.w_checker[k]);
       float gx = cm.edge_gx[k], gy = cm.edge_gy[k];
       float g2 = gx * gx + gy * gy;
-      if (c > .35f && g2 > .12f * .12f && g2 < 1.4f * 1.4f) {
-        float g = sqrtf(g2);
-        float d0 = (cm.edge_t0[k] - .5f) / g; /* signed, source px */
-        d0 = clampf(d0, -1.2f, 1.2f);
-        ox[k] = -d0 * gx / g;
-        oy[k] = -d0 * gy / g;
-        sid[k] = (int)k;
-      } else {
-        ox[k] = oy[k] = 0.f;
-        sid[k] = -1;
-      }
-    }
-  /* Two-pass vectorial distance transform (8SSEDT neighbourhood). */
-#define SDF_TRY(k, nk, dx, dy)                                                  \
-  do {                                                                          \
-    if (sid[nk] >= 0) {                                                         \
-      float cx_ = ox[nk] + (dx), cy_ = oy[nk] + (dy);                           \
-      float nd = cx_ * cx_ + cy_ * cy_;                                         \
-      if (sid[k] < 0 || nd < ox[k] * ox[k] + oy[k] * oy[k]) {                   \
-        ox[k] = cx_;                                                            \
-        oy[k] = cy_;                                                            \
-        sid[k] = sid[nk];                                                       \
-      }                                                                         \
-    }                                                                           \
-  } while (0)
-  for (int y = 0; y < sh; y++)
-    for (int x = 0; x < sw; x++) {
-      size_t k = (size_t)y * sw + x;
-      if (x > 0)
-        SDF_TRY(k, k - 1, -1.f, 0.f);
-      if (y > 0) {
-        SDF_TRY(k, k - sw, 0.f, -1.f);
-        if (x > 0)
-          SDF_TRY(k, k - sw - 1, -1.f, -1.f);
-        if (x + 1 < sw)
-          SDF_TRY(k, k - sw + 1, 1.f, -1.f);
-      }
-    }
-  for (int y = sh - 1; y >= 0; y--)
-    for (int x = sw - 1; x >= 0; x--) {
-      size_t k = (size_t)y * sw + x;
-      if (x + 1 < sw)
-        SDF_TRY(k, k + 1, 1.f, 0.f);
-      if (y + 1 < sh) {
-        SDF_TRY(k, k + sw, 0.f, 1.f);
-        if (x + 1 < sw)
-          SDF_TRY(k, k + sw + 1, 1.f, 1.f);
-        if (x > 0)
-          SDF_TRY(k, k + sw - 1, -1.f, 1.f);
-      }
-    }
-#undef SDF_TRY
-  /* Gather per-source-pixel SDF fields from the winning seeds.  The sign is
-     the *query pixel's own* side of the seed's colour axis, not the seed's
-     side: between the two flank contours of a thin bright feature both
-     flanks' seeds may sit on opposite t sides, and seed-side signing put a
-     phantom zero-crossing down the feature's midline. */
-  for (int y = 0; y < sh; y++)
-    for (int x = 0; x < sw; x++) {
-      size_t k = (size_t)y * sw + x;
-      float *f = fld + 11 * k;
-      int s = sid[k];
-      if (s < 0) {
-        for (int c = 0; c < 11; c++)
-          f[c] = 0.f;
+      if (ck <= .35f || g2 < .12f * .12f || g2 > 1.4f * 1.4f)
         continue;
+      float g = sqrtf(g2);
+      /* De-dilute the ramp width.  The classifier's t-plane gradient comes
+         from a least-squares fit over a fixed 5x5 window, which saturates
+         for true AA ramps narrower than ~1.6 src px (any such ramp measures
+         slope ~0.3 -> width 3.3) and dilutes middle spans.  Rendering with
+         the LS width spreads the re-threshold band several px into what
+         should be saturated flat colour, where the huge fitted colour axis
+         turns small t errors into visible stains.  Invert the dilution
+         empirically (bias narrow: over-width stains, under-width merely
+         sharpens). */
+      float w;
+      if (g >= .295f)
+        w = 1.2f;
+      else {
+        float wl = 1.f / g;
+        w = wl < 4.3f ? wl - 2.1f : wl;
       }
-      float dmag = sqrtf(ox[k] * ox[k] + oy[k] * oy[k]);
-      const float *A = cm.edge_side + 8 * (size_t)s;
-      float p[4], tp = 0.f, aa = 0.f;
-      raw_pm(in, sw, sh, x, y, p);
-      for (int c = 0; c < 4; c++) {
-        float ax = A[4 + c] - A[c];
-        tp += (p[c] - A[c]) * ax;
-        aa += ax * ax;
-      }
-      float side = aa > 1e-8f && tp < .5f * aa ? -1.f : 1.f;
-      float g = sqrtf(cm.edge_gx[s] * cm.edge_gx[s] +
-                      cm.edge_gy[s] * cm.edge_gy[s]);
-      float conf = cm.w_edge[s] * (1.f - cm.w_checker[s]) *
-                   expf(-(dmag * dmag) / (2.f * 1.5f * 1.5f));
-      f[0] = side * dmag;
-      f[1] = clampf(1.f / g, .6f, 3.f);
-      for (int c = 0; c < 4; c++) {
-        f[2 + c] = A[c];
-        f[6 + c] = A[4 + c];
-      }
-      f[10] = conf;
+      w = clampf(w, .6f, 5.f);
+      float invg = 1.f / g;
+      float t0 = cm.edge_t0[k];
+      const float *A = cm.edge_side + 8 * k;
+      for (int j = -4; j <= 4; j++)
+        for (int i = -4; i <= 4; i++) {
+          int px = x + i, py = y + j;
+          if (px < 0 || py < 0 || px >= sw || py >= sh)
+            continue;
+          float r2 = (float)(i * i + j * j);
+          if (r2 > 16.f)
+            continue;
+          float t = t0 + gx * (float)i + gy * (float)j;
+          float d = (t - .5f) * invg;
+          /* Trust the plane only near its own ramp: a short segment's fit
+             must not ghost-extend its contour across empty space. */
+          if (fabsf(d) > 2.6f)
+            continue;
+          float Kw = ck * expf(-r2 / (2.f * 1.5f * 1.5f));
+          size_t kp = (size_t)py * sw + px;
+          float *f = fld + 11 * kp;
+          f[0] += Kw * d;
+          f[1] += Kw * w;
+          for (int c = 0; c < 4; c++) {
+            f[2 + c] += Kw * A[c];
+            f[6 + c] += Kw * A[4 + c];
+          }
+          f[10] += Kw * ck;
+          accw[kp] += Kw;
+        }
     }
-  /* Straighten the stairs: a [1,2,1]^2 pass over the signed distance lets
-     stair-stepped seed polylines relax to their chord (a straight smooth
-     contour) instead of weaving the rendered edge by +-1 input pixel. */
+  /* Normalize; uncovered pixels get conf 0 (their d/w/endpoint values are
+     never used: the render delta is conf-gated).  Then fold in the field
+     coherence gate: a true distance field has |grad d| ~ 1; where planes
+     disagree (junctions, mid-Voronoi ridges, thin-feature midlines) the
+     weighted mean flattens, |grad d| drops, and the delta is suppressed,
+     leaving the adaptive reconstruction underneath untouched. */
+  for (size_t k = 0; k < n; k++) {
+    float iw = accw[k];
+    if (iw > 1e-6f) {
+      float *f = fld + 11 * k;
+      float inv = 1.f / iw;
+      for (int c = 0; c < 10; c++)
+        f[c] *= inv;
+      f[10] *= ramp01(iw, .15f, .5f);
+    }
+  }
+  free(accw);
+  /* Straighten + coherence-gate: one [1,2,1]^2 pass relaxes residual stair
+     wobble to the chord, then |grad d| is estimated from the smoothed
+     field. */
   {
     float *d0 = malloc(n * sizeof *d0), *d1 = malloc(n * sizeof *d1);
     if (d0 && d1) {
@@ -2346,36 +2309,74 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
                d1[(size_t)clampi(y + 1, 0, sh - 1) * sw + x]) *
               .25f;
         }
+      for (int y = 0; y < sh; y++)
+        for (int x = 0; x < sw; x++) {
+          size_t k = (size_t)y * sw + x;
+          float gx = (d1[(size_t)y * sw + clampi(x + 1, 0, sw - 1)] -
+                      d1[(size_t)y * sw + clampi(x - 1, 0, sw - 1)]) *
+                     .5f;
+          float gy = (d1[(size_t)clampi(y + 1, 0, sh - 1) * sw + x] -
+                      d1[(size_t)clampi(y - 1, 0, sh - 1) * sw + x]) *
+                     .5f;
+          fld[11 * k + 10] *= ramp01(sqrtf(gx * gx + gy * gy), .5f, .8f);
+        }
     }
     free(d0);
     free(d1);
   }
-  /* Render: bounded-Mitchell base + bounded SDF re-threshold delta. */
+  /* Render (v2): the *full adaptive composition* first, then a conf-gated
+     SDF re-threshold delta on top.  v1 rendered delta over an unconditional
+     bounded-Mitchell base: anywhere the classifier deliberately routes to
+     smoother reconstructions (junction bunches, low-contrast noise the
+     checker policy softens), sdf stayed harsh and rendered stripes -- the
+     "lots of artifacts" flat-zone failures.  Running the complete adaptive
+     pipeline underneath keeps every other policy branch intact and lets
+     the SDF do the single thing it is best at: straightening measured edge
+     contours. */
+  if (!upscale_adaptive(in, sw, sh, out, dw, dh)) {
+    free(fld);
+    free_class_map(&cm);
+    return 0;
+  }
+  const char *dump = getenv("CELUP_SDF_DUMP");
+  FILE *f_dump = NULL;
+  if (dump) {
+    /* Diagnostic: per-OUTPUT-pixel d', width, conf, t'(pre-curve), tb, |ax|. */
+    f_dump = fopen("/tmp/sdf_dump.bin", "wb");
+    if (f_dump) {
+      int dims[2] = {dw, dh};
+      fwrite(dims, 4, 2, f_dump);
+    }
+  }
+  float tt_dbg = 0.f, tb_dbg = 0.f, ax_dbg = 0.f;
   float wfac = 1.f - .12f * compress_strength;
   wfac = clampf(wfac, .45f, 1.f);
   float yscale = (float)sh / dh, xscale = (float)sw / dw;
+  size_t nout = (size_t)dw * dh;
+  float *D = calloc(nout * 4, sizeof *D);  /* raw per-pixel delta    */
+  float *Db = malloc(nout * 4 * sizeof *Db); /* box blur of the delta */
+  if (!D || !Db) {
+    free(D);
+    free(Db);
+    free(fld);
+    free_class_map(&cm);
+    return 0;
+  }
   for (int y = 0; y < dh; y++) {
     float sy = (y + .5f) * yscale - .5f;
     for (int x = 0; x < dw; x++) {
       float sx = (x + .5f) * xscale - .5f;
-      float base[4], fm[11], f[11], q[4];
-      mitchell_bounded_sample(in, sw, sh, sx, sy, base);
+      float f[11];
       field_bilinear_sample(fld, sw, sh, 11, sx, sy, f);
-      field_mitchell_sample(fld, sw, sh, 11, sx, sy, fm);
-      f[2] = fm[2];         /* endpoint colours keep the smoother kernel; */
-      f[3] = fm[3];
-      f[4] = fm[4];
-      f[5] = fm[5];
-      f[6] = fm[6];
-      f[7] = fm[7];
-      f[8] = fm[8];
-      f[9] = fm[9];
       float conf = clampf(f[10], 0.f, 1.f);
       if (conf > 1e-4f) {
+        float base[4];
+        raw_pm(out, dw, dh, x, y, base);
         float w = f[1] * wfac;
         if (w < .25f)
           w = .25f;
         float t = clampf(.5f + f[0] / w, 0.f, 1.f);
+        tt_dbg = t;
         if (!getenv("CELUP_SDF_LINEAR_RAMP"))
           t = t * t * (3.f - 2.f * t);
         /* Project the base sample onto the local colour axis. */
@@ -2389,25 +2390,99 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
           for (int c = 0; c < 4; c++)
             tb += (base[c] - A[c]) * ax[c];
           tb = clampf(tb / aa, 0.f, 1.f);
+          tb_dbg = tb;
+          ax_dbg = sqrtf(aa);
           float dt = conf * (t - tb);
+          float *dq = D + 4 * ((size_t)y * dw + x);
           for (int c = 0; c < 4; c++)
-            q[c] = clampf(base[c] + dt * ax[c], 0.f, 1.f);
-        } else {
-          for (int c = 0; c < 4; c++)
-            q[c] = base[c];
+            dq[c] = dt * ax[c];
         }
-      } else {
-        for (int c = 0; c < 4; c++)
-          q[c] = base[c];
       }
-      put(out + 4 * ((size_t)y * dw + x), q[0], q[1], q[2], q[3]);
+      if (f_dump) {
+        float rec[6] = {f[0], f[1], conf, tt_dbg, tb_dbg, ax_dbg};
+        fwrite(rec, 4, 6, f_dump);
+      }
     }
   }
-  free(ox);
-  free(oy);
-  free(sid);
+  if (f_dump)
+    fclose(f_dump);
   free(fld);
   free_class_map(&cm);
+  /* Tone conservation: the delta must be *contour sharpening*, never a
+     local tone shift.  Where the SDF contour disagrees with the base's own
+     contour by a fraction of a pixel, the raw delta has a nonzero local
+     mean -- rendered as a bright/dark halo pair hugging strong edges.
+     Subtract the delta's DC component over a 2.5-src-px window, but ONLY
+     where this pixel itself participates in the delta band: subtracting
+     the DC everywhere leaks neighbour deltas into flat zones as a negative
+     halo.  Gate w_k = |D_k| / (|D_k| + .5 mean|D|), ~1 inside the band,
+     ~0 outside. */
+  float *Abs = malloc(nout * sizeof *Abs), *M = malloc(nout * sizeof *M);
+  if (!Abs || !M) {
+    free(Abs);
+    free(M);
+    free(D);
+    free(Db);
+    return 0;
+  }
+  for (size_t k = 0; k < nout; k++) {
+    float a = 0.f;
+    for (int c = 0; c < 4; c++)
+      if (fabsf(D[4 * k + c]) > a)
+        a = fabsf(D[4 * k + c]);
+    Abs[k] = a;
+  }
+  int R = clampi((int)(2.5f * (float)dw / sw + .5f), 2, 12);
+  float invw = 1.f / ((2 * R + 1) * (float)(2 * R + 1));
+  for (int y = 0; y < dh; y++) {
+    float acc[5] = {0, 0, 0, 0, 0};
+    for (int x = -R; x <= R; x++) {
+      size_t k = (size_t)y * dw + clampi(x, 0, dw - 1);
+      for (int c = 0; c < 4; c++)
+        acc[c] += D[4 * k + c];
+      acc[4] += Abs[k];
+    }
+    for (int x = 0; x < dw; x++) {
+      size_t k = (size_t)y * dw + x;
+      float *s = Db + 4 * k;
+      for (int c = 0; c < 4; c++)
+        s[c] = acc[c];
+      M[k] = acc[4];
+      int xa = clampi(x + R + 1, 0, dw - 1), xb = clampi(x - R, 0, dw - 1);
+      size_t ka = (size_t)y * dw + xa, kb = (size_t)y * dw + xb;
+      for (int c = 0; c < 4; c++)
+        acc[c] += D[4 * ka + c] - D[4 * kb + c];
+      acc[4] += Abs[ka] - Abs[kb];
+    }
+  }
+  for (int x = 0; x < dw; x++) {
+    float acc[5] = {0, 0, 0, 0, 0};
+    for (int y = -R; y <= R; y++) {
+      size_t k = (size_t)clampi(y, 0, dh - 1) * dw + x;
+      for (int c = 0; c < 4; c++)
+        acc[c] += Db[4 * k + c];
+      acc[4] += M[k];
+    }
+    for (int y = 0; y < dh; y++) {
+      size_t k = (size_t)y * dw + x;
+      float base[4], q[4];
+      raw_pm(out, dw, dh, x, y, base);
+      float a = Abs[k], m = acc[4] * invw;
+      float w = a / (a + .5f * m + 1e-8f);
+      for (int c = 0; c < 4; c++)
+        q[c] = clampf(base[c] + D[4 * k + c] - w * acc[c] * invw, 0.f, 1.f);
+      put(out + 4 * k, q[0], q[1], q[2], q[3]);
+      int ya = clampi(y + R + 1, 0, dh - 1), yb = clampi(y - R, 0, dh - 1);
+      size_t ka = (size_t)ya * dw + x, kb = (size_t)yb * dw + x;
+      for (int c = 0; c < 4; c++)
+        acc[c] += Db[4 * ka + c] - Db[4 * kb + c];
+      acc[4] += M[ka] - M[kb];
+    }
+  }
+  free(Abs);
+  free(M);
+  free(D);
+  free(Db);
   return 1;
 }
 
@@ -2825,6 +2900,148 @@ static int refine_downsample_consistency(float *hr, const uint8_t *in, int sw,
   return 1;
 }
 
+/* Isolated-pixel (speckle) suppression (v4.1, complements the basis-fit
+   hourglass remover).  Two patterns are detected over the 3x3/3x4 output
+   neighbourhood and overwritten with the surrounding average:
+   - loner:  a single output pixel that deviates from EVERY one of its 8
+             neighbours much more than the neighbours deviate among
+             themselves,
+   - domino: an axis-aligned pixel PAIR whose mean deviates from the uniform
+             10-pixel ring around it the same way.
+   Genuine structure (lines, edges, dots meant by the image in non-ambiguous
+   zones) is always supported by its neighbourhood and never matches; inside
+   checker/junction-ambiguous cells (the w_hg gate) a strong loner is the
+   leftover signature of bow-tie/hourglass phase, and the basis fit alone
+   cannot remove it because it is already orthogonal to the smooth bases. */
+static void suppress_speckle_pm(float *hr, int dw, int dh, const uint8_t *in,
+                                int sw, int sh, float amount,
+                                const float *gate) {
+  if (amount <= 0.f)
+    return;
+  (void)in; /* signature parity with remove_hourglass_basis */
+  float xscale = (float)sw / dw, yscale = (float)sh / dh;
+  /* Snapshot for detection so replacements do not cascade. */
+  size_t n = (size_t)dw * dh;
+  float *snap = malloc(n * 4 * sizeof *snap);
+  if (!snap)
+    return;
+  memcpy(snap, hr, n * 4 * sizeof *snap);
+#define SPK_G(x, y)                                                            \
+  (gate ? gate[(size_t)clampi((int)floorf(((y) + .5f) * yscale - .5f), 0,      \
+                              sh - 1) *                                        \
+                  sw +                                                         \
+              clampi((int)floorf(((x) + .5f) * xscale - .5f), 0, sw - 1)]      \
+        : 1.f)
+#define SPK_P(img, x, y) ((img) + 4 * ((size_t)(y) * dw + (x)))
+  for (int y = 1; y + 1 < dh; y++)
+    for (int x = 1; x + 1 < dw; x++) {
+      float g = SPK_G(x, y);
+      if (g * amount < .05f)
+        continue;
+      const float *c = SPK_P(snap, x, y);
+      const float *nb[8];
+      int ni = 0;
+      for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++)
+          if (i || j)
+            nb[ni++] = SPK_P(snap, x + i, y + j);
+      float spread = 0.f, dev = 1e30f;
+      for (int cc = 0; cc < 4; cc++) {
+        float lo = 1e30f, hi = -1e30f;
+        for (int q = 0; q < 8; q++) {
+          if (nb[q][cc] < lo)
+            lo = nb[q][cc];
+          if (nb[q][cc] > hi)
+            hi = nb[q][cc];
+        }
+        float d = hi - lo;
+        spread += d * d;
+      }
+      for (int q = 0; q < 8; q++) {
+        float d = 0.f;
+        for (int cc = 0; cc < 4; cc++) {
+          float z = c[cc] - nb[q][cc];
+          d += z * z;
+        }
+        if (d < dev)
+          dev = d;
+      }
+      if (dev > 4.f * spread + 2.5e-3f) {
+        float w = amount * g;
+        float *o = SPK_P(hr, x, y);
+        for (int cc = 0; cc < 4; cc++) {
+          float avg = 0.f;
+          for (int q = 0; q < 8; q++)
+            avg += nb[q][cc];
+          o[cc] += w * (avg * .125f - o[cc]);
+        }
+      }
+    }
+  /* Domino pass on the updated image (fresh snapshot). */
+  memcpy(snap, hr, n * 4 * sizeof *snap);
+  for (int vert = 0; vert < 2; vert++)
+    for (int y = 1; y + 1 < dh; y++)
+      for (int x = 1; x + 1 < dw; x++) {
+        /* Pair occupies (x,y),(x+vert,y+1-vert); the 10 ring pixels are the
+           outer frame of the 3x4 (or 4x3) box around the pair. */
+        const float *p0 = SPK_P(snap, x, y),
+                    *p1 = SPK_P(snap, x + vert, y + 1 - vert);
+        float pm_[4] = {0, 0, 0, 0}, spread = 0.f, dev = 1e30f, ring[10][4];
+        int nr = 0;
+        for (int j = -1; j <= 2 - vert; j++)
+          for (int i = -1; i <= 1 + vert; i++) {
+            int onpair = vert ? (j == 0 && (i == 0 || i == 1))
+                              : (i == 0 && (j == 0 || j == 1));
+            if (onpair)
+              continue;
+            const float *r = SPK_P(snap, x + i, y + j);
+            for (int cc = 0; cc < 4; cc++)
+              ring[nr][cc] = r[cc];
+            nr++;
+          }
+        if (nr != 10)
+          continue;
+        for (int cc = 0; cc < 4; cc++)
+          pm_[cc] = .5f * (p0[cc] + p1[cc]);
+        for (int cc = 0; cc < 4; cc++) {
+          float lo = 1e30f, hi = -1e30f;
+          for (int q = 0; q < nr; q++) {
+            if (ring[q][cc] < lo)
+              lo = ring[q][cc];
+            if (ring[q][cc] > hi)
+              hi = ring[q][cc];
+          }
+          float d = hi - lo;
+          spread += d * d;
+        }
+        for (int q = 0; q < nr; q++) {
+          float d = 0.f;
+          for (int cc = 0; cc < 4; cc++) {
+            float z = pm_[cc] - ring[q][cc];
+            d += z * z;
+          }
+          if (d < dev)
+            dev = d;
+        }
+        float g0 = SPK_G(x, y), g1 = SPK_G(x + vert, y + 1 - vert);
+        float w = amount * .5f * (g0 + g1);
+        if (w >= .05f && dev > 4.f * spread + 2.5e-3f) {
+          float *o0 = SPK_P(hr, x, y), *o1 = SPK_P(hr, x + vert,
+                                                   y + 1 - vert);
+          for (int cc = 0; cc < 4; cc++) {
+            float avg = 0.f;
+            for (int q = 0; q < nr; q++)
+              avg += ring[q][cc];
+            avg /= (float)nr;
+            o0[cc] += w * (avg - o0[cc]);
+            o1[cc] += w * (avg - o1[cc]);
+          }
+        }
+      }
+  free(snap);
+#undef SPK_G
+#undef SPK_P
+}
 /* gate: optional per-source-pixel multiplier map (class map w_hg) that
    focuses the removal on genuinely ambiguous cells; pass NULL for the
    original uniform behaviour. */
@@ -2950,6 +3167,7 @@ static int upscale_deconv(const uint8_t *in, int sw, int sh, uint8_t *out,
        cells that can actually generate the artifact instead of being applied
        uniformly (which blurred real edge detail everywhere). */
     remove_hourglass_basis(hr, dw, dh, in, sw, sh, .95f, cm.w_hg);
+    suppress_speckle_pm(hr, dw, dh, in, sw, sh, .95f, cm.w_hg);
     write_hr_rgba(hr, dw, dh, out);
   }
   free_class_map(&cm);
@@ -3025,6 +3243,7 @@ static int upscale_consistentcompress(const uint8_t *in, int sw, int sh,
                                        NULL);
   if (ok) {
     remove_hourglass_basis(hr, dw, dh, in, sw, sh, .80f, NULL);
+    suppress_speckle_pm(hr, dw, dh, in, sw, sh, .80f, NULL);
     write_hr_rgba(hr, dw, dh, out);
   }
   free(hr);
@@ -3054,12 +3273,14 @@ static int upscale_dehourglass(const uint8_t *in, int sw, int sh, uint8_t *out,
      coherent-edge detail almost untouched.  The old uniform pass traded away
      real sharpness everywhere. */
   remove_hourglass_basis(hr, dw, dh, in, sw, sh, .95f, cm.w_hg);
+    suppress_speckle_pm(hr, dw, dh, in, sw, sh, .95f, cm.w_hg);
   /* One very light consistency pass restores exact source average bias without
      reintroducing much hourglass structure; its correction is gated too. */
   ok = refine_downsample_consistency(hr, in, sw, sh, dw, dh, 1, .35f, 0.f,
                                      &cm);
   if (ok) {
     remove_hourglass_basis(hr, dw, dh, in, sw, sh, .55f, cm.w_hg);
+    suppress_speckle_pm(hr, dw, dh, in, sw, sh, .55f, cm.w_hg);
     write_hr_rgba(hr, dw, dh, out);
   }
   free_class_map(&cm);
@@ -3561,8 +3782,11 @@ int main(int ac, char **av) {
         (double)w * h * (classified ? 96.0 : !strcmp(mode, "autoblur") ? 24.0
                                                                       : 4.0);
     double out_bytes =
-        (double)ow * oh * (iterative ? 36.0 : !strcmp(mode, "autoblur") ? 8.0
-                                                                        : 4.0);
+        (double)ow * oh * (iterative          ? 36.0
+                           : !strcmp(mode, "sdf") ? 36.0 + 40.0 /* adaptive +
+                                                       SDF delta/blur buffers */
+                           : !strcmp(mode, "autoblur") ? 8.0
+                                                       : 4.0);
     double estimated =
         (in_bytes + out_bytes + 32.0 * 1024 * 1024) / (1024.0 * 1024.0);
     if (estimated > max_mib) {

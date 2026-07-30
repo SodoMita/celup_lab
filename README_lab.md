@@ -65,16 +65,23 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
   resolution (v3 blurred the source grid, which degenerated to blocky cells
   and staircase tracking at large scales), so 8x upscales are smooth: no
   mosaic ("blurry pixels"), no sawtooth on wandering lines.
-- **sdf** (v4) is the smooth-geometry sharp option: it extracts a signed
-  distance field of every confidently measured edge mid-contour (from the
-  classifier's t-planes, propagated by a vectorial distance transform),
-  upsamples the field, and re-thresholds the local two-colour transition
-  against it. Staircases straighten into smooth contours (0.5px weave ->
-  chord), transition width stays as measured (mildly narrowed by
-  `--strength`), and far from measured edges it falls back to the bounded
-  Mitchell base. It removes hourglass/bow-tie structure by construction
-  (single smooth iso-crossing, no parity alternation) and is the cleanest
-  8x line-art upscale: crosshatch HG 0.0052 (lanczos3 0.0243).
+- **sdf** (v4.1) is the smooth-geometry sharp option. Every confident
+  coherent-edge pixel's fitted t-plane is a *signed-distance plane*
+  (sub-pixel, oriented); the mode kernel-averages all candidate planes into
+  C1-smooth distance/width/endpoint/confidence fields, then re-thresholds
+  the local two-colour transition against the upsampled field as a
+  confidence-gated delta ON TOP of the full adaptive pipeline (v4.0's
+  distance-transform/nearest-seed approach produced washboard banding,
+  phantom midline contours and flat-zone streaks -- all diagnosed and
+  replaced; the other agent's chamfer-SDF/MSDF that snaps to nearest at
+  edges was reviewed and not adopted).  Further guards: ramp widths are
+  de-diluted (the 5x5 LS plane fit saturates at slope 0.3 for true AA <
+  1.6px), planes splat only near their own ramp (no ghost extensions),
+  |grad d| coherence suppresses junction/midline zones, and the delta's
+  local DC is removed so contour sharpening can never shift tone.  sdf
+  MAE-beats adaptive on 5 of 9 standard scenes and inherits its checker
+  policies; it is the cleanest 8x line-art upscale (crosshatch HG 0.0088,
+  lanczos3 0.0243).
 - **deblurcompress** remains the maximum-detail option: same gated iteration
   core, more iterations, more sharpening. It is ~7.5x faster than v1
   (per-cell gates are precomputed once) and its crossing/checker artifacts
@@ -98,11 +105,25 @@ controls how **adaptive** reconstructs checker/Nyquist-ambiguous cells:
   quads and almost no soft-contrast neighbour links), lowpass otherwise.
   The heuristic is global, so one bad region cannot flip a natural photo.
 
-`--checker-policy` only affects `adaptive`. `--adaptive-debug N` (0..15) is
+`--checker-policy` only affects `adaptive` (and `sdf`, which inherits the
+adaptive pipeline). `--adaptive-debug N` (0..15) is
 a development aid that zeroes selected class weights (bit 1 = edge,
 bit 2 = checker, bit 4 = junction, bit 8 = thin-line) to attribute error to
 policy branches. `CELUP_CLASS_DEBUG=1` in the environment prints thin-line
 detection details to stderr.
+
+## Hourglass speckle suppression (v4.1)
+
+After the basis-fit hourglass remover, all gated iterative pipelines
+(adaptive, deblurcompress, consistentcompress/hourglasscompress) now run an
+*isolated-pixel* pass: a single output pixel (loner) or an axis-adjacent
+pair (domino) that deviates from every surrounding pixel much more than the
+surroundings deviate among themselves is overwritten with the surrounding
+average, blended by the same class gate (checker/junction ambiguity) and
+amount as the basis removal.  Genuine lines/edges are always supported by
+their neighbourhood and never match; measured on the torture scene:
+adaptive loners 81 -> 0, deblurcompress 5909 -> 0, HG metrics unchanged
+(the pass removes specks orthogonal to the fitted bases, not amplitude).
 
 ## autoblur options (v4)
 
