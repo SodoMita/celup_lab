@@ -1,0 +1,12 @@
+celup_lab.c                  v3 C source: thin-line class + autoblur + all v2/v1 modes
+README_lab.md                Mode usage notes, v3 recommendations, autoblur options
+handoff.md                   v3/v2 updates (what changed + measurements) + v1 history
+evaluate_upscalers.py        Text metric evaluator (MAE, pm-linear)
+hourglass_metric.py          Artifact metric (HG amplitude, CHK) + torture scenes
+make_lab_comparison_sheets.py Sheet generator; checker/crosshatch/rings + classmap + autoblur
+test_celup3.py               Older regression script (sRGB-space; see handoff v2 notes)
+comparison_sheets.md         Text-only metrics from the latest comparison run (21 modes x 11 scenes)
+build.sh                     Simple build command
+docs/review_checker1.png     Visual evidence: Nyquist checker torture, all key modes
+docs/review_crosshatch.png   Visual evidence: crossing thin lines, artifact cleanup
+docs/review_crossing.png     Visual evidence: natural mixed crossing scene + classmap
