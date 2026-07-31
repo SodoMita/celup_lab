@@ -2307,83 +2307,86 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
                               int dw, int dh);
 /* Standard-normal CDF (libm erff). */
 static float phi1(float z) { return .5f * (1.f + erff(z * 0.70710678f)); }
-/* Inverse standard-normal CDF: Acklam's rational approximation. */
-static float invphi(float p) {
-  static const float a[] = {-3.969683028665376e+01f, 2.209460984245205e+02f,
-                            -2.759285104469687e+02f, 1.383577518672690e+02f,
-                            -3.066479806614716e+01f, 2.506628277459239e+00f};
-  static const float b[] = {-5.447609879822406e+01f, 1.615858368580409e+02f,
-                            -1.556989798598866e+02f, 6.680131188771972e+01f,
-                            -1.328068155288572e+01f};
-  static const float c[] = {-7.784894002430293e-03f, -3.223964580411365e-01f,
-                            -2.400758277161838e+00f, -2.549732539343734e+00f,
-                            4.374664141464968e+00f,  2.938163982698783e+00f};
-  static const float d[] = {7.784695709041462e-03f, 3.224671290700398e-01f,
-                            2.445134137142996e+00f, 3.754408661907416e+00f};
-  p = clampf(p, 1e-5f, 1.f - 1e-5f);
-  if (p < 0.02425f) {
-    float q = sqrtf(-2.f * logf(p));
-    return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q +
-            c[5]) /
-           ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.f);
-  }
-  if (p > 1.f - 0.02425f) {
-    float q = sqrtf(-2.f * logf(1.f - p));
-    return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q +
-             c[5]) /
-            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.f);
-  }
-  float q = p - .5f, r = q * q;
-  return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r +
-          a[5]) *
-         q /
-         (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.f);
-}
 static float trust_lo = .03f, trust_hi = .10f; /* fit-rmse trust gate; debug override: CDG=lo,hi */
 static float ss01(float z) {
   z = clampf(z, 0.f, 1.f);
   return z * z * (3.f - 2.f * z);
 }
-/* autodeblur core pass (v4.7: ANALYTIC gradient-profile steepening).
+/* autodeblur core pass (v4.8: ANCHORED single-lobe profile steepening).
 
    The v4.3..v4.6 pass steepened each channel independently toward
-   per-channel box-window extremes.  Forensics on the v4.6 wide-blur
-   recipe (user review): channels move inconsistently across an edge
-   (one rises, another falls), so independent clamps materialise
-   box-corner colours that exist on OPPOSITE sides of the edge -- a
-   bright/hue-inverted line mid-gradient ("bright line in middle,
-   negates colors"); alpha ran on its own trajectory; fixed box
-   windows quantised values spatially -> stepladder bands along
-   contours.
+   per-channel box-window extremes (hue inversion, boxy halos);
+   v4.7 introduced the 4D single-gradient sampling and the analytic
+   erf/pulse fit, but evaluated the steepened curve by inverting the
+   pixel's COLOUR: nu = phi(k * phi^-1(u_px)).  Review forensics:
+   - d(nu)/du = k at the ramp centre, so any pixel sitting epsilon off
+     the fitted curve rendered k*epsilon off -> outstanding pixels at
+     gradient centres;
+   - near plateaus phi^-1 explodes, turning flat noise into a colour
+     halo that starts at a line's centre and dies near its edge;
+   - one window-wide fit spanning a thin line mixed BOTH flanks and
+     BOTH backgrounds into one phantom step centred mid-line ("2
+     gradients surrounding the edge combined instead of not going
+     further than each other") -> snake-tongue forks at line caps;
+   - every output was snapped onto the fit's 1D colour segment,
+     discarding the orthogonal colour component -> "watered away
+     colors".
 
-   v4.7 rebuilds the pass exactly as suggested: per pixel, ONE gradient
-   direction for the whole premultiplied 4-channel vector (principal
-   axis of the 4D structure tensor from per-channel Sobel), sample the
-   colours along that normal, FIT A FUNCTION of the gradient
-   coordinate -- an error-function edge profile (moment fit mu/s) for a
-   STEP segment, a two-flank pulse for thin lines -- then change the
-   slope ON THE FIT (s -> s/k) and sample the pixel's new value from
-   the fitted curve.  Colours are reconstructed as convex combinations
-   of two REAL local colours (the profile segment endpoints): hue
-   cannot invert, no box-corner colours, no overshoot (fit bounded in
-   (0,1)), alpha is one of the four channels, so the premultiplied
-   invariant holds by convexity.  The fit is spatially continuous (no
-   window-quantised values), k is capped so the output sigma never
-   drops below .6 output px (~1.5 px 30%-edge-width: no re-aliased
-   sawtooth), and the pass renders into a separate buffer -- no
-   scan-order coupling.
-   -D method 1 (remap): evaluate the slope-steepened fit at the pixel.
-   -D method 2 (push):  evaluate the ORIGINAL fit at a coordinate
-     displaced toward the nearer plateau by (u-.5)(k-1)*s -- the Anime4K
-     heightmap push in analytic form.  Pulse profiles always use the
-     slope form (displacement would drain thin lines). */
+   v4.8 keeps the v4.7 sampling (ONE gradient direction per pixel for
+   the whole premultiplied RGBA vector; tangentially averaged line
+   samples) but changes fit domain and evaluation:
+   - LOBE MAP: |du| along the normal is segmented into transition
+     lobes.  Each pixel is assigned its nearest lobe; plateau colours,
+     centre mu and width s come from THAT lobe alone with one-sided
+     margins clipped at neighbouring lobes -- two flanks and two
+     backgrounds never enter one fit.
+   - ANCHORED EVALUATION: the steepened fit is evaluated at the
+     pixel's GEOMETRIC position on the normal (t = 0), and the pixel's
+     own residual to the unsteepened fit is re-added with GAIN 1:
+     out = F_k(0) + (o - F(0)).  On-curve pixels steepen exactly by k;
+     off-curve deviations (texture, hue arcs, dither, alpha) pass
+     through unamplified; line interiors and plateaus evaluate to
+     plateau + residual = identity, so misassignment is never an
+     artifact.  Consequence: float steepness is now safe far beyond 8
+     (-g accepts 1..64), still capped so output ramps keep >= .6 px
+     sigma (no re-aliased sawtooth).
+   - MULTI-CROSSING trust replaces the beta2 gate: per-lobe fits are
+     all locally good inside dense texture, so suppression counts
+     hysteresis mid-level crossings over the whole window (step = 1,
+     one line = 2: full trust; 4+: crosshatch/hair-clump/text fades to
+     zero), beside the erf-RMSE-over-domain trust gate.
+   -D method 1 (remap): evaluate the slope-steepened fit at t = 0.
+   -D method 2 (push):  evaluate the ORIGINAL fit at a position
+     displaced toward the nearer plateau by (ufit-.5)(k-1)*s*1.5/s --
+     the Anime4K heightmap push in analytic form. */
+/* Bilinear sampler for float4 fields (used for the tangential
+   anti-jitter smoothing of the model delta below). */
+static void sample_f4(const float *img, int w, int h, float x, float y,
+                      float q[4]) {
+  int ix = (int)floorf(x), iy = (int)floorf(y);
+  float fx = x - (float)ix, fy = y - (float)iy;
+  q[0] = q[1] = q[2] = q[3] = 0.f;
+  for (int j = 0; j < 2; j++)
+    for (int i = 0; i < 2; i++) {
+      float ww = (i ? fx : 1.f - fx) * (j ? fy : 1.f - fy);
+      const float *p =
+          img + 4 * ((size_t)clampi(iy + j, 0, h - 1) * w +
+                     clampi(ix + i, 0, w - 1));
+      for (int c = 0; c < 4; c++)
+        q[c] += ww * p[c];
+    }
+}
 static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                            int method) {
   size_t n = (size_t)dw * dh;
   float *A = malloc(n * 4 * sizeof *A);
+  float *DEL = malloc(n * 4 * sizeof *DEL); /* model colour delta   */
+  float *DIR = malloc(n * 2 * sizeof *DIR); /* contour tangent      */
   uint8_t *dst = malloc(n * 4);
-  if (!A || !dst) {
+  if (!A || !DEL || !DIR || !dst) {
     free(A);
+    free(DEL);
+    free(DIR);
     free(dst);
     return 0;
   }
@@ -2416,6 +2419,17 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
      and u_px ~.5, so the fit reproduces it unchanged. */
   float sa = 1.3f * scale * sref, sb = 2.4f * scale * sref;
   float flatmix = .25f; /* diffusion-noise flattening in gate-zero zones */
+  int T = clampi((int)(scale * .75f + .5f), 1, 3); /* tangent span (v4.7) */
+  /* per-fit diagnostic dump: CELUP_DBG=x,y prints the fit internals for
+     pixels near (x,y) (step 4 px) */
+  int dbg = 0, dbg_x = 96, dbg_y = 96;
+  {
+    const char *e = getenv("CELUP_DBG");
+    if (e) {
+      dbg = 1;
+      sscanf(e, "%d,%d", &dbg_x, &dbg_y);
+    }
+  }
   for (int y = 0; y < dh; y++)
     for (int x = 0; x < dw; x++) {
       size_t idx = (size_t)y * dw + x;
@@ -2470,7 +2484,6 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
          invariant along their contour, so averaging a few offset
          normals keeps the profile while erasing the grid-periodic
          jitter (period ~1 src px). */
-      int T = clampi((int)(scale * .75f + .5f), 1, 3);
       float tanx = -diry, tany = dirx;
       float C[129][4], u[129], lo[4] = {1e30f, 1e30f, 1e30f, 1e30f},
             hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f},
@@ -2517,9 +2530,9 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
         d[c] = CB[c] - CA[c];
         L2 += d[c] * d[c];
       }
-      float w = 0.f, nv[4], wS = 0.f, wP = 0.f, nvS[4], nvP[4], scw = 0.f;
+      float wS = 0.f, nvS[4];
       for (int c = 0; c < 4; c++)
-        nv[c] = nvS[c] = nvP[c] = o[c];
+        nvS[c] = o[c];
       if (L2 >= 6.4e-5f) { /* |d| >= .008: not a flat */
         for (int j = 0; j < NS; j++) {
           float uu = 0.f;
@@ -2555,93 +2568,155 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
         }
         ul /= mE;
         ur /= mE;
-        scw = ss01(((ur - ul) - .45f) * 5.f); /* soft step/pulse blend */
         {
-          /* ---------------- STEP: erf edge-profile fit ------------- */
-          float P0[4], P1[4], d2[4], Ld2 = 0.f;
-          int n0 = 0, n1 = 0;
-          for (int c = 0; c < 4; c++) {
-            P0[c] = 0.f;
-            P1[c] = 0.f;
+          /* -------- v4.8: unified single-lobe erf profile fit ------ */
+          /* Lobe map: |du| along the normal is segmented into
+             transition lobes (runs above a relative floor, single-
+             sample dips bridged).  The pixel is assigned its NEAREST
+             lobe; the erf profile is fit on that lobe only, with
+             plateau colours taken one-sided from just outside it and
+             the domain clipped at neighbouring lobes -- a thin line's
+             two flanks and its two backgrounds ("2 gradients
+             surrounding edge") never combine into one phantom step,
+             and shading slopes on the plateaus never dilute the
+             moments.  Misassignment degrades to identity: far from the
+             lobe centre both nu and ufit saturate, so the output is
+             plateau + residual = the original pixel. */
+          float wj[129], wmax = 0.f, th;
+          int jl[16], jr[16], NL = 0;
+          wj[0] = wj[NS - 1] = 0.f;
+          for (int j = 1; j < NS - 1; j++) {
+            wj[j] = fabsf(u[j + 1] - u[j - 1]);
+            if (wj[j] > wmax)
+              wmax = wj[j];
           }
-          for (int j = 0; j < NS; j++)
-            if (u[j] < .25f) {
-              n0++;
-              for (int c = 0; c < 4; c++)
-                P0[c] += C[j][c];
-            } else if (u[j] > .75f) {
-              n1++;
-              for (int c = 0; c < 4; c++)
-                P1[c] += C[j][c];
+          th = wmax * .06f;
+          if (th < .004f)
+            th = .004f;
+          for (int j = 1; j < NS - 2 && NL < 16;) {
+            if (wj[j] < th) {
+              j++;
+              continue;
             }
-          for (int c = 0; c < 4; c++) {
-            P0[c] = n0 ? P0[c] / n0 : CA[c];
-            P1[c] = n1 ? P1[c] / n1 : CB[c];
-            d2[c] = P1[c] - P0[c];
-            Ld2 += d2[c] * d2[c];
+            int a = j;
+            while (j + 1 < NS - 1 &&
+                   (wj[j + 1] >= th || (j + 2 < NS - 1 && wj[j + 2] >= th)))
+              j++; /* run, bridging single-sample dips */
+            jl[NL] = a;
+            jr[NL] = j;
+            NL++;
+            j++;
           }
-          if (Ld2 > 6.4e-5f) {
-            double W = 0, mu = 0, sq = 0;
-            for (int j = 1; j < NS - 1; j++) {
-              float wj = fabsf(u[j + 1] - u[j - 1]);
-              W += wj;
-              mu += wj * (j - R);
-            }
-            if (W > 1e-9) {
-              mu /= W;
-              for (int j = 1; j < NS - 1; j++) {
-                float wj = fabsf(u[j + 1] - u[j - 1]);
-                double t = j - R - mu;
-                sq += wj * t * t;
+          if (NL > 0) {
+            int li = 0, lbest = INT_MAX;
+            for (int q = 0; q < NL; q++) {
+              int dist = R < jl[q] ? jl[q] - R : R > jr[q] ? R - jr[q] : 0;
+              if (dist < lbest) {
+                lbest = dist;
+                li = q;
               }
-              float s = (float)sqrt(sq / W);
+            }
+            /* Fit domain: lobe + one-sided plateau margins, clipped at
+               neighbouring lobes and window ends. */
+            int dl = jl[li] - mE, dr = jr[li] + mE;
+            if (li > 0 && dl <= jr[li - 1])
+              dl = jr[li - 1] + 1;
+            if (li + 1 < NL && dr >= jl[li + 1])
+              dr = jl[li + 1] - 1;
+            if (dl < 0)
+              dl = 0;
+            if (dr > NS - 1)
+              dr = NS - 1;
+            float P0[4], P1[4], d2[4], Ld2 = 0.f;
+            int n0 = 0, n1 = 0;
+            for (int c = 0; c < 4; c++) {
+              P0[c] = 0.f;
+              P1[c] = 0.f;
+            }
+            for (int j = dl; j <= dr; j++)
+              if (u[j] < .25f) {
+                n0++;
+                for (int c = 0; c < 4; c++)
+                  P0[c] += C[j][c];
+              } else if (u[j] > .75f) {
+                n1++;
+                for (int c = 0; c < 4; c++)
+                  P1[c] += C[j][c];
+              }
+            for (int c = 0; c < 4; c++) {
+              P0[c] = n0 ? P0[c] / n0 : C[jl[li]][c];
+              P1[c] = n1 ? P1[c] / n1 : C[jr[li]][c];
+              d2[c] = P1[c] - P0[c];
+              Ld2 += d2[c] * d2[c];
+            }
+            /* Full-lobe moments (v4.8): |du| centroid and second moment
+               over the whole lobe.  Windowed-moment refinements were
+               tried and rejected: a core-trimmed centroid halves the
+               tail lever arm but starves the width (sigma 6 reads as
+               2.5 -- the fit-trust gate then rejects every clean wide
+               ramp), and the Gaussian truncation inversion is exact
+               only for perfect Gaussians and flaps the gate per pixel.
+               The residual jitter of plain moments shows up only as
+               +/-1 LSB random dither on noisy synthetic ramps and is
+               suppressed where it is coherent: pass-2 tangential
+               smoothing. */
+            double W = 0, mu = 0, sq = 0;
+            for (int j = jl[li]; j <= jr[li]; j++) {
+              W += wj[j];
+              mu += wj[j] * (j - R);
+            }
+            if (Ld2 > 6.4e-5f && W > 1e-9) {
+              mu /= W;
+              for (int j = jl[li]; j <= jr[li]; j++) {
+                double t = j - R - mu;
+                sq += wj[j] * t * t;
+              }
+              float s = (float)sqrt(sq / W), lwm = .5f * (jr[li] - jl[li] + 1);
               if (s < .3f)
                 s = .3f;
-              if (s > (float)R)
-                s = (float)R;
-              float upx = 0.f;
-              for (int c = 0; c < 4; c++)
-                upx += (o[c] - P0[c]) * d2[c];
-              upx = clampf(upx / Ld2, 0.f, 1.f);
-              /* Steepness: -g pins k; -e adapts k to the goal width;
-                 -s formula otherwise; always capped so the OUTPUT ramp
-                 never falls below .6 px sigma (~1.5 px 30% width): no
-                 re-aliased sawtooth, and already-crisp content is left
-                 alone (k -> 1). */
+              if (s > lwm)
+                s = lwm;
+              /* Steepness: -g pins k exactly (float, up to 64); -e
+                 adapts per edge; -s formula otherwise; always capped so
+                 the OUTPUT ramp never falls below .6 px sigma
+                 (~1.5 px 30% width): no re-aliased sawtooth, and
+                 already-crisp content is left alone (k -> 1). */
               float k = kbase;
               if (deblur_steepness <= 0.f && edge_goal > 0.f) {
                 float st = fmaxf(.6f, edge_goal * scale / 2.5f);
-                k = clampf(s / st, 1.f, 8.f);
+                k = clampf(s / st, 1.f, 16.f);
               }
               k = fminf(k, s / .6f);
-              wS = ss01((sb - s) / (sb - sa));
-              /* v4.7 final: evaluate ON THE FITTED CURVE.  The windowed
-                 moment estimate of the ramp centre is biased toward the
-                 window centre (clipped tails) and silently damped the
-                 steepening to ~1.1x on synthetic ground truth.  Map
-                 through the pixel's own fitted coordinate instead:
-                 z = Phi^-1(u_px) is exactly "the gradient function of
-                 the original"; steepened = evaluate Phi(k*z) --
-                 monotone, bounded (no overshoot), shape-preserving.
-                 push: displace within z toward the nearer plateau. */
-              float z = invphi(upx), nu;
+              /* Anchored evaluation (v4.8): the steepened fit is
+                 evaluated at the pixel's GEOMETRIC position on the
+                 normal (t = 0), and the pixel's own residual to the
+                 unsteepened fit is re-added: out = F_k(0) + (o - F(0)).
+                 On-curve pixels steepen exactly with k; off-curve
+                 deviations (texture, hue arcs, dither) pass through
+                 with GAIN 1 instead of the v4.7 colour-domain gain k
+                 at the ramp centre -- no amplified speckle mid-
+                 gradient, no phi^-1 flat-noise halo, original colours
+                 kept.  push: displace the position toward the nearer
+                 plateau, evaluate the ORIGINAL profile there. */
+              float z0 = (0.f - (float)mu) / s;
+              float ufit0 = phi1(z0), nu;
               if (method == 2 && k > 1.f)
-                nu = phi1(z + (upx - .5f) * (k - 1.f) * 1.5f);
+                nu = phi1(z0 + (ufit0 - .5f) * (k - 1.f) * 1.5f);
               else
-                nu = phi1(k * z);
+                nu = phi1(k * z0);
               nu = clampf(nu, 0.f, 1.f);
-              /* Fit-trust gate: RMSE of the erf fit over the
-                 transition.  Clean single transitions fit tight;
-                 crosshatch/rings/text (several crossings per window)
-                 misfit badly -- there steepening would hallucinate
-                 geometry (hourglass-class residual), so trust fades. */
+              wS = ss01((sb - s) / (sb - sa));
+              /* Fit-trust: RMSE of the erf fit over the full lobe,
+                 |du| weights (the weights concentrate the check on the
+                 lobe core, which is what the steepening actually
+                 moves; a curved/textured ramp misfits and trust
+                 fades). */
               {
                 double en = 0, ed = 0;
-                for (int j = 1; j < NS - 1; j++) {
-                  float wj = fabsf(u[j + 1] - u[j - 1]);
+                for (int j = jl[li]; j <= jr[li]; j++) {
                   float fj = phi1(((float)(j - R) - (float)mu) / s);
-                  en += wj * (u[j] - fj) * (u[j] - fj);
-                  ed += wj;
+                  en += wj[j] * (u[j] - fj) * (u[j] - fj);
+                  ed += wj[j];
                 }
                 if (ed > 1e-9) {
                   float rmse = (float)sqrt(en / ed);
@@ -2649,140 +2724,98 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                              (trust_hi - trust_lo + 1e-9f));
                 }
               }
-              /* Unimodality gate (STEP only): a true single ramp's |du|
-                 profile is one lobe (flatness m4/s^4 ~ 2.0-2.6 after
-                 window truncation); two or more crossings per window
-                 (crosshatch, text, hair clumps) give a platykurtic
-                 multi-lobe profile (~1.4).
-                 rmse alone cannot separate these regimes: a windowed
-                 WIDE ramp misfits its erf exactly like a double
-                 crossing, so gating only on rmse kills legitimate
-                 deblur at -r 3 / high scales.  beta2 separates them. */
+              /* Multi-crossing trust (whole-window property; replaces
+                 the v4.7 beta2 gate): per-lobe fits are ALL locally
+                 good inside dense texture, so crosshatch/hair-clump/
+                 text suppression must look at the window: count mid-
+                 level crossings with hysteresis.  A step crosses 1x,
+                 one line 2x (full trust), 4x+ (dense structure) fades
+                 to zero. */
               {
-                double m4 = 0;
-                for (int j = 1; j < NS - 1; j++) {
-                  float wj = fabsf(u[j + 1] - u[j - 1]);
-                  double t = j - R - mu;
-                  m4 += wj * t * t * t * t;
+                float lmed = .5f * (ul + ur);
+                int side = 0, cross = 0;
+                for (int j = 0; j < NS; j++) {
+                  if (side <= 0 && u[j] > lmed + .02f) {
+                    cross += side < 0;
+                    side = 1;
+                  } else if (side >= 0 && u[j] < lmed - .02f) {
+                    cross += side > 0;
+                    side = -1;
+                  }
                 }
-                float beta2 = (float)(m4 / W) / (float)(s * (double)s * s * s);
-                /* measured populations: clean ramps 2.0..2.6 (window-
-                   truncated tails flatten toward 2.0), multi-crossing
-                   windows ~1.4 -> full trust at 2.1, closed at 1.7. */
-                wS *= ss01((beta2 - 1.7f) * 2.5f);
+                wS *= 1.f - ss01(((float)cross - 2.25f) / 2.5f);
               }
-              for (int c = 0; c < 4; c++)
-                nvS[c] = P0[c] + nu * d2[c];
-            }
-          }
-        }
-        {
-          /* ---------------- PULSE: two-flank line fit -------------- */
-          float BE[4], qv[4], qL2 = 0.f;
-          for (int c = 0; c < 4; c++)
-            BE[c] = .5f * (CA[c] + CB[c]);
-          int jp = 0;
-          float bd = -1.f;
-          for (int j = 0; j < NS; j++) {
-            float dd = 0.f;
-            for (int c = 0; c < 4; c++) {
-              float e = C[j][c] - BE[c];
-              dd += e * e;
-            }
-            if (dd > bd) {
-              bd = dd;
-              jp = j;
-            }
-          }
-          for (int c = 0; c < 4; c++) {
-            qv[c] = C[jp][c] - BE[c];
-            qL2 += qv[c] * qv[c];
-          }
-          if (qL2 > 1.44e-4f && jp > 1 && jp < NS - 2) {
-            double WL = 0, muL = 0, WR = 0, muR = 0;
-            for (int j = 1; j <= jp; j++) {
-              float wj = fabsf(u[j] - u[j - 1]);
-              WL += wj;
-              muL += wj * (j - R);
-            }
-            for (int j = jp; j < NS - 1; j++) {
-              float wj = fabsf(u[j + 1] - u[j]);
-              WR += wj;
-              muR += wj * (j - R);
-            }
-            if (WL > 1e-9 && WR > 1e-9) {
-              muL /= WL;
-              muR /= WR;
-              double sqL = 0, sqR = 0;
-              for (int j = 1; j <= jp; j++) {
-                float wj = fabsf(u[j] - u[j - 1]);
-                double t = j - R - muL;
-                sqL += wj * t * t;
-              }
-              for (int j = jp; j < NS - 1; j++) {
-                float wj = fabsf(u[j + 1] - u[j]);
-                double t = j - R - muR;
-                sqR += wj * t * t;
-              }
-              float sL = (float)sqrt(sqL / WL), sR2 = (float)sqrt(sqR / WR);
-              if (sL < .3f)
-                sL = .3f;
-              if (sR2 < .3f)
-                sR2 = .3f;
-              float se = fminf(sL, sR2);
-              float k = kbase;
-              if (deblur_steepness <= 0.f && edge_goal > 0.f) {
-                float st = fmaxf(.6f, edge_goal * scale / 2.5f);
-                k = clampf(se / st, 1.f, 8.f);
-              }
-              k = fminf(k, se / .6f);
-              wP = ss01((sb - se) / (sb - sa));
-              /* Same fitted-curve evaluation on the pulse coordinate:
-                 q is monotone along each flank, so steepening Phi(k*zq)
-                 tightens both flanks without ever draining the line
-                 interior (q -> 1 stays 1). */
-              float qpx = 0.f;
-              for (int c = 0; c < 4; c++)
-                qpx += (o[c] - BE[c]) * qv[c];
-              qpx = clampf(qpx / qL2, 0.f, 1.f);
-              float nq = phi1(k * invphi(qpx));
-              nq = clampf(nq, 0.f, 1.f);
-              /* Same fit-trust gate for the two-flank pulse model. */
-              {
+              if (dbg && y == dbg_y && abs(x - dbg_x) <= 16 &&
+                  (x & 3) == 0) {
                 double en = 0, ed = 0;
-                for (int j = 1; j < NS - 1; j++) {
-                  float wj = fabsf(u[j + 1] - u[j - 1]);
-                  float fj = phi1(((float)(j - R) - (float)muL) / sL) -
-                             phi1(((float)(j - R) - (float)muR) / sR2);
-                  en += wj * (u[j] - fj) * (u[j] - fj);
-                  ed += wj;
+                for (int j = jl[li]; j <= jr[li]; j++) {
+                  float fj = phi1(((float)(j - R) - (float)mu) / s);
+                  en += wj[j] * (u[j] - fj) * (u[j] - fj);
+                  ed += wj[j];
                 }
-                if (ed > 1e-9) {
-                  float rmse = (float)sqrt(en / ed);
-                  wP *= ss01((trust_hi - rmse) /
-                             (trust_hi - trust_lo + 1e-9f));
-                }
+                fprintf(stderr,
+                        "DBG %d,%d NL=%d lobe[%d..%d] dom[%d..%d] "
+                        "W=%.3f mu=%.3f s=%.3f k=%.3f z0=%.3f ufit=%.4f "
+                        "nu=%.4f wS=%.4f rmse=%.4f Ld2=%.5f\n",
+                        x, y, NL, jl[li], jr[li], dl, dr, W, mu, s, k,
+                        z0, ufit0, nu, wS, ed > 1e-9 ? sqrt(en / ed) : -1.,
+                        Ld2);
               }
-              for (int c = 0; c < 4; c++)
-                nvP[c] = BE[c] + nq * qv[c];
+              for (int c = 0; c < 4; c++) {
+                float F0 = P0[c] + ufit0 * d2[c];
+                nvS[c] = P0[c] + nu * d2[c] + (o[c] - F0);
+              }
             }
           }
         }
       }
-      /* Soft step/pulse blend: coverage varies smoothly, so no branch
-         switching discontinuity (v4.7 corner-scallop fix). */
-      w = scw * wS + (1.f - scw) * wP;
-      for (int c = 0; c < 4; c++)
-        nv[c] = scw * nvS[c] + (1.f - scw) * nvP[c];
-      float fw = ss01((.025f - rng) * (1.f / .017f)) * (1.f - w), res[4];
-      for (int c = 0; c < 4; c++)
-        res[c] = clampf(o[c] + w * (nv[c] - o[c]) +
-                            fw * flatmix * (mean[c] - o[c]),
-                        0.f, 1.f);
+      /* Store the model colour delta (profile steepening + flat
+         flatten) and the contour tangent for pass 2; the pixel's own
+         fit residual is NOT stored: it is re-added unsmoothed at write
+         time via o[c] (texture stays per-pixel). */
+      {
+        float fw = ss01((.025f - rng) * (1.f / .017f)) * (1.f - wS);
+        float *dd = DEL + 4 * idx, *dr = DIR + 2 * idx;
+        for (int c = 0; c < 4; c++)
+          dd[c] = wS * (nvS[c] - o[c]) + fw * flatmix * (mean[c] - o[c]);
+        dr[0] = -diry; /* tangent of the fitted contour */
+        dr[1] = dirx;
+      }
+    }
+  /* Pass 2: tangential smoothing of the model delta.  Per-pixel lobe
+     fits (centre/width, trust weight) jitter by hundredths of a pixel
+     on noisy content; evaluated at steepness k the anchored output
+     renders that jitter amplified ~k-fold as outstanding pixels at
+     gradient centres -- the same artifact class v4.7's colour-domain
+     gain produced, just weaker.  The delta is constant ALONG a
+     genuine contour, so a short tangential average (same span as the
+     line-sampling tangent averaging) destroys the jitter without
+     touching across-edge sharpness, and each pixel's own residual
+     (texture, hue arcs) is never smoothed. */
+  for (int y = 0; y < dh; y++)
+    for (int x = 0; x < dw; x++) {
+      size_t idx = (size_t)y * dw + x;
+      const float *dr = DIR + 2 * idx;
+      float acc[4] = {0, 0, 0, 0}, o[4], res[4], wsum = 0.f;
+      for (int to = -T; to <= T; to++) {
+        float wt = (float)(T + 1 - (to < 0 ? -to : to)), q[4];
+        sample_f4(DEL, dw, dh, (float)x + (float)to * dr[0],
+                  (float)y + (float)to * dr[1], q);
+        for (int c = 0; c < 4; c++)
+          acc[c] += wt * q[c];
+        wsum += wt;
+      }
+      float inv = 1.f / wsum;
+      for (int c = 0; c < 4; c++) {
+        o[c] = A[4 * idx + c];
+        res[c] = clampf(o[c] + acc[c] * inv, 0.f, 1.f);
+      }
       put(dst + 4 * idx, res[0], res[1], res[2], res[3]);
     }
   memcpy(out, dst, n * 4);
   free(dst);
+  free(DIR);
+  free(DEL);
   free(A);
   return 1;
 }
@@ -4449,7 +4482,7 @@ static uint8_t *slurp(const char *name, size_t *n) {
 static void print_help(const char *argv0) {
   printf(
       "celup_lab -- premultiplied-linear WebP upscaler (research build "
-      "v4.7)\n"
+      "v4.8)\n"
       "\n"
       "Usage: %s in.webp out.webp SCALE [options]\n"
       "  SCALE is the upsampling factor, real number in (1,32] "
@@ -4519,11 +4552,15 @@ static void print_help(const char *argv0) {
       "  -D, --deblur-method M     autodeblur method auto|remap|push\n"
       "                            (default auto = 2x proxy picks per image);\n"
       "                            remap = evaluate the slope-steepened\n"
-      "                            profile fit, push = evaluate at a z-\n"
-      "                            displaced coordinate (Anime4K push)\n"
-      "  -g, --deblur-steepness K  autodeblur slope multiplier 1..8 (default\n"
-      "                            0=auto); overrides -s and -e per-edge\n"
-      "                            adaptation\n"
+      "                            profile fit at the pixel's own position,\n"
+      "                            push = evaluate the original fit at a\n"
+      "                            position displaced toward the nearer\n"
+      "                            plateau (Anime4K push)\n"
+      "  -g, --deblur-steepness K  autodeblur slope multiplier FLOAT 1..64\n"
+      "                            (default 0=auto); overrides -s and -e\n"
+      "                            per-edge adaptation; anchored evaluation\n"
+      "                            keeps colour noise at gain 1, so K far\n"
+      "                            above 8 stays artifact-safe\n"
       "\n"
       "autoblur/autodeblur: what is automatic, and how to pin it\n"
       "  parameter    chosen automatically by...        pin manually with\n"
@@ -4533,21 +4570,27 @@ static void print_help(const char *argv0) {
       "  curve        validation-proxy fit              -c (any value but auto)\n"
       "  curve param  fit                               -p P\n"
       "  method       2x-downscale proxy MSE            -D remap|push\n"
-      "  steepness    -s formula, or -e per edge        -g K (exact, 1..8)\n"
+      "  steepness    -s formula, or -e per edge        -g K (exact float,\n"
+      "                                                 1..64)\n"
       "  Only the unpinned parameters are fitted.  Every effective value is\n"
       "  echoed to stderr, so an automatic run can be reproduced exactly by\n"
       "  re-running with its reported values pinned.\n"
       "\n"
-      "autodeblur internals (v4.7): one gradient direction per pixel for the\n"
-      "whole premultiplied RGBA vector (4D structure tensor); colors along\n"
-      "that normal are fit by an analytic profile (error-function edge / two-\n"
-      "flank line pulse); the slope is steepened ON THE FIT by k and the\n"
-      "pixel re-sampled from the curve as a convex mix of two real local\n"
-      "colors -- hue cannot invert, no overshoot, alpha coupled.  k is capped\n"
-      "so output ramps stay >= .6 px sigma (no re-aliased sawtooth), and\n"
-      "multi-crossing windows (text, crosshatch) are left alone via a fit-\n"
-      "quality trust gate.  The analysis window and shading gate scale with\n"
-      "the effective sigma, so wide intentional blur (-r 2+, -e escalation)\n"
+      "autodeblur internals (v4.8): one gradient direction per pixel for the\n"
+      "whole premultiplied RGBA vector (4D structure tensor); transition\n"
+      "lobes along that normal are segmented (|du| runs) and each pixel is\n"
+      "fit by an error-function profile on ITS OWN lobe with one-sided\n"
+      "plateau colours -- a line's two flanks and two backgrounds never\n"
+      "mix into one fit.  The slope is steepened ON THE FIT by k and the\n"
+      "fit is evaluated at the pixel's GEOMETRIC position, with the\n"
+      "pixel's own fit residual re-added at gain 1: colours stay\n"
+      "anchored (no k-amplified speckle, no phi^-1 halo, hue texture\n"
+      "kept), misassigned lobes degrade to identity, and k may be a\n"
+      "large float.  k is capped so output ramps stay >= .6 px sigma (no\n"
+      "re-aliased sawtooth); dense multi-crossing windows (text,\n"
+      "crosshatch) are left alone via a window-level crossing-count\n"
+      "trust gate.  The analysis window and shading gate scale with the\n"
+      "effective sigma, so wide intentional blur (-r 2+, -e escalation)\n"
       "is still unblurred.\n"
       "\n"
       "Output is always lossless WebP.  Hourglass/speckle suppression in the\n"
@@ -4689,8 +4732,9 @@ int main(int ac, char **av) {
       char *e;
       deblur_steepness = strtof(av[i + 1], &e);
       if (*e || (deblur_steepness != 0.f &&
-                 (deblur_steepness < 1.f || deblur_steepness > 8.f))) {
-        fprintf(stderr, "deblur-steepness must be 0 (auto) or in [1,8]\n");
+                 (deblur_steepness < 1.f || deblur_steepness > 64.f))) {
+        fprintf(stderr,
+                "deblur-steepness must be 0 (auto) or in [1,64]\n");
         return 2;
       }
     } else if (!strcmp(av[i], "--deblur-method") || !strcmp(av[i], "-D")) {
@@ -4791,7 +4835,8 @@ int main(int ac, char **av) {
                                                        SDF delta/blur buffers */
                            : !strcmp(mode, "autoblur") ? 8.0
                            : !strcmp(mode, "autodeblur")
-                               ? 8.0 + 12.0 /* remap fields */
+                               ? 8.0 + 44.0 /* A f16 + DEL f16 + DIR f8
+                                               + dst 4 */
                                                        : 4.0);
     double estimated =
         (in_bytes + out_bytes + 32.0 * 1024 * 1024) / (1024.0 * 1024.0);

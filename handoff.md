@@ -1,5 +1,113 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.8 update (2026-07-31): anchored autodeblur -- lobe-local fits, float steepness to 64
+
+User review of v4.7: closer, but (1) "outstanding pixels at centers of
+gradient", (2) "line ends look like snake tongue with split to 2
+ends", (3) "halo of color surrounding line smoothly from line center
+quickly ending near edge of line", (4) "looks like 2 gradients
+surrounding edge are combined instead of not going further than each
+other", (5) requests: float steepness ("can be much higher than 8"),
+"making deblur fit original colors with gradient change", and NO
+per-image-part heuristics (they introduce inconsistency).  Best recipe
+for the miya image at the time:
+`-m autodeblur -r 2.3 -s 100 -g 8 -D remap -c linear -k bspline` (4x),
+"but still with watered away colors".
+
+All symptoms root in v4.7's design, reproduced on purpose-built
+fixtures (tests/make_test_sources.py: caps48, twoline48, huearc48,
+rampnoise48):
+
+- v4.7 evaluates nu = Phi(k * Phi^-1(u_px)): colour-domain mapping.
+  d(nu)/du = k at ramp centre -> off-curve pixels amplify k-fold
+  ("outstanding pixels"); Phi^-1 explodes near plateaus -> flat noise
+  becomes a colour halo hugging a line from its centre, dying at its
+  edge; one window-wide fit spanning a thin line averages BOTH flanks
+  and BOTH backgrounds into a phantom step whose midpoint sits at the
+  LINE CENTRE -> pixels get sorted to the wrong plateau ("2 gradients
+  combined"), flipping at caps ("snake tongue"); and every output is
+  snapped onto the 1D colour segment, deleting the perpendicular
+  colour component ("watered away colors").
+
+v4.8 changes (autodeblur_pass; sampling unchanged):
+
+1. LOBE MAP: |du| along the normal segmented into transition lobes
+   (runs above max(.06*wmax, .004), single-sample dips bridged).  The
+   pixel is assigned its nearest lobe; P0/P1 plateaus are one-sided
+   means clipped at neighbouring lobes; moments mu,s over the lobe
+   only.  The PULSE model is deleted: a line interior pixel assigned
+   to a flank lobe saturates to plateau+residual = identity, and the
+   (CA+CB)/2 phantom-BE concept is gone entirely.
+2. ANCHORED EVALUATION: out = F_k(0) + (o - F(0)) (remap), or
+   F(0 + s*(ufit-.5)(k-1)*1.5) + residual (push).  On-curve pixels
+   steepen exactly by k (identical to v4.7's z-map there); off-curve
+   deviations pass at GAIN 1: no amplification, hue/alpha texture
+   kept.  Misassignment degrades to identity, never artifact.
+3. FLOAT STEEPNESS -g 1..64 (was int 1..8); -e per-edge cap raised to
+   16.  Anti-realiasing cap k <= s/.6 unchanged (output ramp >= .6 px
+   sigma): on step48 g8 == g16 == g32 because the cap binds first --
+   documented in --help and README.
+4. PASS 2: the model colour delta (plus flat-flatten delta) is
+   smoothed tangentially along the contour (binomial weights over the
+   v4.7 tangent span) before application; per-pixel residuals are
+   never smoothed.  Removes coherent hundredth-px fit jitter.
+5. TRUST: erf-RMSE over the lobe (|du| weights) as before, and the
+   beta2 unimodality gate is replaced by a window-level hysteresis
+   mid-level CROSSING COUNT (step = 1, one line = 2: full trust; 4+
+   fades out by 4.75) -- per-lobe fits are all locally good in dense
+   texture, so the suppression signal must live on the window.
+
+Measurements (all reproducible; fixtures regenerate via
+tests/make_test_sources.py):
+
+- step48 4x -r1.5 -g8 remap transect x=86..106: transition ~20 px ->
+  ~9 px (0.180,0.192,0.227,0.306,0.439,0.573,0.678,0.749,0.784,0.804,
+  0.816), plateaus pinned, monotone, no ringing; -g 8/16/32 identical
+  (s/.6 cap binding).
+- Forensics fixtures (4x -r1.5 -g8 remap):
+  caps48: v4.7's cap-centre notch gone (visual);
+  twoline48: each flank steepens against its own background (no BE
+  mixing possible);
+  huearc48 (fast red->cyan sweep): mean saturation base .8490,
+  v4.7 .8471, v4.8 .8481 (arc kept, not chord-collapsed);
+  rampnoise48 (+-6 LSB dither): HF std base .00117, v4.7-g8 .00175,
+  v4.8-g8 .00225 -- see caveat below.
+- miya_face, user recipe (4x, -r2.3 -s100 -g8 -D remap -c linear
+  -k bspline): cheek-gradient HF std v4.7 .01759 -> v4.8 .01568
+  (g16 .01581); blush local texture std .1652 -> .1677.  Spike
+  line-end centre-notch visible in v4.7 removed in v4.8 -g8/-g16
+  (sheet), no dark rim; -g16 safe (anchored noise stays gain-1).
+- Torture 4x defaults, autodeblur: checker2 HG .00469 (autoblur
+  .00428), crosshatch .00417, rings .00398, diag .00214, corner
+  .00184.  MAE improved on ALL scenes vs v4.7 (checker2 .0517 vs
+  .0567).  The v4.7 corner-HG .0101 phase-offset caveat is FIXED by
+  lobe localization: .00184 ~ autoblur's own .00175.
+- tests/test_scales.py: 204/204 PASS.  Clean -Wall -Wextra -Wshadow.
+
+Trade-offs accepted / caveats:
+
+- On synthetic ramps with strong injected dither the residual model
+  jitter (window-moment centre noise ~.02 px, printed once at k) shows
+  as ~+/-1 LSB random dither -- sub-visible at 4x zoom.  Explored and
+  rejected: core-trimmed centroid (starves the width: sigma-6 reads as
+  2.5 and the trust gate rejected every clean wide ramp) and Gaussian
+  truncation inversion (exact for Gaussians but flapped the rmse gate
+  per-pixel on window position).  Tangential pass-2 smoothing removes
+  the coherent part; the remainder is random.  On REAL content (miya),
+  texture passes through at gain 1 and overall HF is LOWER than v4.7
+  (no k-amplification).
+- checker2 HG .00469 vs autoblur .00428 (v4.7: .00402): slight
+  residual steepening activity on the checker scene; MAE improved
+  (.0517 vs autoblur .0544 vs v4.7 .0567).
+- Pinned invisible-alpha pixels differ vs v4.7 (residual preservation
+  keeps hidden RGB under alpha<=16; 0 pixels with alpha>16 differ by
+  more than 128/255; appearance identical; ~2% larger lossless file on
+  miya_face default).
+- CELUP_DBG=x,y prints per-pixel fit internals (lobe bounds, mu, s, k,
+  z0, wS, rmse) around a coordinate -- diagnostic for future tuning.
+- Memory estimate for autodeblur raised to 44 B/out-px of scratch
+  (A f16 + DEL f16 + DIR f8 + dst 4); the --max-mib guard accounts it.
+
 # v4.7 update (2026-07-31): analytic autodeblur (profile-fit steepening)
 
 User review of v4.6: "it doesn't reduce steepness, it creates a bright

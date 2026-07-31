@@ -41,6 +41,77 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
+## v4.8: anchored autodeblur -- lobe-local fits, evaluation at the pixel's own position
+
+Review of v4.7: "closer, but it can create outstanding pixels at
+centers of gradient; line ends look like snake tongue with split to 2
+ends; a halo of color surrounds the line smoothly from line center,
+quickly ending near the line edge; looks like 2 gradients surrounding
+an edge are combined instead of not going further than each other.
+Can steepness be float, much higher than 8? Can the deblur fit the
+original colors with the gradient change? Surely specific artifacts
+aren't supposed to be handled by per-image-part heuristics."  All
+three observations trace to v4.7's three remaining design flaws, and
+the fix is model-level, not per-artifact heuristics:
+
+- v4.7 remapped each pixel's COLOUR through the steepened fit
+  (nu = Phi(k*Phi^-1(u))).  d(nu)/du = k at the ramp centre, so a
+  pixel epsilon off the fitted curve rendered k*epsilon off
+  (outstanding mid-gradient pixels); near plateaus Phi^-1 explodes,
+  printing flat noise as the colour halo that hugs a line from its
+  centre and dies at its edge; and one window-wide fit spanning a
+  thin line averaged BOTH flanks and BOTH backgrounds into one
+  phantom step centred mid-line (the "combined gradients"), which
+  forked line caps into snake tongues.  v4.7 also snapped every
+  output onto the fit's 1D colour segment, discarding the
+  perpendicular colour component -- the "watered away colors".
+
+v4.8 keeps the v4.7 sampling (4D structure tensor, one gradient
+direction for the premultiplied vector, tangentially averaged line
+samples) but redefines fit domain and evaluation:
+
+- LOBE MAP: |du| along the normal is segmented into transition lobes.
+  The pixel is assigned its NEAREST lobe; plateau colours, centre mu
+  and width s come from that lobe alone with one-sided margins
+  clipped at neighbouring lobes -- two flanks and two backgrounds
+  never enter one fit, and misassignment only yields plateau+residual
+  = identity (degrades safely, never to an artifact).  The PULSE
+  branch is gone: one analytic model handles steps and lines alike.
+- ANCHORED EVALUATION: the steepened fit is evaluated at the pixel's
+  GEOMETRIC position on the normal and the pixel's own fit residual
+  is re-added with GAIN 1: out = F_k(0) + (o - F(0)).  On-curve
+  pixels steepen exactly by k; off-curve deviations (texture, hue
+  arcs, dither, alpha) pass through unamplified: no k-amplified
+  speckle, no Phi^-1 halo, original colours kept -- "fit the original
+  colors with the gradient change", as suggested.  Consequence: -g
+  now takes FLOATS 1..64 (noise stays gain-1 while k grows).  The
+  anti-realiasing cap k <= s/.6 still decides the true maximum per
+  edge (wider intended blur via -r/-e or higher scale raises it).
+- The model delta is smoothed TANGENTIALLY along the contour (pass 2)
+  to remove hundredth-pixel fit jitter before application; residuals
+  are never smoothed.
+- MULTI-CROSSING trust replaces the beta2 gate: per-lobe fits are all
+  good inside dense texture, so suppression counts hysteresis
+  mid-level crossings over the whole window (step = 1, one line = 2:
+  full trust; 4+ fades to zero) beside the erf-RMSE-over-lobe gate.
+
+Measured: step48 4x -r1.5 -g8 remap transition ~20 px -> ~9 px,
+plateaus pinned, no ringing (-g 8/16/32 identical there: the s/.6 cap
+is the binding constraint by design; raise -r for more).  miya_face
+with the user's recipe (-r 2.3 -s 100 -c linear -k bspline -D remap):
+cheek-gradient HF noise .0176 (v4.7) -> .0157 at -g8, unchanged at
+-g16 (texture gain ~1); blush texture retention .1652 -> .1677
+(anchored colours, not watered); spike line-end centre-notch in v4.7
+gone at -g8/-g16 (review sheet).  Torture 4x defaults: checker2 HG
+.00469 (autoblur .00428), crosshatch .00417, rings .00398, diag
+.00214, corner **.00184** -- the v4.7 corner phase-offset caveat
+(.0101) is FIXED by lobe localization, at autoblur level (.00175);
+every MAE improved vs v4.7 (checker2 .0517 vs .0567).  tests/
+test_scales.py 204/204 PASS; clean -Wall -Wextra -Wshadow.  Known
+caveat: on synthetic ramps with injected dither, residual model
+jitter shows as ~+/-1 LSB random dither (sub-visible; real-content
+texture passes through at gain 1 instead -- see handoff v4.8).
+
 ## v4.7: analytic autodeblur -- profile fit per gradient, slope on the fit
 
 Review of v4.6 on the wide-blur recipe: "it doesn't reduce steepness,

@@ -115,6 +115,90 @@ def step48_src():
     save("step48_src.webp", (rgba * 255).astype(np.uint8))
 
 
+def caps48_src():
+    """48x48: dark lines with FLAT caps on white (snake-tongue forensics,
+    v4.8): horizontal 3px and 2px, vertical 2px, one shallow diagonal,
+    one T-junction, blurred sigma=1.2 src px."""
+    from scipy.ndimage import gaussian_filter
+
+    lum = np.ones((48, 48), np.float64)
+    lum[8:11, 6:30] = 0.10     # horizontal 3px, flat caps at x=6 and x=29
+    lum[20:22, 30:44] = 0.15   # horizontal 2px, flat caps
+    lum[26:42, 8:10] = 0.12    # vertical 2px, flat caps
+    for xx in range(10, 34):   # shallow diagonal 1.5px-ish
+        yy = int(round(40 - 0.20 * (xx - 10)))
+        lum[yy, xx] = 0.18
+        lum[yy + 1, xx] = 0.45
+    lum[8:14, 17:20] = 0.10    # T-junction stem over the first line
+    lum = gaussian_filter(lum, 1.2)
+    rgba = np.dstack([lum, lum * 0.92 + 0.02, lum * 0.85 + 0.05,
+                      np.ones_like(lum)])
+    save("caps48_src.webp", (np.clip(rgba, 0, 1) * 255).astype(np.uint8))
+
+
+def twoline48_src():
+    """48x48: a 3px dark-red vertical line INSIDE a warm light region,
+    plus an independent warm->deep-blue border 6 src px away, blurred
+    sigma=1.2 src px -- v4.8 '2 gradients surrounding edge combined' /
+    halo forensics: each flank must steepen against its OWN background
+    (warm on both sides of the line, warm|blue at the border), never
+    the mix of the two, and plateaus must not overshoot."""
+    from scipy.ndimage import gaussian_filter
+
+    yy, xx = np.mgrid[0:48, 0:48]
+    rgb = np.zeros((48, 48, 4), np.float64)
+    rgb[..., 0] = np.where(xx < 24, 0.95, 0.10)   # warm light | deep blue
+    rgb[..., 1] = np.where(xx < 24, 0.80, 0.12)
+    rgb[..., 2] = np.where(xx < 24, 0.65, 0.55)
+    rgb[..., 3] = 1.0
+    line = np.abs(xx - 13) < 1.5                  # line inside warm side
+    rgb[line, 0] = 0.30
+    rgb[line, 1] = 0.10
+    rgb[line, 2] = 0.12
+    for c in range(3):
+        rgb[..., c] = gaussian_filter(rgb[..., c], 1.2)
+    save("twoline48_src.webp", (np.clip(rgb, 0, 1) * 255).astype(np.uint8))
+
+
+def huearc48_src():
+    """48x48: horizontal sweep whose colour path ARCS in RGB (saturated
+    hue sweep red -> orange -> yellow -> green), blurred sigma=1.0 src px.
+    v4.8 'watered away colors' forensics: the deblurred sweep must keep
+    the arc (full HSV saturation), not collapse onto the chord between
+    the window extremes."""
+    from scipy.ndimage import gaussian_filter
+    import colorsys
+
+    yy, xx = np.mgrid[0:48, 0:48]
+    h = xx / 47.0 * 0.50                        # red->cyan hue arc (fast)
+    rgb = np.zeros((48, 48, 4), np.float64)
+    for i in range(48):
+        for j in range(48):
+            r, g, b = colorsys.hsv_to_rgb(h[i, j], 0.85, 0.95)
+            rgb[i, j] = (r, g, b, 1.0)
+    for c in range(3):
+        rgb[..., c] = gaussian_filter(rgb[..., c], 1.0)
+    save("huearc48_src.webp", (np.clip(rgb, 0, 1) * 255).astype(np.uint8))
+
+
+def rampnoise48_src():
+    """48x48: smooth vertical ramp + tiny dither noise (+/-2 LSB), blurred
+    sigma=1.0 src px -- v4.8 'outstanding pixels at gradient centre'
+    forensics: anchored evaluation must pass the dither through at gain 1,
+    not amplify it k-fold."""
+    from scipy.ndimage import gaussian_filter
+
+    yy, xx = np.mgrid[0:48, 0:48]
+    rng = np.random.default_rng(20260731)
+    lum = xx / 47.0
+    rgb = np.dstack([lum, lum * 0.9 + 0.03, 1.0 - lum * 0.8,
+                     np.ones_like(lum)])
+    for c in range(3):
+        rgb[..., c] = gaussian_filter(rgb[..., c], 1.0)
+    rgb[..., 0:3] += rng.integers(-6, 7, (48, 48, 1)).astype(np.float64) / 255.0
+    save("rampnoise48_src.webp", (np.clip(rgb, 0, 1) * 255).astype(np.uint8))
+
+
 if __name__ == "__main__":
     torture_src()
     pixelart_src()
@@ -124,3 +208,7 @@ if __name__ == "__main__":
     parallel96()
     rings96()
     step48_src()
+    caps48_src()
+    twoline48_src()
+    huearc48_src()
+    rampnoise48_src()
