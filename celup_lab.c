@@ -30,6 +30,7 @@ static uint8_t to_srgb[4097];
 static float compress_strength = 2.f;
 /* Gaussian sigma in source-pixel units for blur modes. */
 static float blur_radius = 1.f;
+static int blur_radius_set = 0;
 /* If set, tune blurcompress parameters from the input image itself. */
 static int auto_blurcompress = 0;
 /* Conservative peak-RSS guard; overridden by --max-mib. */
@@ -1534,7 +1535,10 @@ static int upscale_adaptive(const uint8_t *in, int sw, int sh, uint8_t *out,
   int policy = resolve_policy(&cm);
   float *low = NULL;
   if (policy == POLICY_LOWPASS) {
-    low = alloc_lowpass_pm(in, sw, sh, .75f);
+    /* v5: honour -r for lowpass sigma so -r has visible effect in adaptive;
+       default 0.75 remains if not pinned. */
+    float lp_sigma = blur_radius_set ? clampf(blur_radius, 0.1f, 2.f) : 0.75f;
+    low = alloc_lowpass_pm(in, sw, sh, lp_sigma);
     if (!low) {
       free_class_map(&cm);
       return 0;
@@ -1667,8 +1671,10 @@ static int upscale_adaptive(const uint8_t *in, int sw, int sh, uint8_t *out,
     }
   }
   free(low);
-  /* Stage 2: gated consistency + focused hourglass cleanup. */
-  float sharp = clampf((compress_strength - 1.f) * .020f, 0.f, .16f);
+  /* Stage 2: gated consistency + focused hourglass cleanup.
+     v5: wider range so -s 100 is visibly stronger than -s 9 (was cap 0.16 at s=9);
+     monotonic up to 100: 0.012*(s-1) -> 0.45 at 100. */
+  float sharp = clampf((compress_strength - 1.f) * 0.012f, 0.f, 0.45f);
   int ok = refine_downsample_consistency(hr, in, sw, sh, dw, dh, 3, .55f,
                                          sharp, &cm);
   if (ok) {
@@ -1749,7 +1755,6 @@ enum {
 static int blur_kernel_kind = BK_AUTO;
 static int blur_curve_kind = CK_AUTO;
 static float curve_param = 0.f; /* <=0: family default (exp/log k, sqrt p) */
-static int blur_radius_set = 0;
 /* Resolved parameters, for the final report. */
 static int fitted_kernel = BK_GAUSSIAN, fitted_curve = CK_LINEAR;
 static float fitted_sigma = .75f, fitted_cp = 0.f;
@@ -1847,25 +1852,25 @@ static float kernel_profile_1d(int kind, float sigma, float x) {
   float a = fabsf(x);
   switch (kind) {
   case BK_BOX: {
-    /* h >= .75: always overlaps 1..2 source pixels (h=.5 would degenerate
-       to nearest-neighbour at continuous coordinates). */
+    /* v5: floor raised to 1.0 to avoid nearest-neighbour staircase at
+       small sigma (diagline 45 deg); 0.75 still showed treads. */
     float h = 1.5f * sigma;
-    if (h < .75f)
-      h = .75f;
+    if (h < 1.f)
+      h = 1.f;
     return a <= h ? .5f / h : 0.f;
   }
   case BK_TRIANGLE: {
-    /* Integer version tapered to 0 at r+1 ~ 2.2 sigma + 1: support s.
-       s >= 1 guarantees the two nearest taps always overlap. */
     float s = 1.1f * sigma + .5f;
     if (s < 1.f)
       s = 1.f;
     return a < s ? (s - a) / (s * s) : 0.f;
   }
   case BK_BSPLINE: {
+    /* v5: floor 0.7 -> 1.05: bspline at sigma 0.5 produced jump95 0.73
+       on 45 deg (staircase), gaussian 0.30 smooth; wider floor cures. */
     float s = .9f * sigma + .25f, u, b;
-    if (s < .7f)
-      s = .7f;
+    if (s < 1.05f)
+      s = 1.05f;
     u = a / s;
     b = u < 1.f ? (4.f - 6.f * u * u + 3.f * u * u * u) / 6.f
       : u < 2.f ? (2.f - u) * (2.f - u) * (2.f - u) / 6.f
@@ -1873,7 +1878,7 @@ static float kernel_profile_1d(int kind, float sigma, float x) {
     return b / s;
   }
   default: { /* BK_GAUSSIAN */
-    float s = sigma < .5f ? .5f : sigma;
+    float s = sigma < .7f ? .7f : sigma;
     return expf(-.5f * x * x / (s * s)) / (s * 2.5066282746f);
   }
   }
@@ -1883,7 +1888,7 @@ static int kernel_support_1d(int kind, float sigma) {
   switch (kind) {
   case BK_BOX: {
     float h = 1.5f * sigma;
-    return clampi((int)ceilf(h < .75f ? .75f : h), 1, 8);
+    return clampi((int)ceilf(h < 1.f ? 1.f : h), 1, 8);
   }
   case BK_TRIANGLE: {
     float s = 1.1f * sigma + .5f;
@@ -1891,12 +1896,12 @@ static int kernel_support_1d(int kind, float sigma) {
   }
   case BK_BSPLINE: {
     float s = .9f * sigma + .25f;
-    if (s < .7f)
-      s = .7f;
+    if (s < 1.05f)
+      s = 1.05f;
     return clampi((int)ceilf(2.f * s), 1, 8);
   }
   default: {
-    float s = sigma < .5f ? .5f : sigma;
+    float s = sigma < .7f ? .7f : sigma;
     return clampi((int)ceilf(3.f * s), 1, 8);
   }
   }
@@ -2174,8 +2179,10 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
         if (d > steep)
           steep = d;
       }
+      /* v5: stronger penalty for steep warp curves (was .30) to avoid
+         tracking source lattice as sawtooth; must win outright. */
       double score =
-          image_pm_mse(recon, in, sw, sh, 2) * (1. + .30 * (steep - 1.));
+          image_pm_mse(recon, in, sw, sh, 2) * (1. + .55 * (steep - 1.));
       s2[ci] = score;
       if (score < best2) {
         best2 = score;
@@ -2328,7 +2335,9 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
                               int dw, int dh);
 /* Standard-normal CDF (libm erff). */
 static float phi1(float z) { return .5f * (1.f + erff(z * 0.70710678f)); }
-static float trust_lo = .03f, trust_hi = .10f; /* fit-rmse trust gate; debug override: CDG=lo,hi */
+/* v5: trust gate widened (was .03/.10) and becomes adaptive to blur size;
+   narrow gate zeroed many wide-blur fits (r=6) -> parameter ignoring. */
+static float trust_lo = .04f, trust_hi = .22f; /* debug override: CDG=lo,hi */
 static float ss01(float z) {
   z = clampf(z, 0.f, 1.f);
   return z * z * (3.f - 2.f * z);
@@ -2538,9 +2547,11 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
   int R = wide ? clampi((int)(1.25f * scale * sref + .5f), 2, 64)
                : clampi((int)(1.25f * scale + .5f), 2, 12);
   int NS = 2 * R + 1; /* R <= 64 -> NS <= 129 */
+  /* v5: k from -s up to 8 (was 3) so -s 100 is visibly stronger than -s 9;
+     manual -g still wins but now its cap is looser (see below). */
   float kbase = deblur_steepness > 0.f
                     ? deblur_steepness
-                    : clampf(1.f + .25f * (compress_strength - 1.f), 1.f, 3.f);
+                    : clampf(1.f + .25f * (compress_strength - 1.f), 1.f, 8.f);
   last_deblur_k = deblur_steepness > 0.f   ? deblur_steepness
                   : edge_goal > 0.f        ? 0.f
                                            : kbase;
@@ -2550,7 +2561,9 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
      and u_px ~.5, so the fit reproduces it unchanged. */
   float sa = 1.3f * scale * sref, sb = 2.4f * scale * sref;
   float flatmix = .25f; /* diffusion-noise flattening in gate-zero zones */
-  int T = clampi((int)(scale * .75f + .5f), 1, 3); /* tangent span (v4.7) */
+  /* v5: T scales with assumed blur to keep tangential averaging effective
+     at wide r (r=6 needs more span to smooth mu jitter and kill 45deg treads). */
+  int T = clampi((int)(scale * .75f + .35f * sref + .5f), 1, 6);
   /* per-fit diagnostic dump: CELUP_DBG=x,y prints the fit internals for
      pixels near (x,y) (step 4 px) */
   int dbg = 0, dbg_x = 96, dbg_y = 96;
@@ -2905,12 +2918,15 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                     ((ab_a + ab_b < rmax ? ab_a + ab_b : rmax) -
                      (ab_a > rmin ? ab_a : rmin)) /
                     bb;
-                wS *= ss01((cov - .55f) * (1.f / .25f));
+                /* v5: wider blur needs lower coverage threshold (0.35 vs 0.55)
+                   else outer shading slopes kill trust and -r 6 leaves blur. */
+                float cov_thr = wide ? 0.35f : 0.55f;
+                wS *= ss01((cov - cov_thr) * (1.f / .25f));
                 if (dbg && y == dbg_y && abs(x - dbg_x) <= 16 &&
                     (x & 3) == 0)
                   fprintf(stderr, "DBGC %d,%d cov=%.3f raw[%.3f..%.3f] "
-                                  "step[%.3f..%.3f]\n",
-                          x, y, cov, rmin, rmax, ab_a, ab_a + ab_b);
+                                  "step[%.3f..%.3f] thr=%.2f\n",
+                          x, y, cov, rmin, rmax, ab_a, ab_a + ab_b, cov_thr);
               }
               /* Steepness: -g pins k exactly (float, up to 64); -e
                  adapts per edge; -s formula otherwise; always capped so
@@ -2922,7 +2938,17 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 float st = fmaxf(.6f, edge_goal * scale / 2.5f);
                 k = clampf(s / st, 1.f, 16.f);
               }
-              k = fminf(k, s / .6f);
+              /* v5: respect manual -g: looser anti-alias cap when user
+                 explicitly asks for steepness; auto keeps 0.6 px. */
+              if (deblur_steepness > 0.f) {
+                float minw = 0.40f;
+                if (deblur_steepness > 16.f) minw = 0.30f;
+                if (deblur_steepness > 32.f) minw = 0.22f;
+                if (deblur_steepness > 50.f) minw = 0.18f;
+                k = fminf(k, s / minw);
+              } else {
+                k = fminf(k, s / .6f);
+              }
               /* Anchored evaluation (v4.8): the steepened fit is
                  evaluated at the pixel's GEOMETRIC position on the
                  normal (t = 0), and the pixel's own residual to the
@@ -2980,7 +3006,11 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                     side = -1;
                   }
                 }
-                wS *= 1.f - ss01(((float)cross - 2.25f) / 2.5f);
+                /* v5: for wide blur allow more crossings (quantization
+                   can create spurious crossings), threshold raised. */
+                float cross0 = wide ? 3.0f : 2.25f;
+                float cross1 = wide ? 3.5f : 2.5f;
+                wS *= 1.f - ss01(((float)cross - cross0) / cross1);
               }
               /* Validity gate (v4.9): at junctions/corners/line caps
                  the 1D ramp model is outside its domain -- the window
@@ -3125,7 +3155,15 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           float st = fmaxf(.6f, edge_goal * scale / 2.5f);
           k = clampf(s / st, 1.f, 16.f);
         }
-        k = fminf(k, s / .6f);
+        if (deblur_steepness > 0.f) {
+          float minw = 0.40f;
+          if (deblur_steepness > 16.f) minw = 0.30f;
+          if (deblur_steepness > 32.f) minw = 0.22f;
+          if (deblur_steepness > 50.f) minw = 0.18f;
+          k = fminf(k, s / minw);
+        } else {
+          k = fminf(k, s / .6f);
+        }
         /* Anchored evaluation (v4.8) on the consensus fit. */
         float z0 = (0.f - mu) / s;
         float ufit0 = phi1(z0), nu;
@@ -4378,7 +4416,7 @@ static int upscale_deconv(const uint8_t *in, int sw, int sh, uint8_t *out,
   }
   int iters = clampi((int)(8.f + 2.f * compress_strength + 1.5f * blur_radius),
                      8, 48);
-  float sharp = clampf((compress_strength - 1.f) * .020f, 0.f, .16f);
+  float sharp = clampf((compress_strength - 1.f) * 0.012f, 0.f, 0.45f);
   int ok = refine_downsample_consistency(hr, in, sw, sh, dw, dh, iters, .64f,
                                          sharp, &cm);
   if (ok) {
