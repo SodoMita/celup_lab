@@ -20,6 +20,8 @@ from PIL import Image, ImageDraw
 S,N=4,96
 
 def candidate(spec):
+ if spec.lower().startswith('pil:'):
+  return ('pil', spec.split(':', 1)[1].lower())
  p=Path(spec); mode=None
  if ':' in spec:
   left,right=spec.rsplit(':',1)
@@ -28,9 +30,18 @@ def candidate(spec):
  return (p.resolve(),mode)
 def cname(c):
  exe,mode=c
+ if exe == 'pil':
+  return 'pil:' + mode
  return exe.name+((':'+mode) if mode else '')
 def run_candidate(c, inp, out):
  exe,mode=c
+ if exe == 'pil':
+  im = Image.open(inp)
+  w, h = im.size
+  res = {'nearest': Image.Resampling.NEAREST, 'bilinear': Image.Resampling.BILINEAR,
+         'bicubic': Image.Resampling.BICUBIC, 'lanczos': Image.Resampling.LANCZOS}.get(mode, Image.Resampling.BICUBIC)
+  im.resize((w*4, h*4), res).save(out)
+  return
  cmd=[exe,inp,out,'4']
  if mode: cmd += ['--mode',mode]
  subprocess.run(cmd,check=True,stdout=subprocess.DEVNULL)

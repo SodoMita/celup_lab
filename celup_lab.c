@@ -250,6 +250,24 @@ static float checker2x2_confidence_pm(float p[4][4]) {
   return clampf(contrast_conf * diag_conf, 0.f, 1.f);
 }
 
+static float checker3x3_at_pm(const uint8_t *in, int sw, int sh, int cx, int cy) {
+  float p[9][4];
+  for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++)
+      raw_pm(in, sw, sh, cx + dx, cy + dy, p[(dy + 1) * 3 + (dx + 1)]);
+  float d_corn = fmaxf(fmaxf(dist4_pm(p[0], p[2]), dist4_pm(p[0], p[6])),
+                       fmaxf(dist4_pm(p[0], p[8]), dist4_pm(p[0], p[4])));
+  float d_edge = fmaxf(fmaxf(dist4_pm(p[1], p[3]), dist4_pm(p[1], p[5])),
+                       dist4_pm(p[1], p[7]));
+  float d_cross = dist4_pm(p[4], p[1]);
+  if (d_cross < 1e-8f)
+    return 0.f;
+  float ratio = fmaxf(d_corn, d_edge) / d_cross;
+  float contrast_conf = ramp01(d_cross, 4e-4f, 3e-2f);
+  float pattern_conf = ramp01(ratio, .75f, .20f);
+  return clampf(contrast_conf * pattern_conf, 0.f, 1.f);
+}
+
 static void bilinear_sample_pm(const uint8_t *in, int sw, int sh, float sx,
                                float sy, float q[4], float cell[4][4]) {
   int ix = (int)floorf(sx), iy = (int)floorf(sy);
@@ -342,7 +360,8 @@ static int upscale_kernel(const uint8_t *in, int sw, int sh, uint8_t *out,
         float sy = (y + .5f) * (float)sh / dh - .5f;
         float base[4], cell[4][4];
         bilinear_sample_pm(in, sw, sh, sx, sy, base, cell);
-        float chk = checker2x2_confidence_pm(cell);
+        float chk = fminf(checker2x2_confidence_pm(cell),
+                          checker3x3_at_pm(in, sw, sh, (int)floorf(sx), (int)floorf(sy)));
         if (chk > 1e-4f)
           for (int c = 0; c < 4; c++)
             q[c] = base[c] + (1.f - chk) * (q[c] - base[c]);
@@ -878,7 +897,8 @@ static float checker2x2_near(const uint8_t *in, int sw, int sh, int cx,
       if (c > best)
         best = c;
     }
-  return best;
+  float c3 = checker3x3_at_pm(in, sw, sh, cx, cy);
+  return fminf(best, c3);
 }
 
 static int same_colour_pm(const float a[4], const float b[4]) {
@@ -2102,13 +2122,13 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
   double s1[4 * 6];
   for (size_t i = 0; i < sizeof s1 / sizeof s1[0]; i++)
     s1[i] = -1.0;
+  int n_sig = blur_radius_set ? 1 : (int)(sizeof sigmas / sizeof sigmas[0]);
   for (size_t ki = 0; ki < sizeof kernels / sizeof kernels[0]; ki++) {
     if (*kk != BK_AUTO && kernels[ki] != *kk)
       continue;
-    for (size_t si = 0; si < sizeof sigmas / sizeof sigmas[0]; si++) {
-      if (blur_radius_set && fabsf(sigmas[si] - *sigma) > 1e-6f)
-        continue;
-      if (!render_soft(train, tw, th, recon, sw, sh, kernels[ki], sigmas[si],
+    for (int si = 0; si < n_sig; si++) {
+      float sig_cand = blur_radius_set ? *sigma : sigmas[si];
+      if (!render_soft(train, tw, th, recon, sw, sh, kernels[ki], sig_cand,
                        CK_LINEAR, 0.f))
         continue;
       double score = image_pm_mse(recon, in, sw, sh, 2);
@@ -2116,7 +2136,7 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
       if (score < best) {
         best = score;
         best_k = kernels[ki];
-        best_s = sigmas[si];
+        best_s = sig_cand;
       }
     }
   }
@@ -2126,16 +2146,15 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
     for (size_t ki = 0; ki < sizeof kernels / sizeof kernels[0]; ki++) {
       if (*kk != BK_AUTO && kernels[ki] != *kk)
         continue;
-      for (size_t si = 0; si < sizeof sigmas / sizeof sigmas[0]; si++) {
-        if (blur_radius_set && fabsf(sigmas[si] - *sigma) > 1e-6f)
-          continue;
+      for (int si = 0; si < n_sig; si++) {
+        float sig_cand = blur_radius_set ? *sigma : sigmas[si];
         double score = s1[ki * 6 + si];
         if (score <= 0 || score > thr)
           continue;
         int rank = kernel_smooth_rank(kernels[ki]);
-        if (sigmas[si] > best_s + 1e-6f ||
-            (fabsf(sigmas[si] - best_s) <= 1e-6f && rank > brank)) {
-          best_s = sigmas[si];
+        if (sig_cand > best_s + 1e-6f ||
+            (fabsf(sig_cand - best_s) <= 1e-6f && rank > brank)) {
+          best_s = sig_cand;
           best_k = kernels[ki];
           brank = rank;
         }
@@ -2922,7 +2941,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 float st = fmaxf(.6f, edge_goal * scale / 2.5f);
                 k = clampf(s / st, 1.f, 16.f);
               }
-              k = fminf(k, s / .6f);
+              if (deblur_steepness <= 0.f) k = fminf(k, s / .6f);
               /* Anchored evaluation (v4.8): the steepened fit is
                  evaluated at the pixel's GEOMETRIC position on the
                  normal (t = 0), and the pixel's own residual to the
@@ -3125,7 +3144,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           float st = fmaxf(.6f, edge_goal * scale / 2.5f);
           k = clampf(s / st, 1.f, 16.f);
         }
-        k = fminf(k, s / .6f);
+        if (deblur_steepness <= 0.f) k = fminf(k, s / .6f);
         /* Anchored evaluation (v4.8) on the consensus fit. */
         float z0 = (0.f - mu) / s;
         float ufit0 = phi1(z0), nu;
