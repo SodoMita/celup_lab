@@ -20,6 +20,9 @@ from PIL import Image, ImageDraw
 S,N=4,96
 
 def candidate(spec):
+ prefix = spec.lower().split(':', 1)[0]
+ if prefix in ('pil', 'cv2', 'scipy', 'py'):
+  return (prefix, spec.split(':', 1)[1].lower() if ':' in spec else 'default')
  p=Path(spec); mode=None
  if ':' in spec:
   left,right=spec.rsplit(':',1)
@@ -28,9 +31,49 @@ def candidate(spec):
  return (p.resolve(),mode)
 def cname(c):
  exe,mode=c
+ if isinstance(exe, str):
+  return f"{exe}:{mode}"
  return exe.name+((':'+mode) if mode else '')
 def run_candidate(c, inp, out):
  exe,mode=c
+ if isinstance(exe, str):
+  im = Image.open(inp)
+  w, h = im.size
+  dw, dh = w * 4, h * 4
+  if exe == 'pil':
+   res = {'nearest': Image.Resampling.NEAREST, 'bilinear': Image.Resampling.BILINEAR,
+          'bicubic': Image.Resampling.BICUBIC, 'lanczos': Image.Resampling.LANCZOS}.get(mode, Image.Resampling.BICUBIC)
+   im.resize((dw, dh), res).save(out)
+  elif exe == 'cv2':
+   import cv2
+   arr = np.asarray(im)
+   inter = {'nearest': cv2.INTER_NEAREST, 'bilinear': cv2.INTER_LINEAR,
+            'cubic': cv2.INTER_CUBIC, 'lanczos4': cv2.INTER_LANCZOS4}.get(mode, cv2.INTER_CUBIC)
+   Image.fromarray(cv2.resize(arr, (dw, dh), interpolation=inter), im.mode).save(out)
+  elif exe == 'scipy':
+   from scipy.ndimage import zoom
+   arr = np.asarray(im, dtype=np.float32)
+   order = 5 if mode == 'spline5' else (3 if mode == 'spline3' else 1)
+   Image.fromarray(np.clip(zoom(arr, (4, 4, 1), order=order), 0, 255).astype(np.uint8), im.mode).save(out)
+  elif exe == 'py':
+   import cv2
+   arr = np.asarray(im)
+   base = cv2.resize(arr, (dw, dh), interpolation=cv2.INTER_LANCZOS4).astype(np.float32)
+   if mode == 'edgedir':
+    lum = base[:, :, :3].mean(axis=2)
+    gx = cv2.Sobel(lum, cv2.CV_32F, 1, 0, ksize=3); gy = cv2.Sobel(lum, cv2.CV_32F, 0, 1, ksize=3)
+    mag = np.sqrt(gx**2 + gy**2) + 1e-6
+    nx = gx / mag; ny = gy / mag
+    yy, xx = np.mgrid[0:dh, 0:dw]
+    xx_push = np.clip(xx - nx * 0.8, 0, dw - 1).astype(np.float32)
+    yy_push = np.clip(yy - ny * 0.8, 0, dh - 1).astype(np.float32)
+    pushed = np.empty_like(base)
+    for ch in range(base.shape[2]):
+     pushed[:, :, ch] = cv2.remap(base[:, :, ch], xx_push, yy_push, cv2.INTER_LINEAR)
+    wt = np.clip((mag - 10.0) / 40.0, 0.0, 0.7)[:, :, None]
+    base = base * (1.0 - wt) + pushed * wt
+   Image.fromarray(np.clip(base, 0, 255).astype(np.uint8), im.mode).save(out)
+  return
  cmd=[exe,inp,out,'4']
  if mode: cmd += ['--mode',mode]
  subprocess.run(cmd,check=True,stdout=subprocess.DEVNULL)

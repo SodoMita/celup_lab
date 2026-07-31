@@ -2,6 +2,29 @@
 
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.9.3 update (2026-07-31): parameter overrides fixed; 3x3 checkerboard confirmation removes diagonal staircases; advanced library benchmarks
+
+- **Parameter override fixes**:
+  - In `autodeblur_pass` (`celup_lab.c`), steepness `k` was previously clamped unconditionally by `k = fminf(k, s / .6f)`. When users explicitly passed `--deblur-steepness K` (`-g K`), `K` was silently ignored/capped on narrower edges. Fixed: explicit `deblur_steepness > 0.f` now bypasses the `s / .6f` clamp and pins `k` exactly as documented.
+  - In `auto_tune_soft_params` (`upscale_autoblur`), when `--blur-radius R` (`-r R`) was passed, the tuning loop skipped every candidate sigma where `sigmas[si] != R`. When `R` was not in the hardcoded table (`.15, .30, .50, .75, 1.10, 1.60`), no candidates matched and the mode defaulted to Gaussian 0.75 / linear. Fixed: when `blur_radius_set == 1`, `auto_tune_soft_params` evaluates `R` directly for all kernels and curves.
+- **3x3 Checkerboard confirmation (diagonal staircase removal)**:
+  - `checker2x2_confidence_pm` (used in `upscale_kernel` to override cubic/Lanczos with bilinear on checkerboards, and in `build_class_map` for checker classification) previously checked only 2x2 cells. A 1-px diagonal line (`A B / B A`) has an identical 2x2 signature to a checkerboard, causing 61 out of 61 diagonal cells on `diagline48_src.webp` to be misdetected as checkerboards and forced to bilinear interpolation (creating diamond-shaped staircase treads).
+  - Added `checker3x3_at_pm` to require 3x3 pattern confirmation (`A B A / B A B / A B A`): true pixel-art checkerboards (`pixelart_src.webp`: 1596 cells) are still detected and lowpassed, while diagonal lines (`diagline48_src.webp`: 0 false positives) keep full cubic/Lanczos/autodeblur sharpness and smooth contours without bilinear staircases.
+- **Advanced Python & C library comparison benchmarks**:
+  - Extended `evaluate_upscalers.py`, `hourglass_metric.py`, and `make_smiley_staircase_sheets.py` to support standard PIL (`pil:bicubic`, `pil:lanczos`) and advanced external library upscalers:
+    - `cv2:lanczos4`: OpenCV 8x8 Lanczos4 window.
+    - `scipy:spline5`: SciPy 5th-order quintic C4-continuous B-spline interpolation (`scipy.ndimage.zoom`).
+    - `py:edgedir`: Python Edge-Directed Super-Resolution (Anime4K-style directional normal sharpening and displacement).
+  - **MAE vs Artifact/Hourglass Energy (`hourglass_metric.py`)**:
+    - While `cv2:lanczos4` (MAE 0.00720) and `py:edgedir` (0.00761) achieve competitive MAE on simple scenes, `hourglass_metric.py` shows their hourglass/bow-tie artifact energy (HG) on textured and diagonal scenes (`rings`, `diag`, `corner`, `checker2`, `crosshatch`) is **5× to 10× higher** than `celup_lab:adaptive` (e.g. `rings` HG: `cv2:lanczos4` = 0.01217, `scipy:spline5` = 0.01553, `py:edgedir` = 0.01658 vs `celup_lab:adaptive` = 0.00191). This confirms that standard linear splines and unguided edge-directed sharpeners trade bow-tie artifact suppression for raw MAE, whereas `adaptive` removes hourglass energy by construction.
+  - Quantitative staircase evaluation (`staircase_diag45_comparison.png`, 95th-percentile step jump / res95):
+    - `cv2:lanczos4`: jump95 = 0.181px | res95 = 0.146px
+    - `scipy:spline5`: jump95 = 0.215px | res95 = 0.160px
+    - `py:edgedir`: jump95 = 0.211px | res95 = 0.137px
+    - `celup_lab:lanczos3`: jump95 = 0.230px | res95 = 0.168px
+    - `autodeblur Miya (-r 2.3 -s 100 -g 16)`: jump95 = 0.003px | res95 = 0.018px
+  - All regression tests pass (`check_stairs.py` PASS, `check_corners.py` PASS, `test_scales.py` PASS, `test_celup3.py` 23.57 baseline PASS).
+
 # v4.9.2 update (2026-07-31): `-D remake` alias; crosshatch delta root-caused
 
 - `-D remake` is now accepted as an alias of `remap` (the user's own
