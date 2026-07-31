@@ -102,6 +102,25 @@ def rings96():
     save("rings96.webp", np.dstack([v, v, v, np.full_like(v, 255)]))
 
 
+def step48_src():
+    """48x48: vertical step blurred with gaussian sigma=1.5 src px (v4.7
+    analytic-deblur ground truth: channels wired to rise/fall oppositely
+    so hue-inversion bugs are visible; transect checks in handoff v4.7)."""
+    yy, xx = np.mgrid[0:48, 0:48]
+    step = (xx >= 24).astype(np.float64)
+    gauss = np.exp(-0.5 * (xx[0] - 24.0) ** 2 / 1.5**2)
+    gauss /= gauss.sum()
+    ker = gauss[None, :] * gauss[:, None]
+    pad = 8
+    ext = np.pad(step, pad, mode="edge")
+    from scipy.signal import convolve2d
+
+    img = np.clip(convolve2d(ext, ker, mode="same")[pad:-pad, pad:-pad] * 0.7 + 0.15,
+                  0, 1)
+    rgba = np.dstack([img, img * 0.5 + 0.3, 1 - img, np.ones_like(img)])
+    save("step48_src.webp", (rgba * 255).astype(np.uint8))
+
+
 if __name__ == "__main__":
     torture_src()
     pixelart_src()
@@ -110,3 +129,4 @@ if __name__ == "__main__":
     thin96()
     parallel96()
     rings96()
+    step48_src()
