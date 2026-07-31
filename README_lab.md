@@ -38,15 +38,20 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
-## v4.9.3: parameter override fixes, 3x3 checkerboard confirmation, and PIL library comparisons
+## v4.9.3: parameter override fixes, 3x3 checkerboard confirmation, and advanced library comparisons
 
 - **Parameter override fixes**:
   - In `autodeblur`, explicit `--deblur-steepness K` (`-g K`) now overrides the default `.6 px` ramp clamp (`fminf(k, s / .6f)`), ensuring requested steepness is applied without being silently capped on narrower edges.
   - In `autoblur`, explicit `--blur-radius R` (`-r R`) is now evaluated directly by the parameter tuner (`auto_tune_soft_params`) instead of skipping sigmas outside the hardcoded 6-value table (`.15, .30, .50, .75, 1.10, 1.60`).
 - **3x3 Checkerboard confirmation**:
   - Replaced standalone 2x2 checkerboard gating (`checker2x2_confidence_pm`, which misdetected 1-px diagonal lines as checkerboards and forced bilinear staircase treads) with 3x3 pattern confirmation (`checker3x3_at_pm`). True checkerboards (`pixelart_src.webp`: 1596 cells) continue to be lowpassed, while diagonal contours (`diagline48_src.webp`: 0 false positives) keep full cubic/Lanczos/autodeblur smoothness without bilinear staircases.
-- **PIL C/Python library comparison benchmark**:
-  - `evaluate_upscalers.py` now accepts standard PIL C/Python resampling candidates (`pil:bicubic`, `pil:lanczos`, `pil:bilinear`, `pil:nearest`), providing direct quantitative MAE comparisons against existing Python image libraries. On test scenes, `celup_lab:cubic` and `celup_lab:adaptive` outperform PIL Bicubic and Lanczos on diagonal lines (`diag`), axis-aligned edges (`axis`), and alpha boundaries (`alpha`), while achieving ~3x lower error on gradients (`gradient`).
+- **Advanced Python & C library comparison benchmarks**:
+  - `evaluate_upscalers.py` and `hourglass_metric.py` now accept standard PIL (`pil:bicubic`, `pil:lanczos`) and advanced mathematical / edge-directed external upscalers:
+    - `cv2:lanczos4`: OpenCV 8x8 Lanczos4 window.
+    - `scipy:spline5`: SciPy 5th-order quintic C4-continuous B-spline interpolation.
+    - `py:edgedir`: Python Edge-Directed Super-Resolution (Anime4K-style directional sharpening and normal displacement).
+  - While `cv2:lanczos4`, `py:edgedir`, and `scipy:spline5` score competitive MAE on simple edges, `hourglass_metric.py` shows their hourglass/bow-tie artifact energy (HG) on textured and diagonal scenes (`rings`, `diag`, `corner`, `checker2`, `crosshatch`) is 5× to 10× higher than `celup_lab:adaptive` (e.g. `rings` HG: `cv2:lanczos4` = 0.01217, `scipy:spline5` = 0.01553 vs `celup_lab:adaptive` = 0.00191), demonstrating that `adaptive` eliminates bow-tie artifacts by construction.
+  - `make_smiley_staircase_sheets.py` regenerates 18-mode visual comparison sheets (`poor_smiley_comparison.png`, `poor_smiley_crop_comparison.png`, `staircase_comparison.png`, `staircase_diag45_comparison.png`) with quantitative staircase metrics.
 
 ## v4.9.2 (micro): `-D remake` = `remap` alias; crosshatch analysis
 
