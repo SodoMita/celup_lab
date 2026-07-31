@@ -25,16 +25,13 @@ SHEET_DIR = ROOT / "images/comparison_sheets"
 TEST_DIR = ROOT / "images/tests"
 
 # List of modes to compare: (label, tool, mode, scale, extra_flags)
-# tool can be 'celup_lab', 'pil', 'cv2', 'scipy', 'py', or 'source'
+# tool can be 'celup_lab' or 'pil' or 'source'
 MODES = [
     ("Source (Nearest)", "source", "nearest", ()),
     ("Nearest Neighbor", "celup_lab", "nearest", ()),
     ("Bilinear", "celup_lab", "bilinear", ()),
     ("PIL Bicubic (Ref)", "pil", "bicubic", ()),
     ("PIL Lanczos (Ref)", "pil", "lanczos", ()),
-    ("scipy:spline5 (Ref)", "scipy", "spline5", ()),
-    ("cv2:lanczos4 (Ref)", "cv2", "lanczos4", ()),
-    ("py:edgedir (Ref)", "py", "edgedir", ()),
     ("celup_lab:cubic", "celup_lab", "cubic", ()),
     ("celup_lab:mitchell", "celup_lab", "mitchell", ()),
     ("celup_lab:lanczos3", "celup_lab", "lanczos3", ()),
@@ -73,41 +70,6 @@ def run_upscale(src_path, dst_path, scale, tool, mode, extra):
         }
         res = res_map.get(mode, Image.Resampling.BICUBIC)
         im.resize((w * scale, h * scale), res).save(dst_path)
-    elif tool == "cv2":
-        import cv2
-        im = Image.open(src_path)
-        arr = np.asarray(im)
-        w, h = im.size
-        inter = {"nearest": cv2.INTER_NEAREST, "bilinear": cv2.INTER_LINEAR,
-                 "cubic": cv2.INTER_CUBIC, "lanczos4": cv2.INTER_LANCZOS4}.get(mode, cv2.INTER_CUBIC)
-        Image.fromarray(cv2.resize(arr, (w * scale, h * scale), interpolation=inter), im.mode).save(dst_path)
-    elif tool == "scipy":
-        from scipy.ndimage import zoom
-        im = Image.open(src_path)
-        arr = np.asarray(im, dtype=np.float32)
-        order = 5 if mode == "spline5" else (3 if mode == "spline3" else 1)
-        up = np.clip(zoom(arr, (scale, scale, 1), order=order), 0, 255).astype(np.uint8)
-        Image.fromarray(up, im.mode).save(dst_path)
-    elif tool == "py":
-        import cv2
-        im = Image.open(src_path)
-        w, h = im.size
-        dw, dh = w * scale, h * scale
-        base = cv2.resize(np.asarray(im), (dw, dh), interpolation=cv2.INTER_LANCZOS4).astype(np.float32)
-        if mode == "edgedir":
-            lum = base[:, :, :3].mean(axis=2)
-            gx = cv2.Sobel(lum, cv2.CV_32F, 1, 0, ksize=3); gy = cv2.Sobel(lum, cv2.CV_32F, 0, 1, ksize=3)
-            mag = np.sqrt(gx**2 + gy**2) + 1e-6
-            nx = gx / mag; ny = gy / mag
-            yy, xx = np.mgrid[0:dh, 0:dw]
-            xx_push = np.clip(xx - nx * 0.8, 0, dw - 1).astype(np.float32)
-            yy_push = np.clip(yy - ny * 0.8, 0, dh - 1).astype(np.float32)
-            pushed = np.empty_like(base)
-            for ch in range(base.shape[2]):
-                pushed[:, :, ch] = cv2.remap(base[:, :, ch], xx_push, yy_push, cv2.INTER_LINEAR)
-            wt = np.clip((mag - 10.0) / 40.0, 0.0, 0.7)[:, :, None]
-            base = base * (1.0 - wt) + pushed * wt
-        Image.fromarray(np.clip(base, 0, 255).astype(np.uint8), im.mode).save(dst_path)
     else:
         cmd = [str(EXE), str(src_path), str(dst_path), str(scale), "--mode", mode, *extra]
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
@@ -231,7 +193,7 @@ def main():
             smiley_crop_panels.append((label, crop_im))
 
         sheet_smiley = make_grid_sheet(
-            "poor_smiley.webp 2x Upscale Comparison (512x512)", smiley_panels, cols=6
+            "poor_smiley.webp 2x Upscale Comparison (512x512)", smiley_panels, cols=5
         )
         sheet_smiley.save(SHEET_DIR / "poor_smiley_comparison.png")
         sheet_smiley.save(SHEET_DIR / "poor_smiley_comparison.webp", lossless=True)
@@ -240,7 +202,7 @@ def main():
         sheet_smiley_crop = make_grid_sheet(
             "poor_smiley.webp 2x Upscale Central Detail Crop (256x256)",
             smiley_crop_panels,
-            cols=6,
+            cols=5,
         )
         sheet_smiley_crop.save(SHEET_DIR / "poor_smiley_crop_comparison.png")
         sheet_smiley_crop.save(SHEET_DIR / "poor_smiley_crop_comparison.webp", lossless=True)
@@ -260,7 +222,7 @@ def main():
         sheet_stair = make_grid_sheet(
             "Staircase Problem Comparison — 45° Line, 30° Line, Circle & L-Corner (4x Upscale)",
             stair_panels,
-            cols=6,
+            cols=5,
         )
         sheet_stair.save(SHEET_DIR / "staircase_comparison.png")
         sheet_stair.save(SHEET_DIR / "staircase_comparison.webp", lossless=True)
@@ -290,7 +252,7 @@ def main():
         sheet_diag45 = make_grid_sheet(
             "45° Diagonal Line Staircase Evaluation (tests/diagline48_src.webp 4x) — Quantitative Staircase Metrics",
             diag45_panels,
-            cols=6,
+            cols=5,
             label_h=66,
         )
         sheet_diag45.save(SHEET_DIR / "staircase_diag45_comparison.png")
