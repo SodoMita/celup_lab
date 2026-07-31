@@ -3108,11 +3108,15 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                     float f = att > .20 ? (float)(1.0 / att) : 5.f;
                     if (f < 1.f)
                       f = 1.f;
-                    if (f > 3.f)
-                      f = 3.f; /* deep washouts need ~1/att; the
-                                  source-range clamp below is the
-                                  hard guard (no colour the source
-                                  never had) */
+                    if (f > 2.25f)
+                      f = 2.25f; /* deep washouts want the full 1/att,
+                                  but past ~2.25x the spatial -- not
+                                  value -- window-membership error (
+                                  +-1 px on a washed skirt) swings the
+                                  recovery by more than a source
+                                  quantisiation step, and the
+                                  consensus polish smears that into a
+                                  neon band outside narrow lines */
                     f = 1.f + (f - 1.f) * ss01((coh - .85f) * (1.f / .15f));
                     if (f <= 1.001f)
                       continue;
@@ -3654,6 +3658,16 @@ k = fminf(k, s / .6f);
         /* Anchored evaluation (v4.8) on the consensus fit. */
         float z0 = (0.f - mu) / s;
         float ufit0 = phi1(z0), nu;
+        /* saturation membership: the BASE (unremapped) model must
+           still place the pixel on this side's plateau before the
+           restored plateau may be claimed for it.  Under -r 6 a
+           narrow line's blur shoulder reads exactly like its washed
+           core (both sit at the attenuated plateau level, inn ~1),
+           so only model-u separates the interior from the rim;
+           without this the offset paints a neon band +-1.5 flanks
+           wide around narrow lines. */
+        float uf0 = 1.f - ss01((ufit0 - .13f) * (1.f / .14f));
+        float uf1 = ss01((ufit0 - .87f) * (1.f / .14f));
         if (method == 2 && k > 1.f)
           nu = phi1(z0 + (ufit0 - .5f) * (k - 1.f) * 1.5f);
         else
@@ -3722,8 +3736,9 @@ k = fminf(k, s / .6f);
              erf tail misfit of tent-shaped line cores used to gate
              the plateau away pixel-by-pixel = barcode teeth) */
           float v = clampf(o[c] + w * ((nu - ufit0) * d2[c]) +
-                               w2v * gInn * ((1.f - nu) * off0e[c] +
-                                             nu * off1e[c]),
+                               w2v * gInn *
+                                   (uf0 * (1.f - nu) * off0e[c] +
+                                    uf1 * nu * off1e[c]),
                            blo, bhi);
           dd[c] += v - o[c];
         }
@@ -3736,8 +3751,8 @@ k = fminf(k, s / .6f);
                   aW2 > 1e-6f ? aR / aW2 : -.5f, gInn, off0e[0],
                   off1e[0], d2[0],
                   o[0] + w * ((nu - ufit0) * d2[0]) +
-                      w2v * gInn * ((1.f - nu) * off0e[0] +
-                                    nu * off1e[0]),
+                      w2v * gInn * (uf0 * (1.f - nu) * off0e[0] +
+                                    uf1 * nu * off1e[0]),
                   c0blo_dbg);
       }
     }
