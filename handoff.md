@@ -10,64 +10,67 @@ are stepladder artifacts. Can deblur be more analytical by
 constructing a function of gradient that fits original then changing
 slopes on that function, then sampling pixels?"
 
-Verified all three hypotheses visually at 3x nearest (crop
-docs/review_v47_final_*.png): magenta/cyan hue-inverted fringe riding
-edges (per-channel box-corner snapping), a white SQUARE ring around
-the beauty-mark dot (fixed-window value quantisation), banded
-transitions. Root cause chain:
-
-1. v4.3..v4.6 remap/push steepened each channel independently with
-   per-channel [lo,hi] box clamps; at an edge channels move in
-   opposite directions, so the clamped 4-tuple can be a corner of the
-   box = colour from the opposite side of the edge => hue inversion /
-   bright midline. Alpha ran on its own trajectory.
-2. Box windows quantise values in space => stepladder bands.
-
-v4.7 rewrites autodeblur_pass around the user's proposed analytic
-model:
+All three hypotheses verified at 3x nearest (crop docs/review_v47*):
+magenta/cyan hue-inverted fringe riding edges (per-channel box-corner
+snapping -- at an edge channels move in opposite directions, so
+independent [lo,hi] clamps can pick a 4-tuple that is a corner of the
+box = colour from the opposite side), a white SQUARE ring around the
+beauty-mark dot (fixed-window value quantisation), banded transitions.
+v4.7 rewrites autodeblur_pass around the proposed analytic model:
 
 - ONE gradient direction per pixel for the premultiplied 4-vector:
   principal axis of the 4D structure tensor (per-channel Sobel).
-- Sample real colours along that normal (bilinear sample_pm), project
-  onto the local colour segment whose endpoints are robust means of
-  line extremes (REAL colours, not box corners).
-- Classify STEP (ramp) vs PULSE (thin line) from endpoint coverage.
-- Fit an analytic profile: error-function edge via |du| moment
-  (mu, s); pulse via two flank moments.  (First version evaluated
-  Phi(-k*mu/s) at the pixel and stayed ~x1.1: the clipped-window
-  moment centroid is biased toward the window centre -- measured
-  +0.79 where the true offset is +2 -- so the map switched to the
-  pixel's own fitted coordinate z = Phi^-1(u_px), steepened as
-  Phi(k*z).  Synthetic ground-truth gaussian step then narrows
-  20 px -> 3.3 px 30%-width with pinned plateaus and no ringing.)
-- k as before (-g pins, -e adapts per edge, -s formula), always
-  capped so output sigma >= .6 output px (~1.5 px 30%-width: ramps
-  never re-alias into sawtooth).
-- Reconstruct as convex mix of two real colours: hue-safe, alpha
-  coupled (rgb<=alpha by convexity), no overshoot; spatially
-  continuous; separate output buffer (no scan-order coupling).
-- Fit-trust gate: weighted rmse of the profile fit; full trust <= .01,
-  none >= .04 -- multi-crossing windows (crosshatch/rings/text) are
-  left alone rather than hallucinated (env CDG=lo,hi overrides for
-  experiments).  Sweep data (autodeblur HG at default -s 2):
-  trust  0.05/0.14 -> crosshatch .0082 diag .0042 corner .0102
-  trust  0.02/0.06 -> crosshatch .0050 diag .0023 corner .0073
-  trust  0.01/0.04 -> crosshatch .0039 diag .0017 corner .0030
-                    rings .0033 checker2 == autoblur, MAE <= autoblur
-                    on all five scenes.  Shipped: 0.01/0.04.
+- Sample real colours along that normal, WITH tangential averaging
+  over the +-T*tan offsets (T = clamp(.75*scale,1,3)): genuine edges
+  are translation-invariant along their contour, so the averaging
+  erases source-lattice jitter BEFORE the fit; without it any residual
+  staircase in the base gets amplified back into scallops by the
+  steepening (corner-torture "greek key" reproduced and killed).
+- Project onto the local colour segment (endpoints = robust means of
+  line-extreme samples: REAL colours, never box corners).
+- STEP vs PULSE classification by endpoint coverage, SOFT-BLENDED
+  (ss01 over [.45,.65]) so no branch seams.
+- Fit: erf edge/pulse via |du| moments; steepen via the pixel's OWN
+  fitted coordinate z = Phi^-1(u_px): remap evaluates Phi(k*z), push
+  displaces z toward the plateau.  (The naive Phi(-k*mu/s) of the
+  moment fit was unusable: window clipping biases the centroid toward
+  the window centre -- measured +0.79 vs true +2 offset on the
+  synthetic ground truth -- which silently damped steepening to x1.1.)
+- Reconstruct as convex mix of the two segment colours: hue-safe,
+  alpha coupled (rgb <= alpha by convexity), no overshoot; k capped so
+  output sigma >= .6 px (no re-aliased sawtooth); separate output
+  buffer (no scan-order coupling).
+- Trust gates: fit-rmse (full <= .03, none >= .10) AND step
+  unimodality (flatness m4/s^4: clean ramps 2.0..2.6, multi-crossing
+  ~1.4, closed below 1.7).  Rationale: rmse alone cannot separate a
+  windowed WIDE clean ramp (its erf fit is imperfect exactly like a
+  double crossing) from crosshatch -- the flatness gate does.
+  (Debug override: CDG=lo,hi env.)
 
-Verification: synthetic transect quoted above; miya_face 4x -r3 -g 8
-(user recipe) -- v4.6 fringe/halo/banding gone, hue-consistent edges,
-mid-transition pixel share .776(base) -> .728(v4.6) -> .663(v4.7
-remap)/.672(push) i.e. stronger AND clean narrowing; default 4x anime
-look preserved side-by-side vs v4.4-4.6; test_scales 204/204 PASS;
-clean -Wall -Wextra -Wshadow.  autodeblur outputs change everywhere by
-design (no bit-identity with v4.3..v4.6).
+Verification:
+- synthetic gaussian step (tests/step48_src.webp, regenerated by
+  make_test_sources.py): ramp 30%-transition ~20 px -> ~12 px at
+  -r 1.5/4x/-g 8, plateaus pinned, no ringing; transects in the commit
+  history.
+- miya_face 4x -r3 -g8 (user recipe): v4.6 midline/boxy halo/fringe
+  gone, edges hue-consistent; mid-transition pixel share .776 (base)
+  -> .728 (v4.6) -> .665 (v4.7 remap) i.e. stronger AND clean
+  narrowing; badge/eye crops in docs/review_v47_final.png.
+- default 4x anime look preserved side-by-side vs v4.4-4.6.
+- torture (default -s 2), autodeblur HG: checker2 .0040 (< autoblur
+  .0043), crosshatch .0060, rings .0050, diag .0027, corner .0101;
+  MAE <= autoblur on crosshatch/rings/diag.  Corner HG sits on the
+  white V band as UNIFORM phase offset (HG95 == HG -- no localized
+  texture) of the fit regularization, present even at -g 1; the
+  visible scallops there were lattice jitter, killed by tangential
+  averaging.  tests/test_scales.py 204/204 PASS; clean -Wall -Wextra
+  -Wshadow build.  autodeblur outputs change everywhere by design
+  (no bit-identity with v4.3..v4.6).
 
-Caveats: at aggressive -g on busy multi-strand texture (hair locks)
-the trust gate softens but may not fully eliminate faint banding; the
-moment-based s underestimates true ramp sigma inside small windows
-(conservative bias -- k caps earlier, never sharper than intended).
+Caveats: HG on the synthetic 'corner' scene stays elevated (~.01) as
+documented above (regularization phase, not texture); at aggressive -g
+on busy multi-strand texture the trust gates soften but faint banding
+may persist.
 
 # v4.6 update (2026-07-31): sigma-aware deblur gate (wide-blur unblur fixed)
 

@@ -2339,7 +2339,7 @@ static float invphi(float p) {
          q /
          (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.f);
 }
-static float trust_lo = .01f, trust_hi = .04f; /* fit-trust gate; debug override: CDG=lo,hi */
+static float trust_lo = .03f, trust_hi = .10f; /* fit-rmse trust gate; debug override: CDG=lo,hi */
 static float ss01(float z) {
   z = clampf(z, 0.f, 1.f);
   return z * z * (3.f - 2.f * z);
@@ -2462,20 +2462,36 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           diry = vy * inv;
         }
       }
-      /* Line samples along the normal. */
+      /* Line samples along the normal, TANGENTIALLY AVERAGED over a
+         small neighborhood perpendicular to it (v4.7 corner-scallop
+         fix): steepening an edge whose source staircase survived the
+         fit would otherwise amplify the source lattice into visible
+         S-wobbles along the contour.  Genuine edges are translation-
+         invariant along their contour, so averaging a few offset
+         normals keeps the profile while erasing the grid-periodic
+         jitter (period ~1 src px). */
+      int T = clampi((int)(scale * .75f + .5f), 1, 3);
+      float tanx = -diry, tany = dirx;
       float C[129][4], u[129], lo[4] = {1e30f, 1e30f, 1e30f, 1e30f},
             hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f},
             mean[4] = {0, 0, 0, 0};
       for (int j = 0; j < NS; j++) {
-        float t = (float)(j - R), q[4];
-        sample_pm(out, dw, dh, (float)x + t * dirx, (float)y + t * diry, q);
+        float t = (float)(j - R), acc[4] = {0, 0, 0, 0};
+        for (int to = -T; to <= T; to++) {
+          float q[4];
+          sample_pm(out, dw, dh, (float)x + t * dirx + (float)to * tanx,
+                    (float)y + t * diry + (float)to * tany, q);
+          for (int c = 0; c < 4; c++)
+            acc[c] += q[c];
+        }
+        float inv = 1.f / (2 * T + 1);
         for (int c = 0; c < 4; c++) {
-          C[j][c] = q[c];
-          mean[c] += q[c];
-          if (q[c] < lo[c])
-            lo[c] = q[c];
-          if (q[c] > hi[c])
-            hi[c] = q[c];
+          C[j][c] = acc[c] * inv;
+          mean[c] += C[j][c];
+          if (C[j][c] < lo[c])
+            lo[c] = C[j][c];
+          if (C[j][c] > hi[c])
+            hi[c] = C[j][c];
         }
       }
       float rng = 0.f;
@@ -2501,9 +2517,9 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
         d[c] = CB[c] - CA[c];
         L2 += d[c] * d[c];
       }
-      float w = 0.f, nv[4];
+      float w = 0.f, nv[4], wS = 0.f, wP = 0.f, nvS[4], nvP[4], scw = 0.f;
       for (int c = 0; c < 4; c++)
-        nv[c] = o[c];
+        nv[c] = nvS[c] = nvP[c] = o[c];
       if (L2 >= 6.4e-5f) { /* |d| >= .008: not a flat */
         for (int j = 0; j < NS; j++) {
           float uu = 0.f;
@@ -2539,7 +2555,8 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
         }
         ul /= mE;
         ur /= mE;
-        if (ur - ul > .55f) {
+        scw = ss01(((ur - ul) - .45f) * 5.f); /* soft step/pulse blend */
+        {
           /* ---------------- STEP: erf edge-profile fit ------------- */
           float P0[4], P1[4], d2[4], Ld2 = 0.f;
           int n0 = 0, n1 = 0;
@@ -2597,7 +2614,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 k = clampf(s / st, 1.f, 8.f);
               }
               k = fminf(k, s / .6f);
-              w = ss01((sb - s) / (sb - sa));
+              wS = ss01((sb - s) / (sb - sa));
               /* v4.7 final: evaluate ON THE FITTED CURVE.  The windowed
                  moment estimate of the ramp centre is biased toward the
                  window centre (clipped tails) and silently damped the
@@ -2628,15 +2645,38 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 }
                 if (ed > 1e-9) {
                   float rmse = (float)sqrt(en / ed);
-                  w *= ss01((trust_hi - rmse) /
-                            (trust_hi - trust_lo + 1e-9f));
+                  wS *= ss01((trust_hi - rmse) /
+                             (trust_hi - trust_lo + 1e-9f));
                 }
               }
+              /* Unimodality gate (STEP only): a true single ramp's |du|
+                 profile is one lobe (flatness m4/s^4 ~ 2.0-2.6 after
+                 window truncation); two or more crossings per window
+                 (crosshatch, text, hair clumps) give a platykurtic
+                 multi-lobe profile (~1.4).
+                 rmse alone cannot separate these regimes: a windowed
+                 WIDE ramp misfits its erf exactly like a double
+                 crossing, so gating only on rmse kills legitimate
+                 deblur at -r 3 / high scales.  beta2 separates them. */
+              {
+                double m4 = 0;
+                for (int j = 1; j < NS - 1; j++) {
+                  float wj = fabsf(u[j + 1] - u[j - 1]);
+                  double t = j - R - mu;
+                  m4 += wj * t * t * t * t;
+                }
+                float beta2 = (float)(m4 / W) / (float)(s * (double)s * s * s);
+                /* measured populations: clean ramps 2.0..2.6 (window-
+                   truncated tails flatten toward 2.0), multi-crossing
+                   windows ~1.4 -> full trust at 2.1, closed at 1.7. */
+                wS *= ss01((beta2 - 1.7f) * 2.5f);
+              }
               for (int c = 0; c < 4; c++)
-                nv[c] = P0[c] + nu * d2[c];
+                nvS[c] = P0[c] + nu * d2[c];
             }
           }
-        } else {
+        }
+        {
           /* ---------------- PULSE: two-flank line fit -------------- */
           float BE[4], qv[4], qL2 = 0.f;
           for (int c = 0; c < 4; c++)
@@ -2696,7 +2736,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 k = clampf(se / st, 1.f, 8.f);
               }
               k = fminf(k, se / .6f);
-              w = ss01((sb - se) / (sb - sa));
+              wP = ss01((sb - se) / (sb - sa));
               /* Same fitted-curve evaluation on the pulse coordinate:
                  q is monotone along each flank, so steepening Phi(k*zq)
                  tightens both flanks without ever draining the line
@@ -2719,16 +2759,21 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 }
                 if (ed > 1e-9) {
                   float rmse = (float)sqrt(en / ed);
-                  w *= ss01((trust_hi - rmse) /
-                            (trust_hi - trust_lo + 1e-9f));
+                  wP *= ss01((trust_hi - rmse) /
+                             (trust_hi - trust_lo + 1e-9f));
                 }
               }
               for (int c = 0; c < 4; c++)
-                nv[c] = BE[c] + nq * qv[c];
+                nvP[c] = BE[c] + nq * qv[c];
             }
           }
         }
       }
+      /* Soft step/pulse blend: coverage varies smoothly, so no branch
+         switching discontinuity (v4.7 corner-scallop fix). */
+      w = scw * wS + (1.f - scw) * wP;
+      for (int c = 0; c < 4; c++)
+        nv[c] = scw * nvS[c] + (1.f - scw) * nvP[c];
       float fw = ss01((.025f - rng) * (1.f / .017f)) * (1.f - w), res[4];
       for (int c = 0; c < 4; c++)
         res[c] = clampf(o[c] + w * (nv[c] - o[c]) +
