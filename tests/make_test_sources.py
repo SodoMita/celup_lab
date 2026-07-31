@@ -108,15 +108,9 @@ def step48_src():
     so hue-inversion bugs are visible; transect checks in handoff v4.7)."""
     yy, xx = np.mgrid[0:48, 0:48]
     step = (xx >= 24).astype(np.float64)
-    gauss = np.exp(-0.5 * (xx[0] - 24.0) ** 2 / 1.5**2)
-    gauss /= gauss.sum()
-    ker = gauss[None, :] * gauss[:, None]
-    pad = 8
-    ext = np.pad(step, pad, mode="edge")
-    from scipy.signal import convolve2d
+    from scipy.ndimage import gaussian_filter
 
-    img = np.clip(convolve2d(ext, ker, mode="same")[pad:-pad, pad:-pad] * 0.7 + 0.15,
-                  0, 1)
+    img = np.clip(gaussian_filter(step, 1.5) * 0.7 + 0.15, 0, 1)
     rgba = np.dstack([img, img * 0.5 + 0.3, 1 - img, np.ones_like(img)])
     save("step48_src.webp", (rgba * 255).astype(np.uint8))
 
