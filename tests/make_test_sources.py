@@ -227,6 +227,23 @@ def cornerstar48_src():
     save("cornerstar48_src.webp", (np.clip(rgba, 0, 1) * 255).astype(np.uint8))
 
 
+def diagline48_src():
+    """64x64: 45-degree dark line (4 px wide, |x-y|<=2) on white,
+    gaussian-blurred sigma=1.0 and quantized to 45 gray levels -- the
+    smiley class (hard pixelated diagonal, the exact geometry that
+    turns into staircase treads when the reconstruction base is too
+    crisp).  Deterministic, no RNG.  Gate: tests/check_stairs.py."""
+    from scipy.ndimage import gaussian_filter
+
+    yy, xx = np.mgrid[0:64, 0:64]
+    lum = np.where(np.abs(xx - yy) <= 2, 0.05, 0.95)
+    lum = gaussian_filter(lum, 0.5)
+    lum = np.round(lum * 44.0) / 44.0
+    rgba = np.dstack([lum, lum * 0.95 + 0.03, lum * 0.90 + 0.06,
+                      np.ones_like(lum)])
+    save("diagline48_src.webp", (np.clip(rgba, 0, 1) * 255).astype(np.uint8))
+
+
 if __name__ == "__main__":
     torture_src()
     pixelart_src()
@@ -241,3 +258,4 @@ if __name__ == "__main__":
     huearc48_src()
     rampnoise48_src()
     cornerstar48_src()
+    diagline48_src()

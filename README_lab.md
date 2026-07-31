@@ -41,6 +41,82 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
+## v4.9.1: user-review fixes -- sigma decouple reverted, shading-aware profile fit, 45 deg staircase gate
+
+User's verdict on v4.9 (same smiley, same recipe
+`-r 6 -s 100 -g 64 -D remap`): **"You returned all errors. On that
+smiley no neon now just because there is not enough blur now. -r 6 was
+because that was the minimal blur when stairs no longer been visible.
+Also there are visible pixels now, returned problem of snake tongue
+lineends."** plus the standing demand: a staircase regression test on a
+45 degree line, run on the final image.  Diagnosis and what changed:
+
+- **The v4.9 base-sigma decouple is REVERTED.**  Rendering the
+  fallback base at `r/min(K,8)` dodged the neon skirt by making the
+  base crisper than the blur the user explicitly asked to keep: the
+  lattice staircase -r 6 exists to hide came straight back, and with
+  it per-tread speckle and forked caps ("snake tongue").  The base
+  again renders at sigma = `-r`; `-r` is the assumed source blur for
+  windows and gates, exactly as documented pre-v4.9.
+- **The neon band is fixed where it is actually created -- the
+  profile fit, not the blend.**  On a wide window (-r 6) the clamped
+  `u` projection destroys ramp tails (window narrower than the blur),
+  and a pure erf cannot represent step-on-linear-shading: the fit
+  absorbed baked-in art shading into the step and dragged whole
+  gradient zones to one plateau colour (the smooth dark "neon" band
+  hugging lines, brightest in the mouth/neck shading).  v4.9.1:
+  - the projection keeps an **unclamped raw channel**; lobe weights
+    are taken from it, so ramp tails re-enter the lobe map (a
+    saturated-but-flat plateau still hard-breaks lobes, so a thin
+    line's two flanks stay apart);
+  - the profile model becomes **linear baseline + erf step**
+    (`y = a + c*z + b*phi(z)`, `tests`-visible helper `lsq_profile`):
+    shading stays in the gain-1 residual channel untouched, only the
+    step component is steepened;
+  - the **drag amplitude is the one-sided plateau span** (the v4.8
+    estimator), not the LS amplitude: on soft wide ramps the
+    phi/linear LS basis is near-degenerate, reading ~0.7x the true
+    span at tips (rounding) and >2x on shaded skirts (band); the
+    plateau span is what the window itself proves, bounded to
+    `[b_min, 1.2*span]` as a safety net for singular fits;
+  - a **step-evidence coverage gate** fades the fit to zero when the
+    window's observed profile does not straddle the modelled step
+    (fits invented on pure shading slopes were another source of
+    phantom bands).
+- **Two mechanisms tried and REMOVED after measurement:** the
+  step-component centroid refinement (re-centred mu at tips/corners
+  and rounded them -- tip extent 83.75 vs gate 86; plain single-LS on
+  raw projections is unbiased enough once tails are back in the lobe
+  map) and the pass-1.5 mu-spread steepness governor (along a bending
+  edge mu varies by construction, so it only ever fired at the
+  geometry it destroyed; on straight shaded ramps it never engaged).
+  The repository history keeps both attempts; the shipped code does
+  neither.
+- **45 degree staircase gate** (`tests/check_stairs.py`, fixture
+  `diagline48`): sub-pixel edge-crossing tracking per output row on
+  the FINAL image; tread-run length and adjacent-row crossing jitter
+  (jump95) must stay smooth at BOTH user recipes (2x -r 6 and 4x
+  -r 2.3) and MUST flag a deliberately crisp probe build -- the
+  detector itself is asserted non-toothless.
+
+Measured: the four hull/tip/width/glow invariants
+(`tests/check_corners.py`) PASS with tip extent 86.25/87 (v4.9:
+86.00) and glow 0.977; staircase gate ship2x jump95 0.111, ship4x
+0.016, crisp probe 0.685 flagged; miya user recipe cheek HF .01439
+(v4.9 .01686, v4.8 .01452), blush std .2036 (v4.9 .2429, v4.8 .2071);
+huearc saturation .8505 unchanged; rampnoise HF unchanged; 4x torture
+HG checker2 .00505 / crosshatch .00567 / rings .00374 / diag .00166 /
+corner .00203 -- between v4.8 and v4.9 except crosshatch, where the
+soft base costs lattice texture the crisp decouple kept (the same
+crispness the user rejected on the smiley; accepted trade, stated
+plainly); test_scales 204/204.  Smiley at the user's recipe: shading
+gradient across the neck preserved (transect 0.43->0.54 smooth, step
+single), mouth line continuous, no neon band, no treads, sharp spike
+tips.
+
+*The v4.9 section below is kept for history; wherever it claims the
+decoupled base sigma is the neon fix, v4.9.1 supersedes it.*
+
 ## v4.9: corner-sharp autodeblur -- junction gating, decoupled base sigma, contour-consensus fits
 
 Review of v4.8 (user's own 256px hard-edged smiley, 2x,

@@ -1753,14 +1753,17 @@ static int blur_radius_set = 0;
 /* Resolved parameters, for the final report. */
 static int fitted_kernel = BK_GAUSSIAN, fitted_curve = CK_LINEAR;
 static float fitted_sigma = .75f, fitted_cp = 0.f;
-/* v4.9: deblur-consistent reconstruction sigma.  In autodeblur mode the
-   base render is decoupled from the ASSUMED source blur (-r): the model
-   claims to remove that blur at steepness k, so the neutral reconstruction
-   low-trust pixels fall back to may assert at most residual blur
-   sigma/min(k,8).  A low-trust pixel then keeps a CRISP source sample
-   instead of dissolving into a sigma-wide skirt -- the "neon glow" v4.8
-   produced at mismatched -r came exactly from blending toward a base
-   rendered at the user's (possibly wrong) blur sigma. */
+/* v4.9.1: the v4.9 decouple (base render at sigma r/min(K,8)) was
+   REVERTED.  It suppressed the v4.8 neon skirt, but any base rendered
+   crisper than the assumed blur also re-quantizes the source lattice:
+   the smiley at -r 6 regained staircase treads (the user picks -r as
+   "the minimal blur when stairs are no longer visible"), the snake-
+   tongue line ends came back and per-tread speckle returned.  The
+   neon problem is now solved where it is actually created -- the
+   profile fit (raw projection, linear+erf decomposition, plateau-span
+   drag amplitude, coverage gate, contour consensus, hull clamp), NOT
+   by smuggling a crisper image into the low-trust blend.  The hook is
+   kept (zeroed) so the fit tables and sigma plumbing stay valid. */
 static float adb_sigma_div = 0.f, adb_assumed_sigma = 0.f;
 
 static const char *kernel_name(int k) {
@@ -2235,7 +2238,7 @@ static int upscale_autoblur(const uint8_t *in, int sw, int sh, uint8_t *out,
     sigma = clampf(sigma / adb_sigma_div, .6f, sigma);
     fitted_sigma = sigma;
     fprintf(stderr,
-            "autodeblur base sigma %.2f = assumed %.2f / %.1f (v4.9; "
+            "autodeblur base sigma %.2f = assumed %.2f / %.1f (v4.9 hook, inactive in v4.9.1; "
             "assumed value still sizes windows/gates)\n",
             sigma, adb_assumed_sigma, adb_sigma_div);
   }
@@ -2330,6 +2333,53 @@ static float ss01(float z) {
   z = clampf(z, 0.f, 1.f);
   return z * z * (3.f - 2.f * z);
 }
+/* 3-parameter weighted profile fit on a projection line:
+   y = *A + *C*z + *B*phi(z), z = (j - R - mu)/s, weights wj over
+   [dl..dr].  Linear baseline = shading content; phi = the step to
+   deblur.  Degenerate pivot falls back to the 2-param amplitude fit. */
+static void lsq_profile(const float *raw, const float *wj, int dl, int dr,
+                        double mu, float s, int R, float *A, float *C,
+                        float *B) {
+  double sw = 0, sz = 0, szz = 0, sp = 0, spp = 0, szp = 0, sy = 0,
+         szy = 0, spy = 0;
+  float a = 0.f, b = 1.f, c = 0.f;
+  for (int j = dl; j <= dr; j++) {
+    if (wj[j] <= 1e-9f)
+      continue;
+    double z = (j - R - mu) / s, p = phi1((float)z), yv = raw[j],
+           w2 = wj[j];
+    sw += w2;
+    sz += w2 * z;
+    szz += w2 * z * z;
+    sp += w2 * p;
+    spp += w2 * p * p;
+    szp += w2 * z * p;
+    sy += w2 * yv;
+    szy += w2 * z * yv;
+    spy += w2 * p * yv;
+  }
+  double m00 = sw, m01 = sz, m02 = sp, m11 = szz, m12 = szp, m22 = spp,
+         c00 = m11 * m22 - m12 * m12, c01 = m02 * m12 - m01 * m22,
+         c02 = m01 * m12 - m02 * m11, c11 = m00 * m22 - m02 * m02,
+         c12 = m01 * m02 - m00 * m12, c22 = m00 * m11 - m01 * m01,
+         det = m00 * c00 + m01 * c01 + m02 * c02;
+  if (fabs(det) > 1e-9 * sw * sw * sw && sw > 1e-9) {
+    a = (float)((sy * c00 + szy * c01 + spy * c02) / det);
+    c = clampf((float)((sy * c01 + szy * c11 + spy * c12) / det), -.3f,
+               .3f);
+    b = clampf((float)((sy * c02 + szy * c12 + spy * c22) / det), .25f,
+               4.f);
+    a = clampf(a, -1.f, 2.f);
+  } else if (sw * m22 - sp * sp > 1e-12 && sw > 1e-9) {
+    double d2p = sw * m22 - sp * sp;
+    a = clampf((float)((sy * m22 - sp * spy) / d2p), -1.f, 2.f);
+    b = clampf((float)((sw * spy - sp * sy) / d2p), .25f, 4.f);
+  }
+  *A = a;
+  *C = c;
+  *B = b;
+}
+
 /* autodeblur core pass (v4.8: ANCHORED single-lobe profile steepening).
 
    The v4.3..v4.6 pass steepened each channel independently toward
@@ -2388,14 +2438,20 @@ static float ss01(float z) {
      rho = lambda2/lambda1 from the SAME structure tensor scales the
      tangent span and the pass-2 tap weights -- a corner keeps its own
      radial fit and stays sharp; straight contours are untouched.
-   - NEON GLOW: low-trust pixels blended toward the base render at the
-     user's ASSUMED blur sigma (-r); at mismatched -r every edge
-     acquired a sigma-wide skirt, and staircase treads re-sharpened
-     into bands floating on that skirt.  Fix: the base render sigma is
-     decoupled to max(.6, r/min(K,8)) -- the most the deblur claims to
-     leave -- so partial trust falls back to a crisp sample, never to
-     a wide smear.  -r remains the assumed blur for window sizing and
-     the shading gate.
+   - NEON GLOW (v4.9.1 redo): v4.9 "fixed" the skirt by rendering the
+     base at sigma r/min(K,8); the user rejected that instantly: the
+     crisp base brought the lattice staircase (-r 6 exists exactly to
+     blur it away), per-tread speckle and forked caps back.  The real
+     mechanism of the dark pre-edge band: the clamped projection kills
+     ramp tails whenever the window is narrower than the blur, and a
+     pure erf cannot represent step-on-linear-shading, so the fit
+     dragged whole shading gradients to a flat plateau colour.  v4.9.1
+     keeps the base at sigma R and fixes the FIT: raw (unclamped)
+     projection restores the tails, a linear+erf LS keeps shading in
+     the gain-1 residual, the drag amplitude is the locally proven
+     one-sided plateau span (robust against LS phi/linear degeneracy
+     BOTH ways), and a step-evidence coverage gate mutes fits where
+     the window does not contain the modelled transition.
    - CONTOUR CONSENSUS: raw per-pixel fits misplaced mu by 1-2 out px
      near wedge apexes (cornerstar48); anchored evaluation amplified
      that ~k into +-0.25 colour deltas with alternating sign, and
@@ -2577,7 +2633,8 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
       /* Coherence-scaled tangent span (v4.9): full T on straight
          contours, 0 at junctions/corners/tips. */
       int Teff = (int)((float)T * coh + .5f);
-      float C[129][4], u[129], lo[4] = {1e30f, 1e30f, 1e30f, 1e30f},
+      float C[129][4], u[129], raw[129],
+            lo[4] = {1e30f, 1e30f, 1e30f, 1e30f},
             hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f},
             mean[4] = {0, 0, 0, 0};
       for (int j = 0; j < NS; j++) {
@@ -2630,7 +2687,8 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           float uu = 0.f;
           for (int c = 0; c < 4; c++)
             uu += (C[j][c] - CA[c]) * d[c];
-          u[j] = clampf(uu / L2, 0.f, 1.f);
+          raw[j] = uu / L2; /* unclamped: ramp TAILS live here         */
+          u[j] = clampf(raw[j], 0.f, 1.f);
         }
         float corr = 0.f;
         for (int j = 0; j < NS; j++)
@@ -2678,7 +2736,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           int jl[16], jr[16], NL = 0;
           wj[0] = wj[NS - 1] = 0.f;
           for (int j = 1; j < NS - 1; j++) {
-            wj[j] = fabsf(u[j + 1] - u[j - 1]);
+            wj[j] = fabsf(raw[j + 1] - raw[j - 1]);
             if (wj[j] > wmax)
               wmax = wj[j];
           }
@@ -2691,9 +2749,19 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
               continue;
             }
             int a = j;
+            /* Run, bridging single-sample dips -- but a SATURATED flat
+               plateau (u pinned at 0/1 while |du| dies) is a hard
+               break: it is the interior of a thin line/tip, and the
+               raw (unclamped) wj keeps sloping there so without this
+               the two flanks merge into one phantom step exactly like
+               the pre-lobe-map days.  A saturated but still-sloping
+               ramp (neck skirt: u pinned, raw still falling) does NOT
+               break -- that tail belongs to the lobe. */
             while (j + 1 < NS - 1 &&
-                   (wj[j + 1] >= th || (j + 2 < NS - 1 && wj[j + 2] >= th)))
-              j++; /* run, bridging single-sample dips */
+                   (wj[j + 1] >= th || (j + 2 < NS - 1 && wj[j + 2] >= th)) &&
+                   !((u[j + 1] <= .002f || u[j + 1] >= .998f) &&
+                     wj[j + 1] < th))
+              j++;
             jl[NL] = a;
             jr[NL] = j;
             NL++;
@@ -2770,8 +2838,80 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 s = lwm;
               fmu = (float)mu;
               fs = s;
+              /* Profile fit (v4.9.1): linear baseline + erf step on the
+                 RAW projection, y = a + c*z + b*phi(z).  The clamped u
+                 destroys ramp TAILS whenever the window is narrower
+                 than the blur (-r 6), and an erf alone cannot represent
+                 step-on-linear-shading: the explicit linear term takes
+                 the baked-in shading so phi only models the step.  The
+                 baseline cancels in v = o + b*(phi(kz)-phi(z))*d, so
+                 shading passes through the residual channel untouched.
+                 (A two-round centroid refinement on the step component
+                 was tried and REMOVED: re-centring mu on y-raw-c*z at
+                 tips/corners moved the fit grid ~.3 px and rounded
+                 them, and the plain single LS already produces a
+                 healthy b once the raw projection restores the ramp
+                 tails to the lobe map.) */
+              float ab_a, ab_b, ab_c;
+              lsq_profile(raw, wj, dl, dr, mu, s, R, &ab_a, &ab_c,
+                          &ab_b);
+              /* Drag amplitude = the one-sided PLATEAU SPAN (v4.8
+                 estimator, robust, shading-free), not the LS b.  On a
+                 soft wide ramp (decouple-reverted base) the 3-param LS
+                 systematically shifts contrast between phi and the
+                 near-parallel linear term, so ab_b reads low (~.7*sp)
+                 at tips and corners -> the render under-drags and
+                 rounds them; and on shaded skirts (-r 6) it can spike
+                 ABOVE the span -> flat-top dark "neon" band.  sp is
+                 the contrast the window itself PROVES between its two
+                 plateaus -- exactly the v4.8/v4.9 fd2 = d2 semantics.
+                 Bounds: nothing when b degenerates, 1.2x span when the
+                 fit spikes. */
+              float sp_dbg = -1.f;
+              if (n0 > 0 && n1 > 0) {
+                float sp = 0.f;
+                for (int c = 0; c < 4; c++)
+                  sp += (P1[c] - P0[c]) * d[c];
+                sp /= L2;
+                sp_dbg = sp;
+                float cap = fmaxf(sp, .03f) * 1.2f;
+                if (ab_b > cap)
+                  ab_b = cap;
+                if (ab_b < sp)
+                  ab_b = sp;
+                ab_c = clampf(ab_c, -.5f * cap, .5f * cap);
+              }
               for (int c = 0; c < 4; c++)
-                fd2[c] = d2[c];
+                fd2[c] = ab_b * d[c];
+              /* Step-evidence coverage (v4.9.1): a step fit is only
+                 admissible when the WINDOW's observed profile actually
+                 spans the modelled step amplitude [a, a+b].  A pixel
+                 more than R from the true edge sees only a linear
+                 shading slope; fitting a "step" there invents a phantom
+                 knee centred on the window itself and drags the shading
+                 (the dark pre-edge "neon" band).  Shading is shading:
+                 coverage < ~.55 fades trust to zero (pixel keeps its
+                 own colour), a fully captured rise keeps it. */
+              {
+                float rmin = 1e30f, rmax = -1e30f;
+                for (int j = 0; j < NS; j++) {
+                  if (raw[j] < rmin)
+                    rmin = raw[j];
+                  if (raw[j] > rmax)
+                    rmax = raw[j];
+                }
+                float bb = fabsf(ab_b) > .03f ? fabsf(ab_b) : .03f;
+                float cov =
+                    ((ab_a + ab_b < rmax ? ab_a + ab_b : rmax) -
+                     (ab_a > rmin ? ab_a : rmin)) /
+                    bb;
+                wS *= ss01((cov - .55f) * (1.f / .25f));
+                if (dbg && y == dbg_y && abs(x - dbg_x) <= 16 &&
+                    (x & 3) == 0)
+                  fprintf(stderr, "DBGC %d,%d cov=%.3f raw[%.3f..%.3f] "
+                                  "step[%.3f..%.3f]\n",
+                          x, y, cov, rmin, rmax, ab_a, ab_a + ab_b);
+              }
               /* Steepness: -g pins k exactly (float, up to 64); -e
                  adapts per edge; -s formula otherwise; always capped so
                  the OUTPUT ramp never falls below .6 px sigma
@@ -2810,8 +2950,9 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
               {
                 double en = 0, ed = 0;
                 for (int j = jl[li]; j <= jr[li]; j++) {
-                  float fj = phi1(((float)(j - R) - (float)mu) / s);
-                  en += wj[j] * (u[j] - fj) * (u[j] - fj);
+                  float zj = ((float)(j - R) - (float)mu) / s;
+                  float fj = ab_a + ab_c * zj + ab_b * phi1(zj);
+                  en += wj[j] * (raw[j] - fj) * (raw[j] - fj);
                   ed += wj[j];
                 }
                 if (ed > 1e-9) {
@@ -2855,18 +2996,19 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                   (x & 3) == 0) {
                 double en = 0, ed = 0;
                 for (int j = jl[li]; j <= jr[li]; j++) {
-                  float fj = phi1(((float)(j - R) - (float)mu) / s);
-                  en += wj[j] * (u[j] - fj) * (u[j] - fj);
+                  float zj = ((float)(j - R) - (float)mu) / s;
+                  float fj = ab_a + ab_c * zj + ab_b * phi1(zj);
+                  en += wj[j] * (raw[j] - fj) * (raw[j] - fj);
                   ed += wj[j];
                 }
                 fprintf(stderr,
                         "DBG %d,%d NL=%d lobe[%d..%d] dom[%d..%d] "
                         "W=%.3f mu=%.3f s=%.3f k=%.3f z0=%.3f ufit=%.4f "
                         "nu=%.4f wS=%.4f rmse=%.4f Ld2=%.5f coh=%.2f "
-                        "Teff=%d\n",
+                        "Teff=%d a=%.3f c=%.3f b=%.3f sp=%.3f\n",
                         x, y, NL, jl[li], jr[li], dl, dr, W, mu, s, k,
                         z0, ufit0, nu, wS, ed > 1e-9 ? sqrt(en / ed) : -1.,
-                        Ld2, coh, Teff);
+                        Ld2, coh, Teff, ab_a, ab_c, ab_b, sp_dbg);
               }
             }
           }
@@ -2934,12 +3076,14 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
       const float *pf = PF + 10 * idx;
       float tanx = pf[8], tany = pf[9], cc = pf[7];
       float aW = 0.f, aMu = 0.f, aS = 0.f, aD[4] = {0, 0, 0, 0},
-            wsum = 0.f;
+            wsum = 0.f, tw[9], tmu[9];
       for (int to = -T; to <= T; to++) {
         float wt = (float)(T + 1 - (to < 0 ? -to : to)), q[10];
         sample_fn(PF, dw, dh, 10, (float)x + (float)to * tanx,
                   (float)y + (float)to * tany, q);
         wt *= sqrtf(cc * fmaxf(q[7], 0.f));
+        tw[to + T] = wt;
+        tmu[to + T] = q[0] > 1e-9f ? q[1] / q[0] : 0.f;
         aW += wt * q[0];
         aMu += wt * q[1];
         aS += wt * q[2];
@@ -2954,8 +3098,29 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           d2[c] = aD[c] / aW;
           o[c] = A[4 * idx + c];
         }
-        /* Steepness from the CONSENSUS width: same rules as pass 1. */
-        float k = kbase;
+        /* Steepness from the CONSENSUS width: same rules as pass 1,
+           then governed by the mu SPREAD along the tangent.  A k-
+           steepened step renders a mu disagreement of d px as an edge
+           displaced ~d*k -- the dark pre-edge "neon" bands are exactly
+           that on shaded wide ramps (-r 6).  Straight stable contours
+           read std << .5 px and keep full k; skirts/wedges/dense zones
+           with std >= ~2.5 px get k -> 1 (left at their own slope). */
+        float k = kbase, vmu = 0.f, wt2 = 0.f;
+        for (int to = -T; to <= T; to++) {
+          if (tw[to + T] <= 0.f)
+            continue;
+          float dd = tmu[to + T] - (float)mu;
+          vmu += tw[to + T] * dd * dd;
+          wt2 += tw[to + T];
+        }
+        float mu_std = wt2 > 1e-9f ? sqrtf(vmu / wt2) : 0.f;
+        (void)mu_std; /* v4.9.1: the mu-spread governor is REMOVED.
+                         Along a bending edge (tip/corner) mu varies
+                         along the tangent by construction, so the
+                         governor only ever fired at exactly the
+                         geometry it destroyed (k -> 1 there = rounded
+                         tips); on straight shaded ramps (its target)
+                         mu_std reads < .35 and it never engaged. */
         if (deblur_steepness <= 0.f && edge_goal > 0.f) {
           float st = fmaxf(.6f, edge_goal * scale / 2.5f);
           k = clampf(s / st, 1.f, 16.f);
@@ -2981,8 +3146,8 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
         if (dbg && y == dbg_y && abs(x - dbg_x) <= 16 && (x & 3) == 0)
           fprintf(stderr,
                   "DBGS %d,%d mu=%.3f s=%.3f k=%.3f ufit=%.4f nu=%.4f "
-                  "wSeff=%.4f (consensus)\n",
-                  x, y, mu, s, k, ufit0, nu, w);
+                  "wSeff=%.4f mu_std=%.3f (consensus)\n",
+                  x, y, mu, s, k, ufit0, nu, w, mu_std);
       }
     }
   /* Pass 2: tangential smoothing of the residual delta.  Fit jitter is
@@ -3034,19 +3199,15 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
 
 static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
                               int dw, int dh) {
-  /* v4.9: decouple the reconstruction sigma from the assumed source blur.
-     The pass claims to remove sigma at steepness k, so the fallback base
-     asserts residual blur sigma/min(k,8) -- never wider than the sharpest
-     output the model itself can produce.  Skipped under -e: the edge-goal
-     escalation owns sigma there. */
+  /* v4.9.1: the v4.9 base-sigma decouple is REVERTED.  It dodged the
+     neon skirt by rendering the base at sigma r/min(K,8), but that
+     re-exposed the source lattice staircase the user deliberately
+     blurs away with -r ("minimal blur when stairs are no longer
+     visible"), and brought back per-tread speckle and forked caps.
+     Neon is prevented where it actually arises -- partial-trust
+     blends -- by the lobe map, consensus evaluation and hull clamp. */
   adb_sigma_div = 0.f;
   adb_assumed_sigma = 0.f;
-  if (edge_goal <= 0.f) {
-    float kg = deblur_steepness > 0.f
-                   ? deblur_steepness
-                   : clampf(1.f + .25f * (compress_strength - 1.f), 1.f, 3.f);
-    adb_sigma_div = clampf(kg, 1.f, 8.f);
-  }
   if (!upscale_autoblur(in, sw, sh, out, dw, dh))
     return 0;
   int method = deblur_method;
@@ -4707,7 +4868,7 @@ static uint8_t *slurp(const char *name, size_t *n) {
 static void print_help(const char *argv0) {
   printf(
       "celup_lab -- premultiplied-linear WebP upscaler (research build "
-      "v4.9)\n"
+      "v4.9.1)\n"
       "\n"
       "Usage: %s in.webp out.webp SCALE [options]\n"
       "  SCALE is the upsampling factor, real number in (1,32] "
@@ -4754,9 +4915,12 @@ static void print_help(const char *argv0) {
       "  -r, --blur-radius R       blur radius .1..40 (default 1): radius\n"
       "                            for *blurcompress modes; ALSO pins the\n"
       "                            autoblur sigma exactly.  In autodeblur it\n"
-      "                            is the ASSUMED source blur (sizes windows\n"
-      "                            and gates); the base render sigma is\n"
-      "                            decoupled to max(.6, R/min(K,8)) (v4.9)\n"
+      "                            is the ASSUMED source blur and the base\n"
+      "                            render sigma alike (v4.9.1: the v4.9\n"
+      "                            base-sigma decouple was reverted -- it\n"
+      "                            re-exposed the lattice staircase -r is\n"
+      "                            chosen to hide).  Windows and gates size\n"
+      "                            from R.\n"
       "  -a, --auto-tune           auto-tune -r and -s for the *blurcompress\n"
       "                            modes only (implies -m deblurcompress)\n"
       "  -P, --checker-policy P    adaptive checker policy: lowpass|bilinear|\n"

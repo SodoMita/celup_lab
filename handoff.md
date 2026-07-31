@@ -1,6 +1,86 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
-# v4.9 update (2026-07-31): corner-sharp autodeblur -- junction gating, decoupled base, contour consensus
+# Handoff: `celup_lab` upscale/hourglass investigation
+
+# v4.9.1 update (2026-07-31): decouple reverted, shading-aware fit, staircase gate
+
+**User rejected v4.9** (same smiley, same recipe): "You returned all
+errors.  On that smiley no neon now just because there is not enough
+blur now.  -r 6 was because that was the minimal blur when stairs no
+longer been visible.  Also there are visible pixels now, returned
+problem of snake tongue lineends."  + mandate: "Add test of staircase,
+that uses 45 degrees line and detects on final image if there are
+staircase".
+
+Root-cause chain (each step measured on the smiley at the user recipe):
+
+1. The v4.9 decouple (base at sigma r/min(K,8)) makes the fallback
+   base CRISPER than the lattice-hiding blur the user pins with -r:
+   staircase treads on every 45-ish contour, per-tread speckle,
+   forked caps.  REVERTED: base again renders at sigma = -r.
+   => the neon fix had to move from the blend into the fit.
+2. Clamped-u projection kills ramp tails whenever the window is
+   narrower than the blur (-r 6): plateau means latch mid-skirt
+   greys, lobe weights degenerate.  Added the unclamped `raw[129]`
+   channel; lobe weights from raw; saturated-but-flat plateaus still
+   hard-break lobes (thin-line flanks stay apart; otherwise the raw
+   weights merge them into one window-wide lobe and tips round off).
+3. A pure erf cannot represent step-on-linear-shading: fitted on
+   shaded art (baked-in mouth/neck gradients) the step amplitude
+   absorbed the shading and the render drag flat-topped whole
+   gradient zones to plateau colours -- the ACTUAL "neon" mechanism
+   (dark band hugging lines, transect dip 0.21 vs shading 0.45-0.65).
+   Fix: LS profile `y = a + c*z + b*phi1(z)` on raw; shading passes
+   through the gain-1 residual, only phi is steepened.
+4. Drag amplitude = locally proven ONE-SIDED PLATEAU SPAN (v4.8
+   estimator), clamped to [ab_b, 1.2*span] as a net: the 3-param LS
+   phi/linear basis is near-degenerate on wide soft ramps, reading
+   ~.7x span at tips (rounds them) and >2x on shaded skirts (neon).
+   With span = v4.8/v4.9's fd2=d2 semantics the tip gate holds AND
+   the band dies (transect is a smooth 0.43..0.54 shading ramp, one
+   clean step), huearc/rampnoise unchanged.
+5. Coverage gate: a step fit whose modelled span [a,a+b] is not
+   straddled by the window's observed profile range fades wS to 0 --
+   kills phantom-knee fits on pure shading slopes >R from any edge.
+
+Tried and REMOVED after measurement (kept in git history, not in the
+shipped code):
+- step-component centroid refinement (LS then re-moments on y-cz):
+  moved mu ~.3 px at tips/corners -> tip extent 83.75 < gate 86.
+  Plain single LS on the raw projection is unbiased enough once the
+  tails are back in the lobe map.
+- pass-1.5 mu-spread steepness governor: along a bending edge mu
+  varies by construction, so the governor only ever fired at
+  tips/corners (k -> 1 there = rounding); on straight shaded ramps
+  (its target) mu_std reads < .35 and it never engaged.
+
+45 deg staircase gate: tests/check_stairs.py + fixture diagline48
+(64x64, 4 px line, sigma .5, 45-level quantized).  Sub-pixel crossing
+tracking x_e(y) on the FINAL image, robust line fit; gates tread-run
+and jump95 at both user recipes (ship2x 0.111, ship4x 0.016, both
+PASS) and asserts a deliberately crisp probe build (-r .5 -g 64) IS
+flagged (jump95 .685).  Detector cannot silently go toothless.
+
+Gates at ship (all from repo root):
+  python3 tests/check_corners.py   hull / tip / width / glow -> PASS
+                                   (tip 86.25 vs 86.00 floor, glow .977)
+  python3 tests/check_stairs.py    45 deg stair treads -> PASS
+  python3 tests/test_scales.py     204/204 PASS
+Fixtures vs v4.9 same recipe (caps48/step48/huearc48/rampnoise48/
+twoline48): MAE <= .0018, huearc sat .8505, rampnoise HF unchanged.
+Miya user recipe (-r 2.3 -g 8): cheek HF .01439 (v4.9 .01686, v4.8
+.01452), blush std .2036 (v4.9 .2429, v4.8 .2071).
+4x torture HG: checker2 .00505, crosshatch .00567, rings .00374,
+diag .00166, corner .00203 -- between v4.8/v4.9 except crosshatch
+(crisp decouple kept more lattice texture there; accepted, user's
+artifact verdict outranks the texture metric).
+
+Build:
+  cc -O3 -DNDEBUG -std=c99 -march=native celup_lab.c -o celup_lab \
+    $(pkg-config --cflags --libs libwebp) -lm
+
+
+## v4.9 update (superseded by v4.9.1 above) (2026-07-31): corner-sharp autodeblur -- junction gating, decoupled base, contour consensus
 
 User review of v4.8 (own test image `poor smiley.webp`, 256x256 hard
 pixelated drawing, 2x upscale, recipe
