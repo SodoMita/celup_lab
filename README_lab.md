@@ -41,6 +41,56 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
+## v4.7: analytic deblur -- profile fit per gradient, slope changed on the fit
+
+Review of v4.6 on the wide-blur recipe: "it doesn't reduce steepness,
+it creates a bright line in the middle of the gradient and negates
+colors... separate color, alpha gradients instead of 4-channel vectors
++ 1 gradient... still box windows like 5x5 because there are stepladder
+artifacts. Can deblur be more analytical: construct a function of the
+gradient that fits the original, change the slopes on that function,
+then sample pixels?" All three guesses were correct, and the answer is
+the new core doing exactly the proposal:
+
+- v4.3..v4.6 steepened each channel independently toward per-channel
+  box-window extremes. At an edge, channels rise/fall oppositely, so
+  independent clamps materialise box-corner colours that exist on
+  OPPOSITE sides ("negated" magenta/cyan fringe mid-gradient), and the
+  spatially fixed windows quantised values into stepladder bands.
+- v4.7, per pixel: ONE gradient direction for the whole premultiplied
+  RGBA vector (principal axis of the 4D structure tensor from per-
+  channel Sobel); sample the colours along that normal; fit an analytic
+  profile of the gradient coordinate -- an error-function edge (STEP)
+  or two-flank pulse (thin LINE); steepen the slope ON THE FIT by
+  evaluating Phi(k * Phi^-1(u)) (remap) or a z-displaced original
+  (push); reconstruct the colour as a convex mix of two REAL local
+  colours (the segment endpoints).  Consequences by construction: hue
+  cannot invert (no box-corner colours), alpha is coupled (convexity
+  keeps rgb <= alpha), nothing overshoots (fit bounded in (0,1)), the
+  map is spatially continuous (no window-quantised bands), k is capped
+  so output ramps stay >= .6 px sigma (~1.5 px 30%-width: no re-
+  aliased sawtooth), and the pass renders into a separate buffer (no
+  scan-order coupling).  Steepening on already-linear shading stays
+  inert by the same u==.5 argument as before.
+- Fit-trust gate (rmse of the profile fit over the transition, full
+  trust <= .01, none >= .04): multi-crossing windows (crosshatch,
+  rings, text) misfit an edge/pulse model and are left alone instead
+  of hallucinating geometry.  (Debug override for experiments:
+  CDG=lo,hi env var.)
+- Step/pulse share one gradient field; -D auto proxy unchanged (miya
+  still picks remap).
+
+Measured (synthetic gaussian step, -r 1.5, 4x, -g 8): ramp 30%-width
+20 px -> ~3.3 px, plateaus pinned, no ringing.  miya -r3 -g 8: the
+v4.6 magenta midline / white boxy halo / cyan fringe are gone; edge
+narrowing is stronger than v4.6 by the mid-transition-share metric
+(.663 vs .728 vs base .776) and hue-consistent.  Torture (default
+-s 2): checker2/rings/crosshatch/diag/corner MAE <= autoblur, HG
+.0039/.0033/.0017/.0030 (v4.4-era levels, far below sdf .0053).
+tests/test_scales.py 204/204 PASS.  NOTE: autodeblur outputs change
+everywhere vs v4.3..v4.6 (deliberate redesign); the default anime
+look is visually preserved (verified side-by-side).
+
 ## v4.6: deblur gate is sigma-aware -- wide intentional blur really unblurs
 
 Report: `-m autodeblur -k bspline -c exp -r 3 -s 100 -A 10 -g 8 -D push`
