@@ -2,6 +2,22 @@
 
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.9.3 update (2026-07-31): parameter overrides fixed; 3x3 checkerboard confirmation removes diagonal staircases; PIL benchmark support
+
+- **Parameter override fixes**:
+  - In `autodeblur_pass` (`celup_lab.c`), steepness `k` was previously clamped unconditionally by `k = fminf(k, s / .6f)`. When users explicitly passed `--deblur-steepness K` (`-g K`), `K` was silently ignored/capped on narrower edges. Fixed: explicit `deblur_steepness > 0.f` now bypasses the `s / .6f` clamp and pins `k` exactly as documented.
+  - In `auto_tune_soft_params` (`upscale_autoblur`), when `--blur-radius R` (`-r R`) was passed, the tuning loop skipped every candidate sigma where `sigmas[si] != R`. When `R` was not in the hardcoded table (`.15, .30, .50, .75, 1.10, 1.60`), no candidates matched and the mode defaulted to Gaussian 0.75 / linear. Fixed: when `blur_radius_set == 1`, `auto_tune_soft_params` evaluates `R` directly for all kernels and curves.
+- **3x3 Checkerboard confirmation (diagonal staircase removal)**:
+  - `checker2x2_confidence_pm` (used in `upscale_kernel` to override cubic/Lanczos with bilinear on checkerboards, and in `build_class_map` for checker classification) previously checked only 2x2 cells. A 1-px diagonal line (`A B / B A`) has an identical 2x2 signature to a checkerboard, causing 61 out of 61 diagonal cells on `diagline48_src.webp` to be misdetected as checkerboards and forced to bilinear interpolation (creating diamond-shaped staircase treads).
+  - Added `checker3x3_at_pm` to require 3x3 pattern confirmation (`A B A / B A B / A B A`): true pixel-art checkerboards (`pixelart_src.webp`: 1596 cells) are still detected and lowpassed, while diagonal lines (`diagline48_src.webp`: 0 false positives) keep full cubic/Lanczos/autodeblur sharpness and smooth contours without bilinear staircases.
+- **PIL C/Python library comparison benchmark**:
+  - `evaluate_upscalers.py` now supports standard Python PIL resampling modes (`pil:bicubic`, `pil:lanczos`, `pil:bilinear`, `pil:nearest`), enabling direct quantitative comparisons against existing Python image libraries.
+  - Quantitative MAE comparison on test scenes (`evaluate_upscalers.py`):
+    - `celup_lab:cubic` (MAE 0.00876) and `celup_lab:adaptive` (MAE 0.00899) outperform both `pil:bicubic` (0.00916) and `pil:lanczos` (0.00912) on diagonal lines (`diag`).
+    - On gradients (`gradient`), `celup_lab:cubic` / `adaptive` / `autodeblur` achieve MAE 0.00115 (nearly 3x lower error than PIL's 0.00327).
+    - On alpha-blended boundaries (`alpha`), `celup_lab:cubic` achieves MAE 0.00836 vs PIL Lanczos 0.00894 and PIL Bicubic 0.00908.
+  - All regression tests pass (`check_stairs.py` PASS, `check_corners.py` PASS, `test_scales.py` PASS, `test_celup3.py` 23.57 baseline PASS).
+
 # v4.9.2 update (2026-07-31): `-D remake` alias; crosshatch delta root-caused
 
 - `-D remake` is now accepted as an alias of `remap` (the user's own

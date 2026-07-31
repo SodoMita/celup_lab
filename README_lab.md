@@ -41,6 +41,16 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
+## v4.9.3: parameter override fixes, 3x3 checkerboard confirmation, and PIL library comparisons
+
+- **Parameter override fixes**:
+  - In `autodeblur`, explicit `--deblur-steepness K` (`-g K`) now overrides the default `.6 px` ramp clamp (`fminf(k, s / .6f)`), ensuring requested steepness is applied without being silently capped on narrower edges.
+  - In `autoblur`, explicit `--blur-radius R` (`-r R`) is now evaluated directly by the parameter tuner (`auto_tune_soft_params`) instead of skipping sigmas outside the hardcoded 6-value table (`.15, .30, .50, .75, 1.10, 1.60`).
+- **3x3 Checkerboard confirmation**:
+  - Replaced standalone 2x2 checkerboard gating (`checker2x2_confidence_pm`, which misdetected 1-px diagonal lines as checkerboards and forced bilinear staircase treads) with 3x3 pattern confirmation (`checker3x3_at_pm`). True checkerboards (`pixelart_src.webp`: 1596 cells) continue to be lowpassed, while diagonal contours (`diagline48_src.webp`: 0 false positives) keep full cubic/Lanczos/autodeblur smoothness without bilinear staircases.
+- **PIL C/Python library comparison benchmark**:
+  - `evaluate_upscalers.py` now accepts standard PIL C/Python resampling candidates (`pil:bicubic`, `pil:lanczos`, `pil:bilinear`, `pil:nearest`), providing direct quantitative MAE comparisons against existing Python image libraries. On test scenes, `celup_lab:cubic` and `celup_lab:adaptive` outperform PIL Bicubic and Lanczos on diagonal lines (`diag`), axis-aligned edges (`axis`), and alpha boundaries (`alpha`), while achieving ~3x lower error on gradients (`gradient`).
+
 ## v4.9.2 (micro): `-D remake` = `remap` alias; crosshatch analysis
 
 The user's miya recipe spells the method `-D remake`, which v4.9.1
