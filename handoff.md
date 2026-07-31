@@ -1,6 +1,29 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
-# Handoff: `celup_lab` upscale/hourglass investigation
+# v4.9.3 update (2026-08-01): restored parameters honesty, narrow-line washout, terraces
+
+- Root cause of "ignoring parameters": the sawtooth cap
+  `k = fminf(k, s/.6f)` makes `-g 16`/`-g 64` bit-identical while the
+  report echoed the request.  The report now prints the effective
+  applied range (`effective-k=6.54..12.32 avg ...` on miya 4x).
+- Narrow-line washout at `-r 6` ("smiley mouth fades to grey"):
+  per-window flank-pair amplitude restoration, heavily gated
+  (coherence, flank extremum + direction-consistency tests,
+  base-model saturation membership `uf0/uf1`, value-membership
+  `gInn`, 2.25x cap, source-range clamp, wS2 evidence + PF
+  consensus blur).  Barcode/neon failure modes seen en route:
+  per-pixel trust flapping; mirrored-frame rel mixing; off-feature
+  saturation claims -- all documented in-code.
+- Terrace cleanup for quantized sources (45-level smiley class):
+  `estimate_qconf` + normal-direction plateau smoothing in pass 2.
+- Verified: tests/check_stairs.py, check_corners.py, test_scales.py
+  (incl. miya face sweep once `tests/miya_normal.webp` is copied
+  from images/), plus vs-master renders on the real assets:
+  smiley r6 mouth dark-mean 108 -> 56 and min 50 -> 0 (native black),
+  r23 visual parity, miya 4x MAE 4.29 -> 2.12 vs base.
+  Synthetic diagline probe 15.2 vs 14.5
+  base (marginal, GT asks sub-blur-line recovery).  Open: r6 eye
+  ring minor unevenness on the smiley (thin annulus class).
 
 # v4.9.2 update (2026-07-31): `-D remake` alias; crosshatch delta root-caused
 

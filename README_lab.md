@@ -38,6 +38,39 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
+## v4.9.3: honest effective-k, narrow-line amplitude restoration, terrace cleanup
+
+User's complaints: **"ignoring parameters"** (e.g. `-g 16` and `-g 64`
+bit-identical outputs) and **"staircase of not fully smoothed
+pixels"** (visible terrace treads on quantized art).  Fixes:
+
+- The run report now prints `effective-k=MIN..MAX avg AVG` -- the
+  slope multiplier that actually reaches pixels after the sawtooth
+  cap (`s/.6`) instead of echoing the request.  When the cap silently
+  replaced K everywhere, the report used to claim `steepness=64.00
+  (manual)`; now it shows what was applied, so knob changes are
+  legible again.
+- **Narrow-feature amplitude restoration**: wide assumed blur (-r 6)
+  attenuates any line of width << sigma by `erf(w/2.83*sigma)`; the
+  window's own flank-pair geometry proves the washout, so the inner
+  plateau is corrected back by `1/att` (capped at 2.25x, clamped to
+  the source colour range, gated by coherence, flank-pair extremum
+  tests, base-model saturation membership, and value-membership so
+  it cannot paint neon bands around thin lines).  The smiley mouth
+  at `-r 6` went from washed grey to its near-native black; hair and
+  chin strokes followed.  On the 48px analytic diagline probe the
+  GT MAE stayed within ~5% of the v4.9.2 baseline (15.2 vs 14.5),
+  and miya 4x (`-r 2.3 -g 16`) improved 4.29 -> 2.12.
+- **Terrace cleanup**: estimate the source quantisation (count of
+  used grey levels); on quantized art, pass 2 applies a small
+  normal-direction smoothing gated to plateau skirts, so the treads
+  of the remaining staircase melt without touching crisp contours.
+- Fit-robustness under the hood: lobe extremum break for merged
+  dips, data-adaptive plateau clamps in the profile fit, joint
+  spatial low-pass of the consensus field (weights AND weighted
+  quantities) so per-pixel trust flapping no longer renders as
+  barcode teeth along narrow features.
+
 ## v4.9.2 (micro): `-D remake` = `remap` alias; crosshatch analysis
 
 The user's miya recipe spells the method `-D remake`, which v4.9.1
