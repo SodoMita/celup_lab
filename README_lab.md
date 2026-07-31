@@ -41,6 +41,17 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
+## v4.9.2 (micro): `-D remake` = `remap` alias; crosshatch analysis
+
+The user's miya recipe spells the method `-D remake`, which v4.9.1
+hard-errored on; it is now an alias of `remap`.  The v4.9.1
+crosshatch HG note below was also fully root-caused by knob-off
+builds: none of the new mechanisms (coverage gate, LS clamp, lobe
+weights) moves the number; it tracks the base sigma alone (v4.9.1
+fit + decoupled base = .00398, better than v4.9's own .00434), i.e.
+the v4.9.1 fit beats v4.9's on either base and the delta is exactly
+the rejected-crispness trade.
+
 ## v4.9.1: user-review fixes -- sigma decouple reverted, shading-aware profile fit, 45 deg staircase gate
 
 User's verdict on v4.9 (same smiley, same recipe

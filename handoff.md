@@ -2,6 +2,23 @@
 
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.9.2 update (2026-07-31): `-D remake` alias; crosshatch delta root-caused
+
+- `-D remake` is now accepted as an alias of `remap` (the user's own
+  miya recipe log spells it that way; previously a hard "Unknown
+  deblur method" error).
+- The v4.9.1 crosshatch HG delta (.00567 vs v4.9 .00434) was chased
+  with knob-off builds: coverage gate off = no change; ls-clamp block
+  off = .00614 (the clamps HELP, they are not the cause); v4.9-exact
+  clamped-u lobe weights = no change.  The whole delta is the BASE
+  sigma: v4.9 fit on the sigma-r base scores .00602, the v4.9.1 fit
+  on the v4.9 decoupled base scores .00398 (best of the four
+  combinations).  I.e. the v4.9.1 fit is strictly better than v4.9's
+  on BOTH bases; the decoupled crisp base buys lattice-texture
+  fidelity with exactly the visible-tread artifact the user rejected.
+  Monotone-tread merge idea withdrawn: it would re-litigate that
+  trade.
+
 # v4.9.1 update (2026-07-31): decouple reverted, shading-aware fit, staircase gate
 
 **User rejected v4.9** (same smiley, same recipe): "You returned all

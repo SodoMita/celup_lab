@@ -4868,7 +4868,7 @@ static uint8_t *slurp(const char *name, size_t *n) {
 static void print_help(const char *argv0) {
   printf(
       "celup_lab -- premultiplied-linear WebP upscaler (research build "
-      "v4.9.1)\n"
+      "v4.9.2)\n"
       "\n"
       "Usage: %s in.webp out.webp SCALE [options]\n"
       "  SCALE is the upsampling factor, real number in (1,32] "
@@ -4942,7 +4942,8 @@ static void print_help(const char *argv0) {
       "                            edges, and adapts autodeblur steepness\n"
       "                            per edge\n"
       "  -D, --deblur-method M     autodeblur method auto|remap|push\n"
-      "                            (default auto = 2x proxy picks per image);\n"
+      "                            (v4.9.2: 'remake' accepted as alias;\n"
+      "                            default auto = 2x proxy picks per image);\n"
       "                            remap = evaluate the slope-steepened\n"
       "                            profile fit at the pixel's own position,\n"
       "                            push = evaluate the original fit at a\n"
@@ -5143,7 +5144,8 @@ int main(int ac, char **av) {
     } else if (!strcmp(av[i], "--deblur-method") || !strcmp(av[i], "-D")) {
       if (!strcmp(av[i + 1], "auto"))
         deblur_method = 0;
-      else if (!strcmp(av[i + 1], "remap"))
+      else if (!strcmp(av[i + 1], "remap") ||
+               !strcmp(av[i + 1], "remake")) /* common typo of remap */
         deblur_method = 1;
       else if (!strcmp(av[i + 1], "push"))
         deblur_method = 2;
