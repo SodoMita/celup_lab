@@ -1753,6 +1753,15 @@ static int blur_radius_set = 0;
 /* Resolved parameters, for the final report. */
 static int fitted_kernel = BK_GAUSSIAN, fitted_curve = CK_LINEAR;
 static float fitted_sigma = .75f, fitted_cp = 0.f;
+/* v4.9: deblur-consistent reconstruction sigma.  In autodeblur mode the
+   base render is decoupled from the ASSUMED source blur (-r): the model
+   claims to remove that blur at steepness k, so the neutral reconstruction
+   low-trust pixels fall back to may assert at most residual blur
+   sigma/min(k,8).  A low-trust pixel then keeps a CRISP source sample
+   instead of dissolving into a sigma-wide skirt -- the "neon glow" v4.8
+   produced at mismatched -r came exactly from blending toward a base
+   rendered at the user's (possibly wrong) blur sigma. */
+static float adb_sigma_div = 0.f, adb_assumed_sigma = 0.f;
 
 static const char *kernel_name(int k) {
   return k == BK_BOX       ? "box"
@@ -2221,6 +2230,15 @@ static int upscale_autoblur(const uint8_t *in, int sw, int sh, uint8_t *out,
   fitted_sigma = sigma;
   fitted_curve = ck;
   fitted_cp = cp;
+  if (adb_sigma_div > 0.f) {
+    adb_assumed_sigma = sigma;
+    sigma = clampf(sigma / adb_sigma_div, .6f, sigma);
+    fitted_sigma = sigma;
+    fprintf(stderr,
+            "autodeblur base sigma %.2f = assumed %.2f / %.1f (v4.9; "
+            "assumed value still sizes windows/gates)\n",
+            sigma, adb_assumed_sigma, adb_sigma_div);
+  }
   int ok = render_soft(in, sw, sh, out, dw, dh, kk, sigma, ck, cp);
   if (ok && edge_goal > 0.f && blur_radius_set)
     fprintf(stderr,
@@ -2358,7 +2376,34 @@ static float ss01(float z) {
    -D method 1 (remap): evaluate the slope-steepened fit at t = 0.
    -D method 2 (push):  evaluate the ORIGINAL fit at a position
      displaced toward the nearer plateau by (ufit-.5)(k-1)*s*1.5/s --
-     the Anime4K heightmap push in analytic form. */
+     the Anime4K heightmap push in analytic form.
+
+   v4.9 review forensics (smiley test: rounded corners + smooth "neon"
+   glow around lines):
+   - CORNER ROUNDING: both tangential mechanisms (line-sample averaging
+     and pass-2 delta smoothing) assume the contour is translation-
+     invariant along its tangent.  At corners/tips that premise fails:
+     taps run AROUND the corner, the radial fit is diluted and the
+     sharpened edge is dissolved into an arc.  Fix: junction measure
+     rho = lambda2/lambda1 from the SAME structure tensor scales the
+     tangent span and the pass-2 tap weights -- a corner keeps its own
+     radial fit and stays sharp; straight contours are untouched.
+   - NEON GLOW: low-trust pixels blended toward the base render at the
+     user's ASSUMED blur sigma (-r); at mismatched -r every edge
+     acquired a sigma-wide skirt, and staircase treads re-sharpened
+     into bands floating on that skirt.  Fix: the base render sigma is
+     decoupled to max(.6, r/min(K,8)) -- the most the deblur claims to
+     leave -- so partial trust falls back to a crisp sample, never to
+     a wide smear.  -r remains the assumed blur for window sizing and
+     the shading gate.
+   - CONTOUR CONSENSUS: raw per-pixel fits misplaced mu by 1-2 out px
+     near wedge apexes (cornerstar48); anchored evaluation amplified
+     that ~k into +-0.25 colour deltas with alternating sign, and
+     delta transport pushed pixels outside the locally observed
+     colours.  Fix: pass 1.5 integrates the wS-weighted fit parameters
+     along the (junction-aware) tangent and re-derives z/k/nu from the
+     consensus; plus a convex-hull output clamp (deblur has no ringing
+     vocabulary), quantized in DISPLAY space. */
 /* Bilinear sampler for float4 fields (used for the tangential
    anti-jitter smoothing of the model delta below). */
 static void sample_f4(const float *img, int w, int h, float x, float y,
@@ -2376,17 +2421,43 @@ static void sample_f4(const float *img, int w, int h, float x, float y,
         q[c] += ww * p[c];
     }
 }
+
+/* Bilinear sampler for interleaved nc-channel float fields (the v4.9
+   fit-parameter field). */
+static void sample_fn(const float *img, int w, int h, int nc, float x,
+                      float y, float *q) {
+  int ix = (int)floorf(x), iy = (int)floorf(y);
+  float fx = x - (float)ix, fy = y - (float)iy;
+  for (int c = 0; c < nc; c++)
+    q[c] = 0.f;
+  for (int j = 0; j < 2; j++)
+    for (int i = 0; i < 2; i++) {
+      float ww = (i ? fx : 1.f - fx) * (j ? fy : 1.f - fy);
+      const float *p =
+          img + (size_t)nc * ((size_t)clampi(iy + j, 0, h - 1) * w +
+                              clampi(ix + i, 0, w - 1));
+      for (int c = 0; c < nc; c++)
+        q[c] += ww * p[c];
+    }
+}
 static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                            int method) {
   size_t n = (size_t)dw * dh;
   float *A = malloc(n * 4 * sizeof *A);
-  float *DEL = malloc(n * 4 * sizeof *DEL); /* model colour delta   */
-  float *DIR = malloc(n * 2 * sizeof *DIR); /* contour tangent      */
+  float *DEL = malloc(n * 4 * sizeof *DEL);  /* flat + model colour delta */
+  /* v4.9 fit-parameter field, wS-weighted: [wS, wS*mu, wS*s, wS*d2x4,
+     coh, tanx, tany].  Pass 1.5 integrates it ALONG THE CONTOUR so each
+     pixel is rendered from a contour-consensus fit instead of its own
+     jittering 1D fit (near-apex windows misplace mu by 1-2 out px and
+     raw per-pixel deltas swung +-0.25 with alternating sign). */
+  float *PF = malloc(n * 10 * sizeof *PF);
+  uint8_t *LOH = malloc(n * 8);              /* local hull, u8/chan    */
   uint8_t *dst = malloc(n * 4);
-  if (!A || !DEL || !DIR || !dst) {
+  if (!A || !DEL || !PF || !LOH || !dst) {
     free(A);
     free(DEL);
-    free(DIR);
+    free(PF);
+    free(LOH);
     free(dst);
     return 0;
   }
@@ -2402,7 +2473,11 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
     if (cdg)
       sscanf(cdg, "%f,%f", &trust_lo, &trust_hi);
   }
-  float sref = fitted_sigma > 1.f ? fitted_sigma : 1.f;
+  /* sref = ASSUMED source blur (window sizing, shading gate).  When the
+     reconstruction sigma was decoupled (v4.9) the assumed value is kept
+     separately: fitted_sigma is then the (smaller) base-render sigma. */
+  float sref0 = adb_assumed_sigma > 0.f ? adb_assumed_sigma : fitted_sigma;
+  float sref = sref0 > 1.f ? sref0 : 1.f;
   int wide = scale * sref > 4.001f;
   int R = wide ? clampi((int)(1.25f * scale * sref + .5f), 2, 64)
                : clampi((int)(1.25f * scale + .5f), 2, 12);
@@ -2462,6 +2537,20 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
       float trh = .5f * (Jxx - Jyy),
             root = sqrtf(trh * trh + Jxy * Jxy),
             lam = .5f * (Jxx + Jyy) + root;
+      /* v4.9 junction measure rho = lambda2/lambda1: ~0 on a straight
+         contour (translation-invariant ALONG it -- the premise of both
+         tangential line-sample averaging and pass-2 delta smoothing),
+         ->1 at corners/junctions where that premise fails.  coh scales
+         the tangent span and the pass-2 tap weights, so a corner keeps
+         its own radial fit (sharp tip) instead of being dissolved into
+         an arc by taps running around it; straight edges keep the full
+         anti-wobble averaging unchanged. */
+      float lam2 = .5f * (Jxx + Jyy) - root;
+      float rho = lam > 1e-12f ? lam2 / lam : 0.f;
+      /* Gate band tuned so long blurred arcs (rings/corner torture,
+         face contours) keep full tangential averaging and only genuine
+         junctions/tips (rho >= ~.3 on a 3x3 tensor) lose it. */
+      float coh = 1.f - ss01((rho - .10f) * (1.f / .20f));
       float dirx = 1.f, diry = 0.f;
       if (lam > 1e-12f) {
         float vx = Jxy, vy = lam - Jxx;
@@ -2485,19 +2574,22 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
          normals keeps the profile while erasing the grid-periodic
          jitter (period ~1 src px). */
       float tanx = -diry, tany = dirx;
+      /* Coherence-scaled tangent span (v4.9): full T on straight
+         contours, 0 at junctions/corners/tips. */
+      int Teff = (int)((float)T * coh + .5f);
       float C[129][4], u[129], lo[4] = {1e30f, 1e30f, 1e30f, 1e30f},
             hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f},
             mean[4] = {0, 0, 0, 0};
       for (int j = 0; j < NS; j++) {
         float t = (float)(j - R), acc[4] = {0, 0, 0, 0};
-        for (int to = -T; to <= T; to++) {
+        for (int to = -Teff; to <= Teff; to++) {
           float q[4];
           sample_pm(out, dw, dh, (float)x + t * dirx + (float)to * tanx,
                     (float)y + t * diry + (float)to * tany, q);
           for (int c = 0; c < 4; c++)
             acc[c] += q[c];
         }
-        float inv = 1.f / (2 * T + 1);
+        float inv = 1.f / (2 * Teff + 1);
         for (int c = 0; c < 4; c++) {
           C[j][c] = acc[c] * inv;
           mean[c] += C[j][c];
@@ -2530,9 +2622,9 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
         d[c] = CB[c] - CA[c];
         L2 += d[c] * d[c];
       }
-      float wS = 0.f, nvS[4];
-      for (int c = 0; c < 4; c++)
-        nvS[c] = o[c];
+      /* v4.9: the pixel-level fit parameters (consensus-evaluated in
+         pass 1.5); zero when no fit was made. */
+      float wS = 0.f, fmu = 0.f, fs = 0.f, fd2[4] = {0, 0, 0, 0};
       if (L2 >= 6.4e-5f) { /* |d| >= .008: not a flat */
         for (int j = 0; j < NS; j++) {
           float uu = 0.f;
@@ -2676,6 +2768,10 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 s = .3f;
               if (s > lwm)
                 s = lwm;
+              fmu = (float)mu;
+              fs = s;
+              for (int c = 0; c < 4; c++)
+                fd2[c] = d2[c];
               /* Steepness: -g pins k exactly (float, up to 64); -e
                  adapts per edge; -s formula otherwise; always capped so
                  the OUTPUT ramp never falls below .6 px sigma
@@ -2745,6 +2841,16 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 }
                 wS *= 1.f - ss01(((float)cross - 2.25f) / 2.5f);
               }
+              /* Validity gate (v4.9): at junctions/corners/line caps
+                 the 1D ramp model is outside its domain -- the window
+                 mixes both arms of a wedge and 'assigns' bright-side
+                 pixels to the dark segment (cornerstar apex: bright
+                 pixels darkened by |delta| ~ .9, transported around
+                 the tip by pass-2).  Downweight to coh: junctions
+                 keep the crisp base sample (source-faithful sharp
+                 tip) instead of a bogus 1D fit; straight contours
+                 (coh ~ 1) are untouched. */
+              wS *= coh;
               if (dbg && y == dbg_y && abs(x - dbg_x) <= 16 &&
                   (x & 3) == 0) {
                 double en = 0, ed = 0;
@@ -2756,65 +2862,171 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 fprintf(stderr,
                         "DBG %d,%d NL=%d lobe[%d..%d] dom[%d..%d] "
                         "W=%.3f mu=%.3f s=%.3f k=%.3f z0=%.3f ufit=%.4f "
-                        "nu=%.4f wS=%.4f rmse=%.4f Ld2=%.5f\n",
+                        "nu=%.4f wS=%.4f rmse=%.4f Ld2=%.5f coh=%.2f "
+                        "Teff=%d\n",
                         x, y, NL, jl[li], jr[li], dl, dr, W, mu, s, k,
                         z0, ufit0, nu, wS, ed > 1e-9 ? sqrt(en / ed) : -1.,
-                        Ld2);
-              }
-              for (int c = 0; c < 4; c++) {
-                float F0 = P0[c] + ufit0 * d2[c];
-                nvS[c] = P0[c] + nu * d2[c] + (o[c] - F0);
+                        Ld2, coh, Teff);
               }
             }
           }
         }
       }
-      /* Store the model colour delta (profile steepening + flat
-         flatten) and the contour tangent for pass 2; the pixel's own
-         fit residual is NOT stored: it is re-added unsmoothed at write
-         time via o[c] (texture stays per-pixel). */
+      /* Store the flat-flatten part of the delta, the wS-weighted fit
+         parameter field for the pass-1.5 contour-consensus evaluation,
+         and the local colour hull (u8) for the hull clamp; the pixel's
+         own fit residual is NOT stored: it is re-added unsmoothed at
+         write time via o[c] (texture stays per-pixel). */
       {
         float fw = ss01((.025f - rng) * (1.f / .017f)) * (1.f - wS);
-        float *dd = DEL + 4 * idx, *dr = DIR + 2 * idx;
+        float *dd = DEL + 4 * idx, *p = PF + 10 * idx;
         for (int c = 0; c < 4; c++)
-          dd[c] = wS * (nvS[c] - o[c]) + fw * flatmix * (mean[c] - o[c]);
-        dr[0] = -diry; /* tangent of the fitted contour */
-        dr[1] = dirx;
+          dd[c] = fw * flatmix * (mean[c] - o[c]);
+        p[0] = wS;
+        p[1] = wS * fmu;
+        p[2] = wS * fs;
+        for (int c = 0; c < 4; c++)
+          p[3 + c] = wS * fd2[c];
+        p[7] = coh;
+        p[8] = -diry; /* tangent of the fitted contour */
+        p[9] = dirx;
+        /* Hull codes in DISPLAY space (sRGB u8 for colour, linear u8
+           for alpha): linear-space u8 codes have no usable resolution
+           at the dark end (0.12 sRGB = 0.012 linear = code 3), which
+           made the first hull clamp toothless exactly where fringes
+           live. */
+        for (int c = 0; c < 4; c++) {
+          int lv, hv;
+          if (c < 3) {
+            lv = to_srgb[clampi((int)(clampf(lo[c], 0.f, 1.f) * 4096.f),
+                                0, 4096)] -
+                 1;
+            hv = to_srgb[clampi((int)(clampf(hi[c], 0.f, 1.f) * 4096.f),
+                                0, 4096)] +
+                 1;
+          } else {
+            lv = (int)(clampf(lo[c], 0.f, 1.f) * 255.f) - 1;
+            hv = (int)(clampf(hi[c], 0.f, 1.f) * 255.f + .999f) + 1;
+          }
+          LOH[8 * idx + c] = (uint8_t)clampi(lv, 0, 255);
+          LOH[8 * idx + 4 + c] = (uint8_t)clampi(hv, 0, 255);
+        }
       }
     }
-  /* Pass 2: tangential smoothing of the model delta.  Per-pixel lobe
-     fits (centre/width, trust weight) jitter by hundredths of a pixel
-     on noisy content; evaluated at steepness k the anchored output
-     renders that jitter amplified ~k-fold as outstanding pixels at
-     gradient centres -- the same artifact class v4.7's colour-domain
-     gain produced, just weaker.  The delta is constant ALONG a
-     genuine contour, so a short tangential average (same span as the
-     line-sampling tangent averaging) destroys the jitter without
-     touching across-edge sharpness, and each pixel's own residual
-     (texture, hue arcs) is never smoothed. */
+  /* Pass 1.5: contour-consensus evaluation (v4.9).  Raw per-pixel fits
+     jitter (mu by up to 1-2 out px near wedges/apexes) and the anchored
+     output renders that jitter amplified ~k-fold -- pass-2 delta
+     smoothing patched the symptom, this treats the cause: the fit
+     parameters themselves are constant/move coherently ALONG a genuine
+     contour, so integrate the wS-weighted parameter field along the
+     tangent (junction-aware weights, wS as the weight of evidence --
+     junction-gated and untrusted pixels contribute no mass) and render
+     each pixel from the CONSENSUS fit: z, k, nu are recomputed from the
+     smoothed mu/s so the anchored evaluation stays exact, and the
+     pixel's own residual (o - F(smoothed fit)) is still re-added per
+     pixel at gain 1.  The local convex-hull clamp (no ringing
+     vocabulary: erf tail-shape misfit at the ramp foot once drove the
+     step48 dark flank .149 -> .027) bounds the result to the colours
+     observed in the pixel's own window. */
   for (int y = 0; y < dh; y++)
     for (int x = 0; x < dw; x++) {
       size_t idx = (size_t)y * dw + x;
-      const float *dr = DIR + 2 * idx;
+      const float *pf = PF + 10 * idx;
+      float tanx = pf[8], tany = pf[9], cc = pf[7];
+      float aW = 0.f, aMu = 0.f, aS = 0.f, aD[4] = {0, 0, 0, 0},
+            wsum = 0.f;
+      for (int to = -T; to <= T; to++) {
+        float wt = (float)(T + 1 - (to < 0 ? -to : to)), q[10];
+        sample_fn(PF, dw, dh, 10, (float)x + (float)to * tanx,
+                  (float)y + (float)to * tany, q);
+        wt *= sqrtf(cc * fmaxf(q[7], 0.f));
+        aW += wt * q[0];
+        aMu += wt * q[1];
+        aS += wt * q[2];
+        for (int c = 0; c < 4; c++)
+          aD[c] += wt * q[3 + c];
+        wsum += wt;
+      }
+      if (aW > 1e-6f && wsum > 1e-6f) {
+        float o[4];
+        float mu = aMu / aW, s = aS / aW, w = aW / wsum, d2[4];
+        for (int c = 0; c < 4; c++) {
+          d2[c] = aD[c] / aW;
+          o[c] = A[4 * idx + c];
+        }
+        /* Steepness from the CONSENSUS width: same rules as pass 1. */
+        float k = kbase;
+        if (deblur_steepness <= 0.f && edge_goal > 0.f) {
+          float st = fmaxf(.6f, edge_goal * scale / 2.5f);
+          k = clampf(s / st, 1.f, 16.f);
+        }
+        k = fminf(k, s / .6f);
+        /* Anchored evaluation (v4.8) on the consensus fit. */
+        float z0 = (0.f - mu) / s;
+        float ufit0 = phi1(z0), nu;
+        if (method == 2 && k > 1.f)
+          nu = phi1(z0 + (ufit0 - .5f) * (k - 1.f) * 1.5f);
+        else
+          nu = phi1(k * z0);
+        nu = clampf(nu, 0.f, 1.f);
+        float *dd = DEL + 4 * idx;
+        for (int c = 0; c < 4; c++) {
+          float blo = c < 3 ? to_linear[LOH[8 * idx + c]]
+                            : LOH[8 * idx + c] * (1.f / 255.f),
+                bhi = c < 3 ? to_linear[LOH[8 * idx + 4 + c]]
+                            : LOH[8 * idx + 4 + c] * (1.f / 255.f);
+          float v = clampf(o[c] + w * (nu - ufit0) * d2[c], blo, bhi);
+          dd[c] += v - o[c];
+        }
+        if (dbg && y == dbg_y && abs(x - dbg_x) <= 16 && (x & 3) == 0)
+          fprintf(stderr,
+                  "DBGS %d,%d mu=%.3f s=%.3f k=%.3f ufit=%.4f nu=%.4f "
+                  "wSeff=%.4f (consensus)\n",
+                  x, y, mu, s, k, ufit0, nu, w);
+      }
+    }
+  /* Pass 2: tangential smoothing of the residual delta.  Fit jitter is
+     already absorbed by the pass-1.5 consensus; this only polishes the
+     small delta noise of the flat-flatten path and any rounding of the
+     consensus evaluation.  Junction-aware taps (v4.9): a corner's delta
+     is not exchangeable with its contour neighbours' -- tangents rotate
+     there. */
+  for (int y = 0; y < dh; y++)
+    for (int x = 0; x < dw; x++) {
+      size_t idx = (size_t)y * dw + x;
+      const float *pf = PF + 10 * idx;
+      float cc = pf[7];
       float acc[4] = {0, 0, 0, 0}, o[4], res[4], wsum = 0.f;
       for (int to = -T; to <= T; to++) {
-        float wt = (float)(T + 1 - (to < 0 ? -to : to)), q[4];
-        sample_f4(DEL, dw, dh, (float)x + (float)to * dr[0],
-                  (float)y + (float)to * dr[1], q);
+        float wt = (float)(T + 1 - (to < 0 ? -to : to)), q[4], qc[10];
+        float sx = (float)x + (float)to * pf[8],
+              sy = (float)y + (float)to * pf[9];
+        sample_fn(PF, dw, dh, 10, sx, sy, qc);
+        wt *= sqrtf(cc * fmaxf(qc[7], 0.f));
+        sample_f4(DEL, dw, dh, sx, sy, q);
         for (int c = 0; c < 4; c++)
           acc[c] += wt * q[c];
         wsum += wt;
       }
-      float inv = 1.f / wsum;
       for (int c = 0; c < 4; c++) {
         o[c] = A[4 * idx + c];
-        res[c] = clampf(o[c] + acc[c] * inv, 0.f, 1.f);
+        float v = wsum > 1e-6f ? o[c] + acc[c] / wsum : o[c];
+        /* Final hull clamp (v4.9): pass-1.5 clamps each pixel's own
+           evaluation, but the smoothed delta can still leave the hull
+           by transport.  No output may leave the locally observed
+           colour range -- enforced here by construction. */
+        float blo = c < 3 ? to_linear[LOH[8 * idx + c]]
+                          : LOH[8 * idx + c] * (1.f / 255.f),
+              bhi = c < 3 ? to_linear[LOH[8 * idx + 4 + c]]
+                          : LOH[8 * idx + 4 + c] * (1.f / 255.f);
+        res[c] = clampf(v, blo, bhi);
       }
       put(dst + 4 * idx, res[0], res[1], res[2], res[3]);
     }
   memcpy(out, dst, n * 4);
   free(dst);
-  free(DIR);
+  free(LOH);
+  free(PF);
   free(DEL);
   free(A);
   return 1;
@@ -2822,6 +3034,19 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
 
 static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
                               int dw, int dh) {
+  /* v4.9: decouple the reconstruction sigma from the assumed source blur.
+     The pass claims to remove sigma at steepness k, so the fallback base
+     asserts residual blur sigma/min(k,8) -- never wider than the sharpest
+     output the model itself can produce.  Skipped under -e: the edge-goal
+     escalation owns sigma there. */
+  adb_sigma_div = 0.f;
+  adb_assumed_sigma = 0.f;
+  if (edge_goal <= 0.f) {
+    float kg = deblur_steepness > 0.f
+                   ? deblur_steepness
+                   : clampf(1.f + .25f * (compress_strength - 1.f), 1.f, 3.f);
+    adb_sigma_div = clampf(kg, 1.f, 8.f);
+  }
   if (!upscale_autoblur(in, sw, sh, out, dw, dh))
     return 0;
   int method = deblur_method;
@@ -4482,7 +4707,7 @@ static uint8_t *slurp(const char *name, size_t *n) {
 static void print_help(const char *argv0) {
   printf(
       "celup_lab -- premultiplied-linear WebP upscaler (research build "
-      "v4.8)\n"
+      "v4.9)\n"
       "\n"
       "Usage: %s in.webp out.webp SCALE [options]\n"
       "  SCALE is the upsampling factor, real number in (1,32] "
@@ -4528,7 +4753,10 @@ static void print_help(const char *argv0) {
       "                            unless -g or -e overrides (see table)\n"
       "  -r, --blur-radius R       blur radius .1..40 (default 1): radius\n"
       "                            for *blurcompress modes; ALSO pins the\n"
-      "                            autoblur/autodeblur sigma exactly\n"
+      "                            autoblur sigma exactly.  In autodeblur it\n"
+      "                            is the ASSUMED source blur (sizes windows\n"
+      "                            and gates); the base render sigma is\n"
+      "                            decoupled to max(.6, R/min(K,8)) (v4.9)\n"
       "  -a, --auto-tune           auto-tune -r and -s for the *blurcompress\n"
       "                            modes only (implies -m deblurcompress)\n"
       "  -P, --checker-policy P    adaptive checker policy: lowpass|bilinear|\n"
@@ -4566,7 +4794,10 @@ static void print_help(const char *argv0) {
       "  parameter    chosen automatically by...        pin manually with\n"
       "  kernel       validation-proxy fit              -k (any value but auto)\n"
       "  sigma        fit, then -e escalation           -r R (exact; -e then\n"
-      "                                                 backs off: manual wins)\n"
+      "                                                 backs off: manual wins).\n"
+      "                                                 autodeblur: R = assumed\n"
+      "                                                 blur; base render sigma\n"
+      "                                                 = R/min(K,8) (v4.9)\n"
       "  curve        validation-proxy fit              -c (any value but auto)\n"
       "  curve param  fit                               -p P\n"
       "  method       2x-downscale proxy MSE            -D remap|push\n"
@@ -4576,22 +4807,30 @@ static void print_help(const char *argv0) {
       "  echoed to stderr, so an automatic run can be reproduced exactly by\n"
       "  re-running with its reported values pinned.\n"
       "\n"
-      "autodeblur internals (v4.8): one gradient direction per pixel for the\n"
-      "whole premultiplied RGBA vector (4D structure tensor); transition\n"
-      "lobes along that normal are segmented (|du| runs) and each pixel is\n"
-      "fit by an error-function profile on ITS OWN lobe with one-sided\n"
-      "plateau colours -- a line's two flanks and two backgrounds never\n"
-      "mix into one fit.  The slope is steepened ON THE FIT by k and the\n"
-      "fit is evaluated at the pixel's GEOMETRIC position, with the\n"
-      "pixel's own fit residual re-added at gain 1: colours stay\n"
-      "anchored (no k-amplified speckle, no phi^-1 halo, hue texture\n"
-      "kept), misassigned lobes degrade to identity, and k may be a\n"
-      "large float.  k is capped so output ramps stay >= .6 px sigma (no\n"
-      "re-aliased sawtooth); dense multi-crossing windows (text,\n"
-      "crosshatch) are left alone via a window-level crossing-count\n"
-      "trust gate.  The analysis window and shading gate scale with the\n"
-      "effective sigma, so wide intentional blur (-r 2+, -e escalation)\n"
-      "is still unblurred.\n"
+      "autodeblur internals (v4.9): one gradient direction per pixel for\n"
+      "the whole premultiplied RGBA vector (4D structure tensor);\n"
+      "transition lobes along that normal are segmented (|du| runs) and\n"
+      "each pixel is fit by an error-function profile on ITS OWN lobe\n"
+      "with one-sided plateau colours -- a line's two flanks and two\n"
+      "backgrounds never mix into one fit.  The slope is steepened ON\n"
+      "THE FIT by k and the fit is evaluated at the pixel's GEOMETRIC\n"
+      "position, with the pixel's own fit residual re-added at gain 1:\n"
+      "colours stay anchored (no k-amplified speckle, no phi^-1 halo,\n"
+      "hue texture kept), misassigned lobes degrade to identity, and k\n"
+      "may be a large float.  k is capped so output ramps stay >= .6 px\n"
+      "sigma (no re-aliased sawtooth); dense multi-crossing windows\n"
+      "(text, crosshatch) are left alone via a window-level crossing-\n"
+      "count trust gate.  v4.9: (1) a junction measure from the SAME\n"
+      "tensor (lambda2/lambda1) scales the tangent span of sampling and\n"
+      "the pass-2 smoothing -- straight contours keep full tangential\n"
+      "averaging, corners/tips keep their own radial fit and stay\n"
+      "SHARP; (2) the base reconstruction sigma is decoupled from the\n"
+      "assumed blur (-r) to max(.6, r/min(K,8)), so low-trust pixels\n"
+      "fall back to a crisp source sample, never to a sigma-wide skirt\n"
+      "(-- the v4.8 'neon glow' at mismatched -r).  -r is ASSUMED\n"
+      "SOURCE BLUR in this mode: grossly oversetting it (hard pixelated\n"
+      "source at -r 6) oversizes windows; moderate values (~1-2.3)\n"
+      "behave best on art with light antialiasing.\n"
       "\n"
       "Output is always lossless WebP.  Hourglass/speckle suppression in the\n"
       "compress family and adaptive/sdf only acts on directed gradients;\n"
@@ -4835,8 +5074,8 @@ int main(int ac, char **av) {
                                                        SDF delta/blur buffers */
                            : !strcmp(mode, "autoblur") ? 8.0
                            : !strcmp(mode, "autodeblur")
-                               ? 8.0 + 44.0 /* A f16 + DEL f16 + DIR f8
-                                               + dst 4 */
+                               ? 8.0 + 84.0 /* A f16 + DEL f16 + PF f40
+                                               + LOH 8 + dst 4 */
                                                        : 4.0);
     double estimated =
         (in_bytes + out_bytes + 32.0 * 1024 * 1024) / (1024.0 * 1024.0);

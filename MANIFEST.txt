@@ -1,23 +1,28 @@
-celup_lab.c                  v4.8 C source: anchored autodeblur (4D-vector gradient,
-                             |du| lobe map per normal, one-sided erf fit on the nearest
-                             lobe, slope steepened on the fit and evaluated at the
-                             pixel's own position, original-pixel residual re-added at
-                             gain 1 [= original colours kept]; tangential delta
-                             smoothing; RMSE + crossing-count trust); float steepness
+celup_lab.c                  v4.9 C source: corner-sharp anchored autodeblur (4D-vector
+                             gradient, |du| lobe map per normal, one-sided erf fit on
+                             the nearest lobe, slope steepened on the fit; pass 1.5
+                             tangential contour-consensus evaluation at the pixel's own
+                             position, original-pixel residual re-added at gain 1
+                             [= original colours kept]; junction measure
+                             lambda2/lambda1 gates tangent span, smoothing and trust;
+                             base sigma decoupled from assumed blur; convex-hull output
+                             clamp; RMSE + crossing-count trust); float steepness
                              -g 1..64; manual pins (-k/-r/-c/-p/-D/-g); v4.4 edge-width
                              goal (-e); gradient-only suppression, sdf halo guard,
                              alpha cleanup, short CLI
-README_lab.md                Mode usage notes, v4.8 anchored deblur, v4.5 pin table
-handoff.md                   v4.8..v2 updates (what changed + measurements) + v1 history
+README_lab.md                Mode usage notes, v4.9 corner-sharp deblur, v4.5 pin table
+handoff.md                   v4.9..v2 updates (what changed + measurements) + v1 history
 evaluate_upscalers.py        Text metric evaluator (MAE, pm-linear)
 hourglass_metric.py          Artifact metric (HG amplitude, CHK) + torture scenes
+check_corners.py (tests/)    v4.9 corner/glow forensics gate on cornerstar48
 make_lab_comparison_sheets.py Sheet generator; checker/crosshatch/rings + classmap + autoblur + sdf
 test_celup3.py               Older regression script (sRGB-space; see handoff v2 notes)
 comparison_sheets.md         Text-only metrics from the latest comparison run (22 mode specs x 11 scenes)
 build.sh                     Simple build command
 tests/make_test_sources.py   Regenerates all test fixtures (torture/pixelart/hline8/
                              grad8/thin96/parallel96/rings96/step48 + v4.8 forensics
-                             caps48/twoline48/huearc48/rampnoise48) bit-exactly
+                             caps48/twoline48/huearc48/rampnoise48 + v4.9 forensics
+                             cornerstar48) bit-exactly
 tests/test_scales.py         Scale-sweep regression: all modes x 1.5..24x on a synthetic
                              AA circle + miya face strip at 2..22x (dims/staircase/AA-step)
 tests/make_miya_fixtures.py  Derives the miya face fixtures when the user asset

@@ -199,6 +199,34 @@ def rampnoise48_src():
     save("rampnoise48_src.webp", (np.clip(rgb, 0, 1) * 255).astype(np.uint8))
 
 
+def cornerstar48_src():
+    """48x48: HARD-edged dark geometry on white -- a filled triangle with
+    three acute tips and an L-corner bar with square ends -- barely
+    blurred (sigma=0.5 src px): v4.9 'rounded corners + neon glow'
+    forensics (the smiley class: pixelated, almost unblurred source).
+    Acute tips must stay pointed, flat plateaus must stay flat, and a
+    sigma-wide luminance skirt around the dark strokes is a failure.
+    Integer half-plane fill: bit-exact on any platform."""
+    from scipy.ndimage import gaussian_filter
+
+    yy, xx = np.mgrid[0:48, 0:48]
+
+    def tri(ax, ay, bx, by, cx, cy):
+        d = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+        a = ((by - cy) * (xx - cx) + (cx - bx) * (yy - cy)) / d
+        b = ((cy - ay) * (xx - cx) + (ax - cx) * (yy - cy)) / d
+        return (a >= 0) & (b >= 0) & (a + b <= 1)
+
+    lum = np.ones((48, 48), np.float64)
+    lum[tri(8, 40, 44, 44, 20, 8)] = 0.12     # triangle: tips at (8,40),(44,44),(20,8)
+    lum[26:46, 40:43] = 0.15                  # L-corner: vertical bar
+    lum[26:29, 30:40] = 0.15                  # ...joined horizontal bar (square ends)
+    lum = gaussian_filter(lum, 0.5)
+    rgba = np.dstack([lum, lum * 0.94 + 0.03, lum * 0.88 + 0.06,
+                      np.ones_like(lum)])
+    save("cornerstar48_src.webp", (np.clip(rgba, 0, 1) * 255).astype(np.uint8))
+
+
 if __name__ == "__main__":
     torture_src()
     pixelart_src()
@@ -212,3 +240,4 @@ if __name__ == "__main__":
     twoline48_src()
     huearc48_src()
     rampnoise48_src()
+    cornerstar48_src()

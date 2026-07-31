@@ -41,6 +41,56 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
+## v4.9: corner-sharp autodeblur -- junction gating, decoupled base sigma, contour-consensus fits
+
+Review of v4.8 (user's own 256px hard-edged smiley, 2x,
+`-r 6 -s 100 -g 64 -D remap -c linear -k bspline`): "previous problems
+resolved, but now sharp corners/line-end tips come back ROUNDED, and
+the halo is different -- smoother, like a neon glow".  Two model
+defects, no per-artifact patches:
+
+- **Neon glow** = low-trust pixels blending toward the base render at
+  the user's ASSUMED blur sigma (-r): at a mismatched -r every edge
+  grows a sigma-wide skirt, and staircase treads re-sharpen into
+  contour bands floating on that skirt.  In autodeblur mode the base
+  reconstruction sigma is now **decoupled** from the assumed blur:
+  `sigma_base = max(.6, r / min(K,8))` -- never wider than the sharpest
+  output the deblur itself can produce, so partial trust can no longer
+  invent a wide smear.  `-r` remains the assumed source blur (window
+  sizing, shading gate).  NOTE: on a hard pixelated source do NOT
+  overset -r (it is a claim, not a strength knob); ~1-2.3 fits art with
+  light antialiasing.
+- **Rounded corners** = the tangential mechanisms (line-sample
+  averaging, pass smoothing) assumed the contour is translation-
+  invariant along its tangent -- false at corners/tips.  A **junction
+  measure from the same structure tensor** (`rho = lambda2/lambda1`)
+  now scales the tangent span and the pass tap weights: straight
+  contours keep full anti-wobble averaging; corners keep their own
+  radial fit and stay sharp.
+
+Plus one structural upgrade found by the new forensics fixture
+(`cornerstar48`, acute wedge): raw per-pixel fits can misplace the ramp
+centre by 1-2 output px near wedges, and anchored evaluation rendered
+that jitter amplified ~k, pushing deltas outside the local colour
+range.  v4.9 renders each pixel from a **tangentially integrated
+contour-consensus fit** (pass 1.5: wS-weighted mu/s/delta-colour
+integrated along the junction-aware tangent; z/k/nu recomputed from the
+consensus so anchored evaluation stays exact), and the output is
+clamped to the **local observed colour hull** (per-pixel window
+min/max, display-quantized -- a deblur has no ringing vocabulary).
+The hull invariant and corner sharpness are gated by
+`tests/check_corners.py`.
+
+Measured (4x torture, HG vs v4.8/autoblur): checker2 .00496/.00469/
+.00428, crosshatch .00434/.00417/.00363, rings .00463/.00398/.00260,
+diag .00203/.00214/.00127, corner .00297/.00184/.00175 -- dense gated
+scenes now keep the source structure (MAE up to +.03 on synthetic
+soft-truth scenes, by design: detail preferred over smoothness);
+huearc saturation .8504 (unchanged); rampnoise HF .00183 (v4.8:
+.00214, base .00117 -- consensus removed the v4.8 mu-jitter dither);
+step48 transect sharper, plateaus pinned, monotone; miya user recipe
+blush texture .2429 (v4.8 .2071), cheek clean.
+
 ## v4.8: anchored autodeblur -- lobe-local fits, evaluation at the pixel's own position
 
 Review of v4.7: "closer, but it can create outstanding pixels at

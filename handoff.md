@@ -1,5 +1,92 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.9 update (2026-07-31): corner-sharp autodeblur -- junction gating, decoupled base, contour consensus
+
+User review of v4.8 (own test image `poor smiley.webp`, 256x256 hard
+pixelated drawing, 2x upscale, recipe
+`--mode autodeblur -c linear -k bspline -r 6 -s 100 -g 64 -D remap`):
+v4.7 problems gone, but regression: **sharp corners / line-cap tips are
+rounded** ("v4.7, even with the doubled snake tongue, made sharp tips;
+this may fit some art styles but it loses details"), and **the halo is
+different now -- smooth, like neon**.  Reproduced bit-near-exactly
+(<=1 LSB, arch noise).
+
+Diagnosis (all confirmed with CELUP_DBG and probe transects):
+1. The neon skirt is not from the steepener at all: the base
+   reconstruction was rendered at the user's *assumed* blur sigma
+   (`-r` 6 on a nearly unblurred source).  Every edge with wS < 1
+   dissolved toward a sigma-wide smear, and each source-staircase tread
+   simultaneously re-sharpened into its own lobe step => sharp bands
+   floating on a wide smooth glow = "neon".  At -r 2.3 the same
+   mechanism glows; only ~1.2 looked right.
+2. Corner rounding: the tangential averaging (T) in the line sampling
+   and the pass-2 delta smoothing both assume the contour is
+   translation-invariant along its tangent.  At corners/tips that
+   premise fails and the radial fit/delta is dissolved around the
+   corner.  Additionally, with a heavily blurred base the *samples
+   themselves* encode a rounded tip and the fit re-renders it (v4.7's
+   "sharp tips" were phantom overshoot, an accident).
+3. New fixture cornerstar48 (acute wedge, sigma 0.5): raw per-pixel
+   fits near the apex misplaced mu 1-2 out px; anchored evaluation
+   amplified that ~k into +-0.25 colour deltas, pass-2 transported them
+   past the observed colour range (white pixels darkened to 0).
+   NOTE/history: the first hull clamp stored *linear* lo/hi in u8 --
+   0.12 sRGB = 0.012 linear = code 3, toothless precisely in the dark;
+   hull codes are now display-quantized (sRGB u8 colour, linear u8
+   alpha).
+
+Fixes (model-level; no per-artifact heuristics):
+- **Sigma decouple (autodeblur only)**: base render sigma =
+  max(.6, assumed_r / min(K,8)) -- never wider than the sharpest ramp
+  the deblur itself asserts.  Partial trust then falls back to a crisp
+  source sample, never a wide smear.  `-r` keeps meaning "assumed
+  source blur" for windows/gates; skipped under `-e` (escalation owns
+  sigma there).  stderr reports the decoupled value.
+- **Junction gating**: rho = lambda2/lambda1 of the same 4D structure
+  tensor, coh = 1-ss01((rho-.10)/.20); scales the line-sampling tangent
+  span (Teff), the pass tap weights, AND trust itself (wS *= coh --
+  the 1D ramp model is out-of-domain at junctions; identity fallback =
+  crisp source tip).  Long arcs (rings/corner torture, hair curls)
+  measure rho <= .08 and keep full averaging: no wobble return.
+- **Contour-consensus evaluation (pass 1.5)**: instead of rendering
+  each pixel from its own jittering 1D fit, the wS-weighted fit
+  parameters (mu, s, colour delta d2, plus tangent/coherence) are
+  integrated along the junction-aware tangent; z/k/nu are recomputed
+  from the consensus (anchored evaluation stays exact, residual still
+  re-added per pixel at gain 1; P0 cancels, so only d2 is carried).
+  This also eliminated v4.8's accepted +-1 LSB mu-jitter dither at the
+  root: rampnoise48 HF .00214 -> .00183 (base .00117).
+- **Convex-hull output clamp**: no output may leave the colour range
+  observed in the pixel's own sampling window (deblur has no ringing
+  vocabulary), enforced at pass 1.5 and again after pass 2 (delta
+  transport), codes display-quantized.
+
+Regression gate: tests/check_corners.py (hull / tip extent / flank
+width / glow strip on cornerstar48 at the user-style recipe).  All
+PASS; the v4.8 binary FAILS the hull check on the same gate.  Sharp-tip
+smiley at user's recipe: pointed spikes, thin rings, no glow.
+
+Torture 4x (v4.9 vs v4.8 vs autoblur): HG checker2 .00496/.00469/
+.00428, crosshatch .00434/.00417/.00363, rings .00463/.00398/.00260,
+diag .00203/.00214/.00127, corner .00297/.00184/.00175; MAE checker2
+.08191/.05173/.05445 (dense checker kept crisp by design), corner
+.02345/.02238/.02325, rings .05001/.04548/.04906.  Dense gated scenes
+now keep source structure instead of melting it (MAE up to +.03 on
+synthetic soft-truth scenes: detail preferred, HG stays sub-visible).
+miya user recipe: cheek HF .00769 (sub-visible), blush texture .2429
+(v4.8 .2071 -- the "watered away" complaint), g8 == g16 (s/.6 cap
+binds); huearc saturation .8504; step48 transect sharper than v4.8,
+plateaus pinned (.149-0.169 dark / .784-.827 bright), monotone, no
+undershoot fringe; caps48 tongues stay fixed.  test_scales.py 204/204.
+
+Memory: autodeblur estimate now 8.0 + 84.0 B/out-px (A f16 + DEL f16 +
+PF f40 parameter field + LOH u8x8 + dst 4).
+
+Rejected intermediate steps (kept for the record): per-pixel deltas +
+pass-2 smoothing alone (transport overshoot out of hull at wedge
+flanks); rho band .06/.25 (barely engaged anywhere -- replaced by
+.10/.30); linear-quantized hull codes (toothless at the dark end).
+
 # v4.8 update (2026-07-31): anchored autodeblur -- lobe-local fits, float steepness to 64
 
 User review of v4.7: closer, but (1) "outstanding pixels at centers of
