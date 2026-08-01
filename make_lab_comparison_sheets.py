@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 """Generate example inputs and comparison sheets for celup_lab modes.
-
 The examples are procedural high-resolution RGBA scenes.  Each scene is reduced
 with a premultiplied-linear 4x4 box filter to make a 96x96 WebP input.  celup_lab
 then upscales that input back to 384x384 with several modes.
-
 Outputs:
-  examples/                  low-res source WebPs and ground-truth PNGs
-  comparison_sheets/          per-case sheets plus comparison_sheet.png
+  examples/                  low-res source WebPs and ground-truth WebPs (webp only, never png)
+  comparison_sheets/          per-case sheets plus comparison_sheet.webp
 """
 import math
 import subprocess
 from pathlib import Path
-
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-
 ROOT = Path(__file__).resolve().parent
 EXE = ROOT / "celup_lab"
 EXAMPLE_DIR = ROOT / "images" / "examples"
@@ -23,7 +19,6 @@ SHEET_DIR = ROOT / "images" / "comparison_sheets"
 S = 4
 N = 96
 Z = N * S
-
 # Include every algorithm currently exposed by celup_lab.  Each tuple is
 # (sheet label, --mode value, extra command-line options).
 MODE_SPECS = (
@@ -55,17 +50,11 @@ MODE_LABELS = tuple(label for label, _, _ in MODE_SPECS)
 # Classifier visualization is not a MAE candidate; appended to sheets as a
 # separate labelled panel.
 CLASSMAP_SPEC = ("classmap (R=edge G=chk B=junct)", "classmap", ())
-
-
 def lin(x):
     x = x / 255.0
     return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
-
-
 def srgb(x):
     return np.where(x <= 0.0031308, 12.92 * x, 1.055 * np.power(x, 1 / 2.4) - 0.055)
-
-
 def pm(a):
     a = np.asarray(a, dtype=np.float32)
     o = np.empty_like(a, dtype=np.float32)
@@ -73,21 +62,15 @@ def pm(a):
     o[:, :, :3] = lin(a[:, :, :3]) * alpha
     o[:, :, 3:4] = alpha
     return o
-
-
 def encode_pm(p):
     a = np.clip(p[:, :, 3:4], 0, 1)
     rgb = np.divide(p[:, :, :3], np.maximum(a, 1e-8))
     rgb = np.clip(rgb, 0, 1)
     rgba = np.dstack((np.clip(srgb(rgb) * 255, 0, 255), a[:, :, 0] * 255)).astype(np.uint8)
     return Image.fromarray(rgba, "RGBA")
-
-
 def down4(a):
     """4x4 box reduction in premultiplied-linear RGBA."""
     return pm(a).reshape(N, S, N, S, 4).mean((1, 3))
-
-
 def checker_composite(img):
     a = np.asarray(img.convert("RGBA"), dtype=np.uint16)
     h, w = a.shape[:2]
@@ -96,8 +79,6 @@ def checker_composite(img):
     alpha = a[:, :, 3:4]
     rgb = (a[:, :, :3] * alpha + bg * (255 - alpha) + 127) // 255
     return Image.fromarray(rgb.astype(np.uint8), "RGB")
-
-
 def grad_background(c0, c1):
     arr = np.zeros((Z, Z, 4), np.uint8)
     x = np.linspace(0, 1, Z, dtype=np.float32)[None, :]
@@ -107,8 +88,6 @@ def grad_background(c0, c1):
         arr[:, :, ch] = (c0[ch] * (1 - mix) + c1[ch] * mix).astype(np.uint8)
     arr[:, :, 3] = 255
     return Image.fromarray(arr, "RGBA")
-
-
 def scene_badge():
     im = grad_background((22, 28, 54), (48, 94, 142))
     d = ImageDraw.Draw(im, "RGBA")
@@ -119,8 +98,6 @@ def scene_badge():
               fill=(255, 100, 80, 255))
     d.line((17*S, 83*S, 88*S, 18*S), fill=(255, 255, 255, 255), width=2*S)
     return im
-
-
 def scene_lines():
     im = Image.new("RGBA", (Z, Z), (235, 232, 216, 255))
     d = ImageDraw.Draw(im, "RGBA")
@@ -130,8 +107,6 @@ def scene_lines():
     d.line((9*S, 80*S, 88*S, 18*S), fill=(20, 155, 190, 255), width=3*S)
     d.rectangle((20*S, 24*S, 75*S, 71*S), outline=(28, 28, 28, 255), width=S)
     return im
-
-
 def scene_curves_alpha():
     im = Image.new("RGBA", (Z, Z), (0, 0, 0, 0))
     d = ImageDraw.Draw(im, "RGBA")
@@ -141,8 +116,6 @@ def scene_curves_alpha():
     d.arc((10*S, 52*S, 94*S, 135*S), start=205, end=315, fill=(255, 255, 255, 255), width=2*S)
     d.line((12*S, 82*S, 84*S, 14*S), fill=(255, 78, 35, 255), width=2*S)
     return im
-
-
 def scene_photoish():
     # Procedural photo-like texture: smooth sky/water gradients plus soft blobs.
     arr = np.zeros((Z, Z, 4), np.uint8)
@@ -162,8 +135,6 @@ def scene_photoish():
     d = ImageDraw.Draw(im, "RGBA")
     d.ellipse((68*S, 10*S, 84*S, 26*S), fill=(255, 225, 150, 255))
     return im
-
-
 def scene_tiny_text():
     im = Image.new("RGBA", (Z, Z), (248, 248, 244, 255))
     d = ImageDraw.Draw(im, "RGBA")
@@ -178,8 +149,6 @@ def scene_tiny_text():
         d.rectangle((x0*S, 34*S, (x0+6)*S, 35*S), fill=(255, 100, 80, 255))
         d.rectangle((x0*S, 34*S, (x0+1)*S, 44*S), fill=(255, 100, 80, 255))
     return im
-
-
 def scene_crossing():
     # Antialiased crossing strokes/sections.  This stresses whether a method can
     # sharpen intersections without inventing new colours or fitted geometry.
@@ -190,8 +159,6 @@ def scene_crossing():
     d.line((4*S, 50*S, 92*S, 50*S), fill=(30, 160, 180, 220), width=2*S)
     d.ellipse((38*S, 38*S, 58*S, 58*S), outline=(255, 245, 120, 255), width=S)
     return im
-
-
 def scene_soft_gradient():
     # Broad smooth diagonal colour transition: useful for seeing whether an
     # algorithm creates small cell/triangle facets inside a true gradient.
@@ -208,8 +175,6 @@ def scene_soft_gradient():
     d = ImageDraw.Draw(im, "RGBA")
     d.line((8*S, 86*S, 88*S, 12*S), fill=(255, 255, 255, 90), width=S)
     return im
-
-
 def scene_checker1():
     # 1 source px checkerboard (Nyquist frequency): the hourglass/bow-tie
     # torture test.  Truth renders 4x4px blocks per source pixel.
@@ -220,8 +185,6 @@ def scene_checker1():
     a[:, :, 2] = np.where(c, 28, 238)
     a[:, :, 3] = 255
     return Image.fromarray(a, "RGBA")
-
-
 def scene_checker2():
     # 2 source px checkerboard (resolvable, but locally checker-ambiguous):
     # does the algorithm keep intentional checker texture?
@@ -232,8 +195,6 @@ def scene_checker2():
     a[:, :, 2] = np.where(c, 60, 200)
     a[:, :, 3] = 255
     return Image.fromarray(a, "RGBA")
-
-
 def scene_crosshatch():
     # Two families of 1-px-wide crossing diagonal lines: crossing artefacts,
     # ringing dots and invented crossing colours all show here.
@@ -243,8 +204,6 @@ def scene_crosshatch():
     xh = (((xx - yy) % (8 * S)) < S) | (((xx + yy) % (8 * S)) < S)
     a[xh] = (25, 25, 130, 255)
     return Image.fromarray(a, "RGBA")
-
-
 def scene_rings():
     # Thin concentric rings: curved near-Nyquist structures.
     yy, xx = np.mgrid[0:Z, 0:Z].astype(np.float32)
@@ -253,8 +212,6 @@ def scene_rings():
     a[:] = (24, 30, 44, 255)
     a[(r % (6 * S)) < (2 * S)] = (245, 200, 70, 255)
     return Image.fromarray(a, "RGBA")
-
-
 SCENES = (
     ("badge", scene_badge),
     ("lines", scene_lines),
@@ -268,21 +225,13 @@ SCENES = (
     ("crosshatch", scene_crosshatch),
     ("rings", scene_rings),
 )
-
-
 def draw_label(draw, xy, text, fill="black"):
     draw.text(xy, text, fill=fill)
-
-
 def safe_name(label):
     return label.replace(" ", "_").replace("/", "_")
-
-
 def run_mode(inp, out, mode, extra=()):
     cmd = [str(EXE), str(inp), str(out), "4", "--mode", mode, *extra]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
-
-
 def make_sheet_for_scene(name, truth_img, low_img, outputs, metrics, classmap_img=None):
     labels_and_imgs = [("ground truth", truth_img), ("source x4", low_img.resize((Z, Z), Image.Resampling.NEAREST))]
     labels_and_imgs += [(m + f"\nMAE {metrics[m]:.5f}", outputs[m]) for m in MODE_LABELS]
@@ -298,26 +247,21 @@ def make_sheet_for_scene(name, truth_img, low_img, outputs, metrics, classmap_im
         sheet.paste(checker_composite(img), (x, label_h))
         d.rectangle((x, label_h, x + Z - 1, label_h + Z - 1), outline=(180, 180, 180))
     return sheet
-
-
 def main():
     if not EXE.exists():
         raise SystemExit(f"Build {EXE} first")
-    EXAMPLE_DIR.mkdir(exist_ok=True)
-    SHEET_DIR.mkdir(exist_ok=True)
+    EXAMPLE_DIR.mkdir(exist_ok=True, parents=True)
+    SHEET_DIR.mkdir(exist_ok=True, parents=True)
     panels = []
     summary_rows = []
     for name, maker in SCENES:
         truth = maker().convert("RGBA")
         low_pm = down4(np.asarray(truth))
         low = encode_pm(low_pm)
-        truth_path = EXAMPLE_DIR / f"{name}_truth.png"
+        truth_path = EXAMPLE_DIR / f"{name}_truth.webp"
         low_webp = EXAMPLE_DIR / f"{name}_source_96.webp"
-        low_png = EXAMPLE_DIR / f"{name}_source_96.png"
-        truth.save(truth_path)
-        low.save(low_png)
+        truth.save(truth_path, lossless=True)
         low.save(low_webp, lossless=True)
-
         truth_pm = pm(np.asarray(truth))
         outputs = {}
         metrics = {}
@@ -334,10 +278,9 @@ def main():
         run_mode(low_webp, cm_path, CLASSMAP_SPEC[1])
         classmap_img = Image.open(cm_path).convert("RGBA")
         sheet = make_sheet_for_scene(name, truth, low, outputs, metrics, classmap_img)
-        sheet_path = SHEET_DIR / f"comparison_{name}.png"
-        sheet.save(sheet_path)
+        sheet_path = SHEET_DIR / f"comparison_{name}.webp"
+        sheet.save(sheet_path, lossless=True)
         panels.append((name, sheet))
-
     # Combined sheet with a title row for each scene.
     row_h = Z + 70
     combined = Image.new("RGB", (panels[0][1].width, row_h * len(panels)), "white")
@@ -346,30 +289,25 @@ def main():
         y = i * row_h
         d.text((6, y + 5), f"{name}: procedural source -> 96x96 premultiplied-linear box -> celup_lab 4x", fill="black")
         combined.paste(panel, (0, y + 26))
-    combined.save(SHEET_DIR / "comparison_sheet.png")
-
+    combined.save(SHEET_DIR / "comparison_sheet.webp", lossless=True)
     # Compact source overview.
     overview = Image.new("RGB", (len(SCENES) * Z, Z + 42), "white")
     d = ImageDraw.Draw(overview)
     for i, (name, _) in enumerate(SCENES):
-        low = Image.open(EXAMPLE_DIR / f"{name}_source_96.png").convert("RGBA")
+        low = Image.open(EXAMPLE_DIR / f"{name}_source_96.webp").convert("RGBA")
         d.text((i * Z + 5, 4), name + " source x4", fill="black")
         overview.paste(checker_composite(low.resize((Z, Z), Image.Resampling.NEAREST)), (i * Z, 42))
-    overview.save(SHEET_DIR / "example_sources.png")
-
+    overview.save(SHEET_DIR / "example_sources.webp", lossless=True)
     # Markdown summary of MAE numbers.
     lines = ["# celup_lab generated comparison sheets", "", "Metric: mean absolute error in premultiplied-linear RGBA, excluding 4px border; lower is better.", ""]
     lines.append("| case | " + " | ".join(MODE_LABELS) + " |")
     lines.append("|---|" + "---|" * len(MODE_LABELS))
     for name, metrics in summary_rows:
         lines.append("| " + name + " | " + " | ".join(f"{metrics[m]:.5f}" for m in MODE_LABELS) + " |")
-    lines += ["", "Generated files:", "", "- `comparison_sheets/comparison_sheet.png`", "- `comparison_sheets/example_sources.png`", "- `comparison_sheets/comparison_<case>.png`", "- `examples/*_source_96.webp` and matching mode outputs"]
+    lines += ["", "Generated files:", "", "- `comparison_sheets/comparison_sheet.webp`", "- `comparison_sheets/example_sources.webp`", "- `comparison_sheets/comparison_<case>.webp`", "- `examples/*_source_96.webp` and matching mode outputs"]
     (ROOT / "comparison_sheets.md").write_text("\n".join(lines) + "\n")
-
-    print("Wrote", SHEET_DIR / "comparison_sheet.png")
-    print("Wrote", SHEET_DIR / "example_sources.png")
+    print("Wrote", SHEET_DIR / "comparison_sheet.webp")
+    print("Wrote", SHEET_DIR / "example_sources.webp")
     print("Wrote", ROOT / "comparison_sheets.md")
-
-
 if __name__ == "__main__":
     main()
