@@ -49,6 +49,9 @@ MODE_SPECS = (
     ("adaptive s2x", "adaptive", ("--checker-policy", "scale2x")),
     ("autoblur", "autoblur", ()),
     ("autodeblur", "autodeblur", ()),
+    ("analytical g1", "autodeblur", ("-D", "analytical", "-g", "1")),
+    ("analytical g5", "autodeblur", ("-D", "analytical", "-g", "5")),
+    ("analytical auto", "autodeblur", ("-D", "analytical")),
     ("sdf", "sdf", ()),
 )
 MODE_LABELS = tuple(label for label, _, _ in MODE_SPECS)
