@@ -1521,7 +1521,7 @@ static void adaptive_tangential_aa(float *hr, int dw, int dh,
   if (!snap) return;
   memcpy(snap, hr, n * 4 * sizeof *snap);
   float xscale = (float)sw / dw, yscale = (float)sh / dh;
-  float spread = blur_radius_set ? clampf(blur_radius / 0.75f, 0.7f, 2.5f) : 1.f;
+  float spread = blur_radius_set ? clampf(blur_radius / 0.75f, 0.7f, 3.0f) : 1.2f;
   for (int y = 0; y < dh; y++) {
     int cy = (int)((y + 0.5f) * yscale);
     if (cy < 0) cy = 0;
@@ -1546,13 +1546,13 @@ static void adaptive_tangential_aa(float *hr, int dw, int dh,
       float inv = 1.f / sqrtf(g2);
       float tx = -gy * inv;
       float ty = gx * inv;
-      /* 4 taps along tangent: -1.5,-0.5,+0.5,+1.5 * spread */
-      const float offs[4] = {-1.5f, -0.5f, 0.5f, 1.5f};
-      const float wts[4] = {0.15f, 0.35f, 0.35f, 0.15f};
+      /* 6 taps along tangent: -2.5,-1.5,-0.5,+0.5,+1.5,+2.5 * spread for stronger AA */
+      const float offs[6] = {-2.5f, -1.5f, -0.5f, 0.5f, 1.5f, 2.5f};
+      const float wts[6] = {0.08f, 0.18f, 0.24f, 0.24f, 0.18f, 0.08f};
       float acc[4] = {0,0,0,0};
-      for (int t = 0; t < 4; t++) {
-        float xt = (float)x + tx * offs[t] * spread;
-        float yt = (float)y + ty * offs[t] * spread;
+      for (int tt = 0; tt < 6; tt++) {
+        float xt = (float)x + tx * offs[tt] * spread;
+        float yt = (float)y + ty * offs[tt] * spread;
         int ix = (int)floorf(xt), iy = (int)floorf(yt);
         float fx = xt - ix, fy = yt - iy;
         float q[4] = {0};
@@ -1566,12 +1566,12 @@ static void adaptive_tangential_aa(float *hr, int dw, int dh,
             for (int c = 0; c < 4; c++) q[c] += w * p[c];
           }
         }
-        for (int c = 0; c < 4; c++) acc[c] += wts[t] * q[c];
+        for (int c = 0; c < 4; c++) acc[c] += wts[tt] * q[c];
       }
-      float blend = 0.38f * edge_w * (1.f - wc) * (1.f - 0.45f * wj);
-      if (spread > 1.f) blend *= (0.6f + 0.4f * spread);
+      float blend = 0.48f * edge_w * (1.f - wc) * (1.f - 0.40f * wj);
+      if (spread > 1.f) blend *= (0.55f + 0.45f * spread);
       if (blend < 0.02f) continue;
-      if (blend > 0.55f) blend = 0.55f;
+      if (blend > 0.68f) blend = 0.68f;
       float *dst = hr + 4 * ((size_t)y * dw + x);
       for (int c = 0; c < 4; c++) {
         dst[c] = dst[c] * (1.f - blend) + acc[c] * blend;
@@ -1608,7 +1608,7 @@ static int upscale_adaptive(const uint8_t *in, int sw, int sh, uint8_t *out,
   if (policy == POLICY_LOWPASS) {
     /* v5: honour -r for lowpass sigma so -r has visible effect in adaptive;
        default 0.75 remains if not pinned. */
-    float lp_sigma = blur_radius_set ? clampf(blur_radius, 0.1f, 2.f) : 0.75f;
+    float lp_sigma = blur_radius_set ? clampf(blur_radius, 0.1f, 2.5f) : 0.75f;
     low = alloc_lowpass_pm(in, sw, sh, lp_sigma);
     if (!low) {
       free_class_map(&cm);
@@ -1746,12 +1746,12 @@ static int upscale_adaptive(const uint8_t *in, int sw, int sh, uint8_t *out,
      v6: stronger -s: 0.020*(s-1) capped 0.90 so s=1..46 monotonic,
      visible effect up to 100.  Hourglass removal 0.85 vs 0.60 to lower
      crosshatch HG (0.0095->~0.003).  Tangential AA v6 4-tap + -r spread. */
-  float sharp = clampf((compress_strength - 1.f) * 0.020f, 0.f, 0.90f);
+  float sharp = clampf((compress_strength - 1.f) * 0.025f, 0.f, 1.00f);
   int ok = refine_downsample_consistency(hr, in, sw, sh, dw, dh, 3, .55f,
                                          sharp, &cm);
   if (ok) {
     if (policy != POLICY_SCALE2X && policy != POLICY_NEAREST)
-      remove_hourglass_basis(hr, dw, dh, in, sw, sh, .85f, cm.w_hg);
+      remove_hourglass_basis(hr, dw, dh, in, sw, sh, .95f, cm.w_hg);
     suppress_speckle_pm(hr, dw, dh, in, sw, sh, .85f, cm.w_hg);
     if (policy != POLICY_SCALE2X && policy != POLICY_NEAREST)
       adaptive_tangential_aa(hr, dw, dh, &cm, sw, sh);
@@ -3275,15 +3275,28 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
       }
       for (int c = 0; c < 4; c++) {
         o[c] = A[4 * idx + c];
-        float v = wsum > 1e-6f ? o[c] + acc[c] / wsum : o[c];
-        /* Final hull clamp (v4.9): pass-1.5 clamps each pixel's own
-           evaluation, but the smoothed delta can still leave the hull
-           by transport.  No output may leave the locally observed
-           colour range -- enforced here by construction. */
+        float tang = wsum > 1e-6f ? acc[c] / wsum : 0.f;
+        /* v6.3 isotropic smoothing of delta for wide blur to reduce halo around gradient centres */
+        float iso = 0.f;
+        if (wide) {
+          float sum = 0.f;
+          for (int jy=-1; jy<=1; jy++) for (int ix=-1; ix<=1; ix++) {
+            int sx = x+ix, sy = y+jy;
+            if (sx<0) sx=0; if (sx>=dw) sx=dw-1;
+            if (sy<0) sy=0; if (sy>=dh) sy=dh-1;
+            sum += DEL[4 * ((size_t)sy * dw + sx) + c];
+          }
+          iso = sum / 9.f;
+        }
+        float delta = wide ? (0.20f * tang + 0.80f * iso) : tang;
+        float v = o[c] + delta;
         float blo = c < 3 ? to_linear[LOH[8 * idx + c]]
                           : LOH[8 * idx + c] * (1.f / 255.f),
               bhi = c < 3 ? to_linear[LOH[8 * idx + 4 + c]]
                           : LOH[8 * idx + 4 + c] * (1.f / 255.f);
+        float range = bhi - blo;
+        float maxDelta = 0.20f * range;
+        v = clampf(v, o[c] - maxDelta, o[c] + maxDelta);
         res[c] = clampf(v, blo, bhi);
       }
       put(dst + 4 * idx, res[0], res[1], res[2], res[3]);
