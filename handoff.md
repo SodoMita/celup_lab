@@ -1,5 +1,39 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.9.4 update (2026-08-01): accumulate-mass deblur (watercolor, round 2)
+
+- User: "improve autodeblur. currently it water colors, produce halo.
+  it supposed to accumulate colors back at deblur phase."
+- Diagnosis by numbers (smiley 2x ROI rows 240-500; ink = total
+  darkness vs NN = 1.0; halo = mean darkness in the 2-4 px band
+  outside the NN line mask; darkmean = mean darkness inside the
+  mask): v4.9.3 claimed the right plateau but paid it only at
+  `ufit0 > .78` (unsteepened model); narrow -r 6 strokes are ~2.9
+  sigma wide so interiors read .6-.9 and stayed at the attenuated
+  plateau.
+- nu-based membership tried and REVERTED: phi1(k*z0) saturates at
+  |z0| > 2.5/k -- no side truth; washed skirts were painted black
+  (diagline GT MAE 13.7 -> 17.6; inside-vs-outside positions e.g.
+  mouth (250,416) ufit .66 pay vs diag (54,64) ufit .37 don't-pay
+  confirmed ufit0 keeps the side information).
+- Fixes shipped: gate centre .78 -> .70 (scan .55/.60/.65/.70/.78:
+  smiley ink .929/.924/.919/.912/.900, darkmean 227/226/225/223/220,
+  diag MAE 16.6/15.9/15.1/14.2/14.3 -- .70 best joint); mass-correct
+  restore depth `max(1/att, min(k,8)/att * wsrc/(wsrc+2.83*sigma))`
+  gated att < .85, cap 4, with pass-1 k hoisted above the restoration
+  block; full-strength payment where nu + uf + gInn are all
+  saturated (was blurred consensus weight ~.5-.7).
+- Net: smiley r6 ink .879 -> .912, core darkmean 215 -> 223, halo
+  17.8 -> 17.6 (unchanged); diag MAE 14.2 vs 13.7 base; r 2.3 recipe
+  unchanged; check_stairs / check_corners / test_scales (incl. miya
+  face sweep) green.
+- OPEN: the halo/veil (3-17 darkness in the 2-4 px skirt, NN ~2) is
+  untouched by every gate tried (consensus-blur radii, uf centre,
+  f_mass, k-cap): it is the base render's gaussian tail minus the
+  partial erf-swap correction, surviving through the anchored-eval
+  residual channel far from evidence (wS ~ 0 keeps the wash).  Needs
+  real mass TRANSPORT (skirt -> core), not another rescale.
+
 # v4.9.3 update (2026-08-01): restored parameters honesty, narrow-line washout, terraces
 
 - Root cause of "ignoring parameters": the sawtooth cap

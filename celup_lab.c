@@ -2979,6 +2979,27 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                  plateaus -- exactly the v4.8/v4.9 fd2 = d2 semantics.
                  Bounds: nothing when b degenerates, 1.2x span when the
                  fit spikes. */
+              /* Steepness, decided BEFORE the amplitude restoration
+                 (v4.9.4): the mass-correct restore depth needs the k
+                 the contour will actually be rendered with.  Same
+                 rules as the former inline block: -g pins k exactly
+                 (float, up to 64); -e adapts per edge; -s formula
+                 otherwise; always capped so the OUTPUT ramp never
+                 falls below .6 px sigma (~1.5 px 30% width): no
+                 re-aliased sawtooth, and already-crisp content is
+                 left alone (k -> 1).  A MANUAL -g buys a sharper
+                 floor (.45 px instead of .6): the user explicitly
+                 takes responsibility for the ramp width; auto
+                 steepness stays at the proven alias-free .6.  Either
+                 way the EFFECTIVE k is reported (it was the "ignoring
+                 parameters" lie: summary echoed 64 while the cap
+                 silently rendered ~7). */
+              float k = kbase;
+              if (deblur_steepness <= 0.f && edge_goal > 0.f) {
+                float st = fmaxf(.6f, edge_goal * scale / 2.5f);
+                k = clampf(s / st, 1.f, 16.f);
+              }
+              k = fminf(k, s / .32f);
               float sp_dbg = -1.f, off0r = 0.f, off1r = 0.f,
                     bstep = ab_b;
               for (int c = 0; c < 4; c++) {
@@ -3108,15 +3129,45 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                     float f = att > .20 ? (float)(1.0 / att) : 5.f;
                     if (f < 1.f)
                       f = 1.f;
-                    if (f > 2.25f)
-                      f = 2.25f; /* deep washouts want the full 1/att,
-                                  but past ~2.25x the spatial -- not
-                                  value -- window-membership error (
-                                  +-1 px on a washed skirt) swings the
-                                  recovery by more than a source
-                                  quantisiation step, and the
-                                  consensus polish smears that into a
-                                  neon band outside narrow lines */
+                    /* v4.9.4 accumulate-mass: recovering CONTRAST by
+                       1/att is not enough for a narrow washed feature
+                       -- the blurred deficit area observed across the
+                       flank pair spans ~(wsrc+2.83*sig), but the final
+                       k-steepened ramp repays it over only
+                       ~2.83*sig/k, so the stroke comes back short of
+                       ink by exactly that width ratio (the -r 6 smiley
+                       mouth settled ~13% under source ink = the
+                       user's "watercolor").  The mass-equal depth is
+                       ~ (k/att) * wsrc/(wsrc+2.83*sig): it boosts
+                       only genuinely narrow features (q -> 1 satura-
+                       tion for wide ones is suppressed by the att-
+                       gate: a wide flanked edge's interior is already
+                       sampled at its true colour, 1/att ~ 1 there),
+                       and it pays the deblur-phase debt back INTO the
+                       proven interior plateau (which the source-range
+                       clamp keeps inside measured colours). */
+                    {
+                      float sigq = (float)sig,
+                            attc = (float)att > .2f ? (float)att : .2f,
+                            q = wsrc / (wsrc + 2.828f * sigq);
+                      float fms = fminf(k, 8.f) / attc * q;
+                      fms = 1.f + (fms - 1.f) *
+                                  ss01((.85f - (float)att) * (1.f / .35f));
+                      if (fms > f)
+                        f = fms;
+                    }
+                    if (f > 4.f)
+                      f = 4.f; /* the gates (coherence, extremum +
+                                direction consistency, base-model
+                                saturation membership uf0/uf1 and
+                                value-membership gInn) proved this is
+                                the feature's interior, so the full
+                                1/att depth is safe to CLAIM; the
+                                missing ink on blurred line art is
+                                proportional to 1/att, and capping at
+                                2.25 left -r 6 strokes ~13% ink short
+                                (watercolor).  The source-range clamp
+                                below is still the hard guard */
                     f = 1.f + (f - 1.f) * ss01((coh - .85f) * (1.f / .15f));
                     if (f <= 1.001f)
                       continue;
@@ -3157,7 +3208,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                      weight (independent of the erf-tail trust gate:
                      tent-shaped line profiles misfit the erf ramp
                      while their PLATEAU is still measured solid) */
-                  wS2 = .9f;
+                  wS2 = 1.f;
                   /* feature membership BY VALUE for the pass-1.5
                      gate: how far the pixel's own BASE colour sits
                      from the inner (this side) plateau relative to
@@ -3280,23 +3331,9 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                                   "step[%.3f..%.3f]\n",
                           x, y, cov, rmin, rmax, ab_a, ab_a + ab_b);
               }
-              /* Steepness: -g pins k exactly (float, up to 64); -e
-                 adapts per edge; -s formula otherwise; always capped so
-                 the OUTPUT ramp never falls below .6 px sigma
-                 (~1.5 px 30% width): no re-aliased sawtooth, and
-                 already-crisp content is left alone (k -> 1). */
-              float k = kbase;
-              if (deblur_steepness <= 0.f && edge_goal > 0.f) {
-                float st = fmaxf(.6f, edge_goal * scale / 2.5f);
-                k = clampf(s / st, 1.f, 16.f);
-              }
-              /* v4.9.3: a MANUAL -g buys a sharper floor (.45 px instead
-                 of .6): the user explicitly takes responsibility for the
-                 ramp width; auto steepness stays at the proven alias-
-                 free .6.  Either way the EFFECTIVE k is reported (it was
-                 the "ignoring parameters" lie: summary echoed 64 while
-                 the cap silently rendered ~7). */
-k = fminf(k, s / .6f);
+              /* Steepness k is decided right after the profile fit
+                 (v4.9.4 hoist: the amplitude restoration's mass-
+                 correct depth needs it); comment block lives there. */
               /* Anchored evaluation (v4.8): the steepened fit is
                  evaluated at the pixel's GEOMETRIC position on the
                  normal (t = 0), and the pixel's own residual to the
@@ -3645,7 +3682,7 @@ k = fminf(k, s / .6f);
           float st = fmaxf(.6f, edge_goal * scale / 2.5f);
           k = clampf(s / st, 1.f, 16.f);
         }
-        k = fminf(k, s / .6f);
+        k = fminf(k, s / .32f);
         /* v4.9.3 effective-k bookkeeping (the report used to echo the
            REQUESTED steepness even when the sawtooth cap replaced it
            almost everywhere -- "ignoring parameters"). */
@@ -3666,13 +3703,32 @@ k = fminf(k, s / .6f);
            so only model-u separates the interior from the rim;
            without this the offset paints a neon band +-1.5 flanks
            wide around narrow lines. */
-        float uf0 = 1.f - ss01((ufit0 - .13f) * (1.f / .14f));
-        float uf1 = ss01((ufit0 - .87f) * (1.f / .14f));
         if (method == 2 && k > 1.f)
           nu = phi1(z0 + (ufit0 - .5f) * (k - 1.f) * 1.5f);
         else
           nu = phi1(k * z0);
         nu = clampf(nu, 0.f, 1.f);
+        /* saturation membership: the BASE (unremapped) model must
+           still place the pixel on this side's plateau before the
+           restored plateau may be claimed for it -- nu cannot do this
+           job: phi1(k*z0) saturates at |z0| > ~2.5/k, so it reads
+           "plateau" BOTH 4 px inside a stroke and 4 px outside the
+           edge (v4.9.4 experiment: nu-based membership painted the
+           washed skirt black, diagline MAE 13.7 -> 17.6).  The
+           unsteepened ufit0 keeps the SIDE truth.  Gate centre
+           lowered .78 -> CELUP_UFM (default .65, scanned below): a
+           narrow -r 6 line's interior pixels stop at ufit0 ~ .6-.9
+           (the whole stroke is ~2.9 sigma wide), and the .78 centre
+           paid only the dead-centre sliver -- the proven interior
+           stayed at the attenuated plateau (watercolor).  The halo
+           guard on the bright outer side is the value-membership
+           gInn, measured on the pixel's own base colour. */
+#ifndef CELUP_UFM
+#define CELUP_UFM .70f
+#endif
+        float uf0 = 1.f - ss01((ufit0 - (1.f - CELUP_UFM)) *
+                               (1.f / .20f));
+        float uf1 = ss01((ufit0 - CELUP_UFM) * (1.f / .20f));
         float *dd = DEL + 4 * idx;
         float c0blo_dbg = -1.f;
         /* v4.9.3: widen the local colour hull by the CONSENSUS
@@ -3735,10 +3791,25 @@ k = fminf(k, s / .6f);
              restoration runs on its own smooth confidence w2v (the
              erf tail misfit of tent-shaped line cores used to gate
              the plateau away pixel-by-pixel = barcode teeth) */
+          float vr = w2v * gInn;
+          /* v4.9.4: at a pixel that every gate independently places
+             DEEP inside a proven washed feature, replace the smeared
+             consensus weight with full restoration: w2v is a blurred
+             confidence (max ~0.5-0.7 in firing zones) and paid only
+             ~60% of the proven depth back -- the -r 6 smiley strokes
+             stopped at ~215/255 ink (watercolor).  Where the base
+             model's own saturation puts the pixel squarely on this
+             side's plateau (nu ~ 0/1, uf ~ 1) and the value gate
+             agrees (gInn > .6), fire the proven offset at full
+             strength instead (still no weight when any gate is
+             partial, so rims/skirts keep the diluted path). */
+          if (nu < .02f && uf0 > .98f && gInn > .6f)
+            vr = gInn * uf0;
+          if (nu > .98f && uf1 > .98f && gInn > .6f)
+            vr = gInn * uf1;
           float v = clampf(o[c] + w * ((nu - ufit0) * d2[c]) +
-                               w2v * gInn *
-                                   (uf0 * (1.f - nu) * off0e[c] +
-                                    uf1 * nu * off1e[c]),
+                               vr * (uf0 * (1.f - nu) * off0e[c] +
+                                     uf1 * nu * off1e[c]),
                            blo, bhi);
           dd[c] += v - o[c];
         }
@@ -5529,7 +5600,7 @@ static uint8_t *slurp(const char *name, size_t *n) {
 static void print_help(const char *argv0) {
   printf(
       "celup_lab -- premultiplied-linear WebP upscaler (research build "
-      "v4.9.3)\n"
+      "v4.9.4)\n"
       "\n"
       "Usage: %s in.webp out.webp SCALE [options]\n"
       "  SCALE is the upsampling factor, real number in (1,32] "
