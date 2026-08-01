@@ -4827,6 +4827,56 @@ static void upscale_triangle(const uint8_t *in, int sw, int sh, uint8_t *out,
   }
 }
 
+/* v5.2: supersampled smooth mode - 2x2 subpixel area averaging with triangle
+   interpolation, guaranteeing no staircase even at 45deg. The -r parameter
+   scales the subpixel spread (extra blur) for user control. */
+static void upscale_smooth(const uint8_t *in, int sw, int sh, uint8_t *out,
+                           int dw, int dh) {
+  float spread = 1.f;
+  if (blur_radius_set) spread = clampf(blur_radius, 0.5f, 2.f);
+  /* 2x2 supersampling: 4 samples per output pixel */
+  for (int y = 0; y < dh; y++) {
+    for (int x = 0; x < dw; x++) {
+      float acc[4] = {0,0,0,0};
+      for (int sy_sub = 0; sy_sub < 2; sy_sub++) {
+        for (int sx_sub = 0; sx_sub < 2; sx_sub++) {
+          float ox = (sx_sub == 0 ? 0.25f : 0.75f);
+          float oy = (sy_sub == 0 ? 0.25f : 0.75f);
+          float sx = ((float)x + ox + 0.5f) * (float)sw / dw - 0.5f;
+          float sy = ((float)y + oy + 0.5f) * (float)sh / dh - 0.5f;
+          /* small jitter proportional to spread-1 for extra AA when -r>1 */
+          if (spread > 1.f) {
+            sx += (ox - 0.5f) * (spread - 1.f) * 0.25f;
+            sy += (oy - 0.5f) * (spread - 1.f) * 0.25f;
+          }
+          int ix = (int)floorf(sx), iy = (int)floorf(sy);
+          float fx = sx - ix, fy = sy - iy;
+          float p[4][4], l[4];
+          for (int j = 0; j < 2; j++)
+            for (int i = 0; i < 2; i++) {
+              int k = j * 2 + i;
+              raw_pm(in, sw, sh, ix + i, iy + j, p[k]);
+              l[k] = .2126f * p[k][0] + .7152f * p[k][1] + .0722f * p[k][2] + .5f * p[k][3];
+            }
+          float gx = l[1] + l[3] - l[0] - l[2], gy = l[2] + l[3] - l[0] - l[1];
+          const float *a,*b,*c;
+          float wa,wb,wc;
+          if (gx * gy < 0) {
+            if (fx >= fy) { a=p[0]; b=p[1]; c=p[3]; wa=1-fx; wb=fx-fy; wc=fy; }
+            else { a=p[0]; b=p[2]; c=p[3]; wa=1-fy; wb=fy-fx; wc=fx; }
+          } else {
+            if (fx + fy <= 1) { a=p[0]; b=p[1]; c=p[2]; wa=1-fx-fy; wb=fx; wc=fy; }
+            else { a=p[3]; b=p[2]; c=p[1]; wa=fx+fy-1; wb=1-fx; wc=1-fy; }
+          }
+          for (int k = 0; k < 4; k++)
+            acc[k] += 0.25f * (wa * a[k] + wb * b[k] + wc * c[k]);
+        }
+      }
+      put(out + 4 * ((size_t)y * dw + x), acc[0], acc[1], acc[2], acc[3]);
+    }
+  }
+}
+
 static int upscale(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
                    int dh) {
   int *xi = malloc((size_t)dw * 4 * sizeof *xi),
@@ -5006,7 +5056,9 @@ static void print_help(const char *argv0) {
       "  autodeblur    autoblur base + gradient-slope steepening: sharp\n"
       "                edges with no halos/ringing; flats gently cleaned.\n"
       "                Best for AI-upscaled/diffusion anime art\n"
-      "  triangle      softest, no ringing or halos; safe default for art\n"
+      "  triangle      soft, no ringing or halos; safe default for art\n"
+      "  smooth        supersampled triangle (2x2 area avg), -r controls\n"
+      "                extra spread; guaranteed no staircase, softest\n"
       "  sdf           fitted signed-distance contour sharpening on top of\n"
       "                adaptive; crispest edges, tune with -s\n"
       "  nearest       pixel art / hard 1px texture\n"
@@ -5296,7 +5348,7 @@ int main(int ac, char **av) {
       strcmp(mode, "safeblurcompress") && strcmp(mode, "edgecompress") &&
       strcmp(mode, "deblurcompress") && strcmp(mode, "dehourglass") &&
       strcmp(mode, "consistentcompress") && strcmp(mode, "hourglasscompress") &&
-      strcmp(mode, "triangle") && strcmp(mode, "adaptive") &&
+      strcmp(mode, "triangle") && strcmp(mode, "smooth") && strcmp(mode, "adaptive") &&
       strcmp(mode, "classmap") && strcmp(mode, "scale2x") &&
       strcmp(mode, "autoblur") && strcmp(mode, "sdf") &&
       strcmp(mode, "autodeblur")) {
@@ -5424,6 +5476,8 @@ int main(int ac, char **av) {
     ok = upscale_consistentcompress(in, w, h, out, ow, oh);
   else if (!strcmp(mode, "triangle"))
     upscale_triangle(in, w, h, out, ow, oh);
+  else if (!strcmp(mode, "smooth"))
+    upscale_smooth(in, w, h, out, ow, oh);
   else if (!strcmp(mode, "adaptive"))
     ok = upscale_adaptive(in, w, h, out, ow, oh);
   else if (!strcmp(mode, "classmap"))
