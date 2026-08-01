@@ -38,6 +38,48 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
+## v4.9.5: accumulate-mass depth (colours are reconcentrated, never invented) + dip-core tent
+
+User's report on v4.9.4: colour restore visibly better, **but** "miya
+mouth vertically doubled" and "line tips are rounded too much ... no
+deblur that would preserve shapes".
+
+- **Root cause of the doubling** (measured at the miya mouth): a
+  2-3 px lip structure (true depth ~130-170 on a ~19 skin field) was
+  claimed by v4.9.4's `1/att` saturation logic as a **pure-black**
+  dip (f -> 4 cap), and the two flank frames paid their claims as
+  two black rails with a bright seam at the dip centre, where
+  neither side's saturation gate applies.
+- **Root cause of the invented black**: `1/att` assumes every washed
+  dip is a saturated feature seen through blur.  The honest ledger
+  is MASS: blur conserves the colour deficit, so the restored depth
+  must satisfy `depth*(wsrc + 2.83*sig)` =
+  `depth'*(wsrc + 2.83*sig/k)`, pinning the multiplier at
+  `f = k*(wsrc+t)/(k*wsrc+t)`, t = 2.83*sig.  Self-limiting by
+  construction: shallow wide washes keep ~their own level, point
+  lines get ~k (full reconcentration), wide features get f -> 1.
+  Smiley line art (clamped at native black) keeps the v4.9.4 gains
+  (ink .912 -> **.914**, darkmean 223); the miya mouth renders at
+  ~163/173 of its true depth as ONE stroke; the 45-level diagline
+  probe sits at 15.3 vs 13.7 base (GT asks full-black recovery from
+  a half-px blur -- the mass model declines to hallucinate ink).
+- **Dip-core tent**: when BOTH sides' flank-pair restoration passes
+  its extremum tests (the proven geometry of a narrow dip), the
+  centre of the dip (ufit ~ .5, no side-gate coverage) is paid the
+  conservative same-sign component of the two offsets.
+- **Tip entry**: below the .85 coherence gate, flank pairs are now
+  admitted when their outer levels agree (both arms exit to the same
+  surround = genuine dip or wedge tip; T-junction arms pair unequal
+  outsides and stay rejected), discounted toward coh .3.  This
+  repairs brow/lash taper ends.  **Open**: at a sharp cusp apex the
+  lobe map reads NL=1 (single edge), so no flank-pair machinery can
+  fire and the apex keeps the blurred base (spikes dome ~3-4 out px
+  short of their point) -- preserving true cusps needs a dedicated
+  radial/tip class, tracked for the next iteration.
+- Gates: check_stairs (ship2x jump95 .263 -> **.089**), check_corners
+  (hull/tip/width/glow .977), test_scales incl. miya face sweep: all
+  green.
+
 ## v4.9.4: accumulate-mass deblur -- stroke interiors filled, membership gate recentered
 
 User's complaint: autodeblur **"water colors, produce halo. it
