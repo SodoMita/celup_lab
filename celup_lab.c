@@ -4756,6 +4756,123 @@ static void upscale_triangle(const uint8_t *in, int sw, int sh, uint8_t *out,
  * pixel art. */
 
 
+/* ---------------------------------------------------------------------------
+   Jinc2-Bilateral (Hyllian 2025) -- faithful CPU port.
+
+   This is the jinc2-bilateral-xbr.slang filter: a windowed-jinc 2-lobe
+   reconstruction (space domain) multiplied by a *bilateral* (range-domain)
+   weight that compares each source texel's luma to a guide reconstruction
+   of the output pixel, followed by an anti-ringing clamp to the central 2x2
+   source cell.
+
+     wa = WA*pi, wb = WB*pi   (WA=0.5, WB=0.88: best 2-lobe jinc approx)
+     resampler(d) = sin(d*wa)*sin(d*wb)/(d*d)
+     I(A,B)       = lanczos( luma(|A-B|)*STR + dt, 2 )     (range weight)
+     weight       = resampler(dist) * I(guide, texel)
+     color        = sum(weight * texel) / sum(weight)
+     color        = mix(color, clamp(color, min4(c11,c21,c12,c22),
+                                      max4(c11,c21,c12,c22)), AR)
+
+   Working in the lab's premultiplied-linear RGBA space keeps it consistent
+   with every other mode (and the metrics are computed in that space).  The
+   bilateral term suppresses cross-edge bleed/ringing by downweighting texels
+   on the far side of an edge; the anti-ringing clamp bounds the output to
+   locally observed colours, so no overshoot is possible.  STR (bilateral
+   strength) and AR (anti-ringing) can be tuned via the CELUP_J2B_STR /
+   CELUP_J2B_AR env vars (default 1.0, 1.0 -- the shader defaults).  -s can
+   optionally raise bilateral strength: STR = 1 + (strength-1)*0.05.
+--------------------------------------------------------------------------- */
+static float j2b_sinc(float x) {
+  x = fabsf(x);
+  if (x < 1e-6f)
+    return 1.f;
+  float p = CELUP_PI * x;
+  return sinf(p) / p;
+}
+static float j2b_lanczos(float x, float a) {
+  return j2b_sinc(x) * j2b_sinc(x / a);
+}
+static float j2b_luma(const float c[4]) {
+  return .2126f * c[0] + .7152f * c[1] + .0722f * c[2] + .35f * c[3];
+}
+static float j2b_resampler(float x, float wa, float wb) {
+  /* sin(x*wa)*sin(x*wb)/(x*x) with the x->0 limit wa*wb. */
+  if (x < 1e-6f)
+    return wa * wb;
+  return sinf(x * wa) * sinf(x * wb) / (x * x);
+}
+static void upscale_jinc2_bilateral(const uint8_t *in, int sw, int sh,
+                                    uint8_t *out, int dw, int dh) {
+  const float WA = .5f, WB = .88f;
+  float wa = WA * CELUP_PI, wb = WB * CELUP_PI;
+  float STR = 1.0f, AR = 1.0f;
+  if (compress_strength > 1.f)
+    STR = 1.f + (compress_strength - 1.f) * .05f; /* -s gently raises STR */
+  {
+    const char *e = getenv("CELUP_J2B_STR");
+    if (e)
+      STR = strtof(e, NULL);
+    e = getenv("CELUP_J2B_AR");
+    if (e)
+      AR = strtof(e, NULL);
+  }
+  float xscale = (float)sw / dw, yscale = (float)sh / dh;
+  for (int y = 0; y < dh; y++) {
+    float sy = (y + .5f) * yscale - .5f;
+    int iy = (int)floorf(sy);
+    float fy = sy - iy;
+    for (int x = 0; x < dw; x++) {
+      float sx = (x + .5f) * xscale - .5f;
+      int ix = (int)floorf(sx);
+      float fx = sx - ix;
+      float guide[4];
+      bilinear_cell_pm(in, sw, sh, ix, iy, fx, fy, guide);
+      float c[4][4][4], wsum = 0.f, acc[4] = {0.f, 0.f, 0.f, 0.f};
+      float glum = j2b_luma(guide);
+      for (int j = 0; j < 4; j++)      /* source y = iy-1+j */
+        for (int i = 0; i < 4; i++) {  /* source x = ix-1+i  */
+          int px = ix - 1 + i, py = iy - 1 + j;
+          raw_pm(in, sw, sh, px, py, c[j][i]);
+          float dx = sx - (float)px, dy = sy - (float)py;
+          float dist = sqrtf(dx * dx + dy * dy);
+          float ws = j2b_resampler(dist, wa, wb);
+          float wr = j2b_lanczos(fabsf(glum - j2b_luma(c[j][i])) * STR + 1e-5f,
+                                 2.0f);
+          float ww = ws * wr;
+          wsum += ww;
+          for (int ch = 0; ch < 4; ch++)
+            acc[ch] += ww * c[j][i][ch];
+        }
+      float q[4];
+      if (wsum > 1e-12f) {
+        float inv = 1.f / wsum;
+        for (int ch = 0; ch < 4; ch++)
+          q[ch] = acc[ch] * inv;
+      } else
+        for (int ch = 0; ch < 4; ch++)
+          q[ch] = guide[ch];
+      /* Anti-ringing clamp to the central 2x2 source cell. */
+      {
+        float lo[4] = {1e30f, 1e30f, 1e30f, 1e30f},
+              hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
+        for (int j = 1; j <= 2; j++)
+          for (int i = 1; i <= 2; i++)
+            for (int ch = 0; ch < 4; ch++) {
+              if (c[j][i][ch] < lo[ch])
+                lo[ch] = c[j][i][ch];
+              if (c[j][i][ch] > hi[ch])
+                hi[ch] = c[j][i][ch];
+            }
+        for (int ch = 0; ch < 4; ch++) {
+          float cl = q[ch] < lo[ch] ? lo[ch] : (q[ch] > hi[ch] ? hi[ch] : q[ch]);
+          q[ch] = cl * AR + q[ch] * (1.f - AR);
+        }
+      }
+      put(out + 4 * ((size_t)y * dw + x), q[0], q[1], q[2], q[3]);
+    }
+  }
+}
+
 /* xBR pixel art upscaler (simpler than xBRZ).
  * Supports integer scale factors 2, 3, 4. */
 static int upscale_xbr(const uint8_t *in, int sw, int sh, uint8_t *out,
@@ -4967,6 +5084,10 @@ static void print_help(const char *argv0) {
       "                integer scale 2..6, sharp corners, no halos\n"
       "  xbr           Hyllian xBR: simpler cellular-automata pixel-art upscaler;\n"
       "                integer scale 2..4, sharp corners, no halos\n"
+      "  jinc2_bilateral  Hyllian Jinc2-Bilateral: windowed-jinc 2-lobe +\n"
+      "                bilateral edge-preserving reconstruction (any scale);\n"
+      "                low ringing / hourglass, smooth diagonals\n"
+      "  superxbr      Super XBR reference (this build: jinc2-bilateral)\n"
       "\n"
       "Modes -- other (accepted, but expect artifacts on art):\n"
       "  bilinear cubic mitchell lanczos2 lanczos3 blur\n"
@@ -5394,6 +5515,12 @@ int main(int ac, char **av) {
     ok = upscale_autodeblur(in, w, h, out, ow, oh);
   else if (!strcmp(mode, "sdf"))
     ok = upscale_sdf(in, w, h, out, ow, oh);
+  else if (!strcmp(mode, "jinc2_bilateral"))
+    upscale_jinc2_bilateral(in, w, h, out, ow, oh);
+  else if (!strcmp(mode, "superxbr"))
+    /* Super XBR reference: jinc2-bilateral refinement.  The launcher calls it
+       at any scale; the faithful single-pass jinc2-bilateral port is used. */
+    upscale_jinc2_bilateral(in, w, h, out, ow, oh);
   else if (!strcmp(mode, "xbr")) {
     /* xBR only supports integer scales 2..4; fall back to bilinear otherwise. */
     int f = (int)(scale + 0.5f);
