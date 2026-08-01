@@ -3977,76 +3977,85 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
            lands on the next stroke's ramp: no same-side saturation),
            and dark interiors are untouched (core depth is the
            restoration terms' job). */
-        float wpeel = 0.f, atap[4] = {0, 0, 0, 0};
+        float wpeel = 0.f, atap[4] = {0, 0, 0, 0}, lvlT = 0.f;
 #ifndef CELUP_NOPEEL_ENV
         {
           static int nopeel = -1;
           if (nopeel < 0)
             nopeel = getenv("CELUP_NOPEEL") != NULL;
-          /* v4.9.6 skirt transport.  The moment-fit s underreads the
-             true composite blur ~2.5x at -r >= 4 ("sigma 6 reads as
-             2.5"), so the steepened model saturates before the tail
-             ends: the anchored removal stops being paid exactly
-             where the long blur skirt lives (the halo), and across
-             the wash trough it even saturates DARK at truly bright
-             pixels.  Cleanup is licensed by the pixel's OWN model
-             (no independent tap fit -- at 2.6s distance there often
-             is none): where the model claims plateau saturation,
-             the colour observed ~2.6s farther along the normal is a
-             sample of the same claimed plateau.  Value does the
-             guarding: bright-plateau claims (nu > .88) may pull only
-             toward taps that do not darken along the step; deep
-             dark-interior claims (nu < .12) MORE than 1.2s past the
-             fitted contour (wash trough, not rim: rim pixels sit
-             |z0| < ~1 and wide-ink interiors never find a brighter
-             tap) may pull only toward strictly brighter taps.
-             Targets are neighbourhood observations (nothing
-             invented; hull clamp after), so seams between close
-             strokes that offer no clean plateau simply never fire. */
+          /* v4.9.7: own-line plateau transport replaces the v4.9.6
+             tap transport.  v4.9.6 pulled saturated-claim pixels
+             toward the RAW colours sampled +-2.6s along the normal;
+             tap averages are not the pixel's own asymptote, so
+             bright-plateau pixels near strokes were dragged to a
+             mid-gray tap mean -> a smooth black ring hugging every
+             stroke's OUTER flank (miya mouth, smiley outline).  Same
+             probes, new discipline: a probe must (a) REACH the
+             pixel's own model plateau projection along d2
+             (existence-of-plateau test: cancels between close
+             strokes and inside real gradients where no plateau is
+             within tail distance) and (b) be strictly BRIGHTER along
+             d2.  The colour then moves strictly along the pixel's
+             OWN step line: atap = o + pv*.d2/|d2|, so foreign hues
+             can never bleed in and the target can never sit below
+             the claimed asymptote -- no darkening, no halo; the
+             level is capped near the observed plateau and the hull
+             clamp bounds the rest.  Bright branch (nu > .88) keeps
+             v4.9.6 semantics. */
           float satb = ss01((nu - .88f) * (1.f / .09f));
-          /* dark branch gates: saturated dark claim (nu < .12) FAR
-             past the fitted contour (|z0| > 1.2 sigma: the trough,
-             not the rim) AND value far from the proven washed inner
-             level (inn < .6 -- inn alone separates the fog (inn ~
-             .45) from the ink rim (inn > .7) even at -r 6 wash
-             compression; cutting on inn rather than gInn keeps the
-             .5/.3 ss01 gate's own shape out of the geometry). */
+          /* trough branch (v4.9.7b): ownership by the UNSTEEPENED
+             model position.  True ink-fills saturate the base
+             profile (ufit0 ~ 0) while the wash trough reads
+             .1-.4 -- without the floor the brightening fired deep
+             inside fat ink fills.  The wider ufit0-window variant
+             (any model-mid pixel treated as trough) bleached thin
+             strokes and reopened the halo class; keep the measured
+             v4.9.7c/d gates. */
           float satd = ss01((.12f - nu) * (1.f / .06f)) *
+                       ss01((ufit0 - .06f) * (1.f / .12f)) *
                        ss01((-z0 - 1.2f) * (1.f / .6f)) *
                        ss01((.60f - inn_) * (1.f / .15f)) *
                        ss01((s - 2.f) * (1.f / 2.f));
           float sat = satb > satd ? satb : satd;
           if (!nopeel && w > .04f && sat > .02f) {
             float nax = pf[9], nay = -pf[8];
-            float accw = 0.f;
+            float Ld2 = 1e-9f;
+            for (int c = 0; c < 4; c++)
+              Ld2 += d2[c] * d2[c];
+            float Ld = sqrtf(Ld2);
+            float pvmin = (1.f - ufit0) * Ld - .03f;
+            float best = 0.f, okm = 0.f;
             float dist = clampf(2.6f * s, 5.f, 20.f);
             for (int sgn = -1; sgn <= 1; sgn += 2) {
-              float tx = (float)x + (float)sgn * dist * nax,
-                    ty = (float)y + (float)sgn * dist * nay, qa[4];
-              float pv = 0.f, nn_ = 0.f;
-              sample_f4(A, dw, dh, tx, ty, qa);
-              for (int c = 0; c < 4; c++) {
+              float qa[4], pv = 0.f;
+              sample_f4(A, dw, dh, (float)x + (float)sgn * dist * nax,
+                        (float)y + (float)sgn * dist * nay, qa);
+              for (int c = 0; c < 4; c++)
                 pv += (qa[c] - o[c]) * d2[c];
-                nn_ += d2[c] * d2[c];
+              pv /= Ld2;
+              float ok = ss01((pv * Ld - pvmin) * (1.f / .06f));
+              pv *= Ld;
+              if (pv < .015f)
+                ok = 0.f; /* strictly brighter plateau along d2 only */
+              if (ok > 1e-3f && pv > best) {
+                best = pv;
+                okm = ok;
               }
-              pv = nn_ > 1e-9f ? pv / sqrtf(nn_) : 0.f;
-              float ok = satd > satb
-                             ? ss01((pv - .015f) * (1.f / .03f))
-                             : ss01((pv + .002f) * (1.f / .03f));
-              if (ok < 1e-3f)
-                continue;
-              for (int c = 0; c < 4; c++)
-                atap[c] += ok * qa[c];
-              accw += ok;
-              if (ok > wpeel)
-                wpeel = ok;
             }
-            if (accw > 1e-6f) {
+            if (okm > 1e-3f) {
+              /* target = own step line lifted to the observed plateau
+                 level pv* (bounded by the hull clamp afterwards);
+                 payment scales with how far the plateau sits above
+                 the model's own claim. */
+              if (best > (1.f - ufit0) * Ld)
+                best = (1.f - ufit0) * Ld + .35f * (best - (1.f - ufit0) * Ld);
+              if (best > 1.05f * Ld)
+                best = 1.05f * Ld;
               for (int c = 0; c < 4; c++)
-                atap[c] /= accw;
-              wpeel = wpeel * w * sat;
-            } else
-              wpeel = 0.f;
+                atap[c] = o[c] + best * d2[c] / Ld;
+              lvlT = best;
+              wpeel = w * sat * okm;
+            }
           }
         }
 #endif
@@ -5956,7 +5965,7 @@ static uint8_t *slurp(const char *name, size_t *n) {
 static void print_help(const char *argv0) {
   printf(
       "celup_lab -- premultiplied-linear WebP upscaler (research build "
-      "v4.9.6)\n"
+      "v4.9.7)\n"
       "\n"
       "Usage: %s in.webp out.webp SCALE [options]\n"
       "  SCALE is the upsampling factor, real number in (1,32] "

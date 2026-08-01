@@ -1,5 +1,45 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.9.7 update (2026-08-01): v4.9.6 halo regression root-caused; overshoot-free transport
+
+- User regression report on v4.9.6: "black halo around miya mouth
+  that never existed; sharp black halos on the outer part of poor
+  smiley, similar to lanczos but bigger and smoother; be more
+  analytical -- derive a formula that steepens the gradient without
+  anything that could possibly overshoot."
+- Forensics: miya495-vs-496 diff mask lights up exactly along the
+  chin/mouth/collar contours (max darkening -50), smiley r6 diff is
+  a smooth dark ring around every stroke's OUTER flank (max -98).
+  Carrier = the v4.9.6 bright branch (satb): nu>.88 plateau claims
+  pulled toward tap averages that were slightly darker than the
+  local plateau.  Taps are not the pixel's own asymptote --
+  averaging foreign values into a plateau IS a halo generator.
+- v4.9.7 re-derives the skirt fix from the monotone-map theorem
+  (Phi(k Phi^-1 z) steepening, g:(0,1)->(0,1) monotone, never
+  exits the local range = never overshoots).  Probes survive only
+  as plateau-EXISTENCE tests (must reach the pixel's own model
+  plateau projection; must be strictly brighter along d2); colour
+  moves strictly along the pixel's OWN step line to the proven
+  plateau level -> brightening is the only possible direction.
+  Trough/ink split uses the unsteepened ufit0 (ink-fills 0, trough
+  .1-.4) after a wide-window variant bleached thin strokes
+  (halo 46.9 catastrophe, reverted).
+- Dead ends measured this round: bare asymptote completion
+  (residual keeps the wash pinned; only fired at saturation ->
+  halo 17.0); ufit0-window trough ownership (.06-.58 window
+  swallows thin-stroke rims); scalar pre-payment direction guard
+  (units matched but the outside darkening persisted -- root cause
+  class not worth keeping).
+- Scoreboard: r6 .951/16.25/30.4 (v495 .949/17.37/31.6, v496
+  .942/14.78/32.5); r2.3 .970/4.17/19.2 (v496 .971/3.35/16.1);
+  diagline 13.20 (best ever); outside-ink darkening frac ~0; gates
+  green; miya 4x mouth ring GONE (verified vs v495 frame).
+- Open: last ~1.5 halo units need the tail-calibrated sigma
+  (two-scale LS at the consensus level; also unblocks the parked
+  CELUP_DIP line class: its widths collapse to the point-line floor
+  in multi-feature troughs without it).  Cusp/radial tip class;
+  dense-hair multi-crossing gate policy; wand-smoke alpha fringe.
+
 # v4.9.6 update (2026-08-01): veil root-caused (s-underread) + skirt transport shipped
 
 - Trigger: external review of the miya/smiley sheets ("halos, mush,
