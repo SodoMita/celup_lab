@@ -52,6 +52,8 @@ MODES = [
     ("Adaptive auto", "celup_lab", "adaptive", ("--checker-policy", "auto")),
     ("Adaptive s2x", "celup_lab", "adaptive", ("--checker-policy", "scale2x")),
     ("SDF", "celup_lab", "sdf", ()),
+    ("MSDF (v4.9.3)", "celup_lab", "msdf", ()),
+    ("DSDF (v4.9.3)", "celup_lab", "dsdf", ()),
     ("Autoblur (auto)", "celup_lab", "autoblur", ()),
     ("Autodeblur (auto)", "celup_lab", "autodeblur", ()),
     ("autodeblur Smiley\n(-r 6 -s 100 -g 64 -D remap)", "celup_lab", "autodeblur",
@@ -290,7 +292,7 @@ def main():
             smiley_crop_panels.append((label, crop_im))
 
         sheet_smiley = make_grid_sheet(
-            "poor_smiley.webp 2x Upscale Comparison (512x512)", smiley_panels, cols=8
+            "poor_smiley.webp 2x Upscale Comparison (512x512)", smiley_panels, cols=6
         )
         sheet_smiley.save(SHEET_DIR / "poor_smiley_comparison.webp", lossless=True)
         print("   -> saved poor_smiley_comparison.png (.webp)")
@@ -298,7 +300,7 @@ def main():
         sheet_smiley_crop = make_grid_sheet(
             "poor_smiley.webp 2x Upscale Central Detail Crop (256x256)",
             smiley_crop_panels,
-            cols=8,
+            cols=6,
         )
         sheet_smiley_crop.save(SHEET_DIR / "poor_smiley_crop_comparison.webp", lossless=True)
         print("   -> saved poor_smiley_crop_comparison.png (.webp)")
@@ -317,7 +319,7 @@ def main():
         sheet_stair = make_grid_sheet(
             "Staircase Problem Comparison — 45° Line, 30° Line, Circle & L-Corner (8x Upscale of 48x48)",
             stair_panels,
-            cols=8,
+            cols=6,
         )
         sheet_stair.save(SHEET_DIR / "staircase_comparison.webp", lossless=True)
         print("   -> saved staircase_comparison.webp")
@@ -346,7 +348,7 @@ def main():
         sheet_diag45 = make_grid_sheet(
             "45° Diagonal Line Staircase Evaluation (tests/diagline48_src.webp 4x) — Quantitative Staircase Metrics",
             diag45_panels,
-            cols=8,
+            cols=6,
             label_h=66,
         )
         sheet_diag45.save(SHEET_DIR / "staircase_diag45_comparison.webp", lossless=True)
@@ -367,7 +369,7 @@ def main():
         sheet_cat_crop = make_grid_sheet(
             "cat.webp 2x Upscale Detail Crop (256x256 around eyes/whiskers)",
             cat_crop_panels,
-            cols=8,
+            cols=6,
         )
         sheet_cat_crop.save(SHEET_DIR / "cat_crop_comparison.webp", lossless=True)
         print("   -> saved cat_crop_comparison.webp")
@@ -387,7 +389,7 @@ def main():
         sheet_pika_crop = make_grid_sheet(
             "pikachu.webp 2x Upscale Line-Art Detail Crop (256x256 around vector contours)",
             pikachu_crop_panels,
-            cols=8,
+            cols=6,
         )
         sheet_pika_crop.save(SHEET_DIR / "pikachu_crop_comparison.webp", lossless=True)
         print("   -> saved pikachu_crop_comparison.webp")
