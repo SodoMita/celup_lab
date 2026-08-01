@@ -7,7 +7,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 EXE = ROOT / "celup_lab"
-SHEET_DIR = ROOT / "comparison_sheets"
+SHEET_DIR = ROOT / "images"
 SHEET_DIR.mkdir(exist_ok=True)
 
 # ensure env for libwebp

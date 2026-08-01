@@ -18,8 +18,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 ROOT = Path(__file__).resolve().parent
 EXE = ROOT / "celup_lab"
-EXAMPLE_DIR = ROOT / "examples"
-SHEET_DIR = ROOT / "comparison_sheets"
+EXAMPLE_DIR = ROOT / "images" / "examples"
+SHEET_DIR = ROOT / "images" / "comparison_sheets"
 S = 4
 N = 96
 Z = N * S

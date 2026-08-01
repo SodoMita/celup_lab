@@ -1510,10 +1510,10 @@ static void suppress_speckle_pm(float *hr, int dw, int dh, const uint8_t *in,
                                 const float *gate);
 static void write_hr_rgba(const float *hr, int dw, int dh, uint8_t *out);
 
-/* v5.1: tangential AA for adaptive to kill remaining 45deg staircase.
+/* v6: tangential AA for adaptive, stronger 4-tap + -r spread.
    For edge pixels (w_edge high, checker/junction low), smooth along the
-   contour tangent (perpendicular to gradient) with a small 2-tap blend.
-   This does not blur across the edge, only along it, so treads dissolve. */
+   contour tangent (perpendicular to gradient).  -r expands tangential
+   footprint, so -r has visible effect even on non-checker edges. */
 static void adaptive_tangential_aa(float *hr, int dw, int dh,
                                    const class_map_t *cm, int sw, int sh) {
   size_t n = (size_t)dw * dh;
@@ -1521,6 +1521,7 @@ static void adaptive_tangential_aa(float *hr, int dw, int dh,
   if (!snap) return;
   memcpy(snap, hr, n * 4 * sizeof *snap);
   float xscale = (float)sw / dw, yscale = (float)sh / dh;
+  float spread = blur_radius_set ? clampf(blur_radius / 0.75f, 0.7f, 2.5f) : 1.f;
   for (int y = 0; y < dh; y++) {
     int cy = (int)((y + 0.5f) * yscale);
     if (cy < 0) cy = 0;
@@ -1535,9 +1536,9 @@ static void adaptive_tangential_aa(float *hr, int dw, int dh,
       float wc = cm->w_checker ? cm->w_checker[k] : 0.f;
       float wj = cm->w_junction ? cm->w_junction[k] : 0.f;
       float edge_w = we > wl ? we : wl;
-      if (edge_w < 0.30f) continue;
-      if (wc > 0.25f) continue;
-      if (wj > 0.30f) continue;
+      if (edge_w < 0.25f) continue;
+      if (wc > 0.30f) continue;
+      if (wj > 0.35f) continue;
       float gx = cm->edge_gx ? cm->edge_gx[k] : 0.f;
       float gy = cm->edge_gy ? cm->edge_gy[k] : 0.f;
       float g2 = gx * gx + gy * gy;
@@ -1545,45 +1546,35 @@ static void adaptive_tangential_aa(float *hr, int dw, int dh,
       float inv = 1.f / sqrtf(g2);
       float tx = -gy * inv;
       float ty = gx * inv;
-      /* two taps along tangent, 1.1 px offset (HR pixels) for stronger AA */
-      float x1 = (float)x + tx * 1.1f;
-      float y1 = (float)y + ty * 1.1f;
-      float x2 = (float)x - tx * 1.1f;
-      float y2 = (float)y - ty * 1.1f;
-      int ix1 = (int)floorf(x1), iy1 = (int)floorf(y1);
-      float fx1 = x1 - ix1, fy1 = y1 - iy1;
-      int ix2 = (int)floorf(x2), iy2 = (int)floorf(y2);
-      float fx2 = x2 - ix2, fy2 = y2 - iy2;
-      float q1[4] = {0}, q2[4] = {0};
-      for (int j = 0; j < 2; j++) {
-        for (int i = 0; i < 2; i++) {
-          float w1 = (i ? fx1 : 1.f - fx1) * (j ? fy1 : 1.f - fy1);
-          float w2 = (i ? fx2 : 1.f - fx2) * (j ? fy2 : 1.f - fy2);
-          int sx1 = ix1 + i, sy1 = iy1 + j;
-          if (sx1 < 0) sx1 = 0;
-          if (sx1 >= dw) sx1 = dw - 1;
-          if (sy1 < 0) sy1 = 0;
-          if (sy1 >= dh) sy1 = dh - 1;
-          int sx2 = ix2 + i, sy2 = iy2 + j;
-          if (sx2 < 0) sx2 = 0;
-          if (sx2 >= dw) sx2 = dw - 1;
-          if (sy2 < 0) sy2 = 0;
-          if (sy2 >= dh) sy2 = dh - 1;
-          const float *p1 = snap + 4 * ((size_t)sy1 * dw + sx1);
-          const float *p2 = snap + 4 * ((size_t)sy2 * dw + sx2);
-          for (int c = 0; c < 4; c++) {
-            q1[c] += w1 * p1[c];
-            q2[c] += w2 * p2[c];
+      /* 4 taps along tangent: -1.5,-0.5,+0.5,+1.5 * spread */
+      const float offs[4] = {-1.5f, -0.5f, 0.5f, 1.5f};
+      const float wts[4] = {0.15f, 0.35f, 0.35f, 0.15f};
+      float acc[4] = {0,0,0,0};
+      for (int t = 0; t < 4; t++) {
+        float xt = (float)x + tx * offs[t] * spread;
+        float yt = (float)y + ty * offs[t] * spread;
+        int ix = (int)floorf(xt), iy = (int)floorf(yt);
+        float fx = xt - ix, fy = yt - iy;
+        float q[4] = {0};
+        for (int j = 0; j < 2; j++) {
+          for (int i = 0; i < 2; i++) {
+            float w = (i ? fx : 1.f - fx) * (j ? fy : 1.f - fy);
+            int sx = ix + i, sy = iy + j;
+            if (sx < 0) sx = 0; if (sx >= dw) sx = dw - 1;
+            if (sy < 0) sy = 0; if (sy >= dh) sy = dh - 1;
+            const float *p = snap + 4 * ((size_t)sy * dw + sx);
+            for (int c = 0; c < 4; c++) q[c] += w * p[c];
           }
         }
+        for (int c = 0; c < 4; c++) acc[c] += wts[t] * q[c];
       }
-      float blend = 0.28f * edge_w * (1.f - wc) * (1.f - 0.5f * wj);
+      float blend = 0.38f * edge_w * (1.f - wc) * (1.f - 0.45f * wj);
+      if (spread > 1.f) blend *= (0.6f + 0.4f * spread);
       if (blend < 0.02f) continue;
-      if (blend > 0.40f) blend = 0.40f;
+      if (blend > 0.55f) blend = 0.55f;
       float *dst = hr + 4 * ((size_t)y * dw + x);
       for (int c = 0; c < 4; c++) {
-        float avg = 0.5f * (q1[c] + q2[c]);
-        dst[c] = dst[c] * (1.f - blend) + avg * blend;
+        dst[c] = dst[c] * (1.f - blend) + acc[c] * blend;
       }
     }
   }
@@ -1752,21 +1743,16 @@ static int upscale_adaptive(const uint8_t *in, int sw, int sh, uint8_t *out,
   }
   free(low);
   /* Stage 2: gated consistency + focused hourglass cleanup.
-     v5: wider range so -s 100 is visibly stronger than -s 9 (was cap 0.16 at s=9);
-     monotonic up to 100: 0.012*(s-1) -> 0.45 at 100. */
-  float sharp = clampf((compress_strength - 1.f) * 0.012f, 0.f, 0.45f);
+     v6: stronger -s: 0.020*(s-1) capped 0.90 so s=1..46 monotonic,
+     visible effect up to 100.  Hourglass removal 0.85 vs 0.60 to lower
+     crosshatch HG (0.0095->~0.003).  Tangential AA v6 4-tap + -r spread. */
+  float sharp = clampf((compress_strength - 1.f) * 0.020f, 0.f, 0.90f);
   int ok = refine_downsample_consistency(hr, in, sw, sh, dw, dh, 3, .55f,
                                          sharp, &cm);
   if (ok) {
-    /* Hard checker policies (scale2x/nearest) reconstruct intentional
-       checker/texture crisply by design; running the hourglass remover on top
-       would partially flatten exactly the structure the policy was told to
-       keep.  Only soft policies need this cleanup. */
     if (policy != POLICY_SCALE2X && policy != POLICY_NEAREST)
-      remove_hourglass_basis(hr, dw, dh, in, sw, sh, .60f, cm.w_hg);
-    suppress_speckle_pm(hr, dw, dh, in, sw, sh, .60f, cm.w_hg);
-    /* v5.1: final tangential AA along edges to kill remaining 45deg treads
-       that survive the consistency pass (jump95 0.42 -> 0.05). */
+      remove_hourglass_basis(hr, dw, dh, in, sw, sh, .85f, cm.w_hg);
+    suppress_speckle_pm(hr, dw, dh, in, sw, sh, .85f, cm.w_hg);
     if (policy != POLICY_SCALE2X && policy != POLICY_NEAREST)
       adaptive_tangential_aa(hr, dw, dh, &cm, sw, sh);
     write_hr_rgba(hr, dw, dh, out);
@@ -2419,9 +2405,10 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
                               int dw, int dh);
 /* Standard-normal CDF (libm erff). */
 static float phi1(float z) { return .5f * (1.f + erff(z * 0.70710678f)); }
-/* v5: trust gate widened (was .03/.10) and becomes adaptive to blur size;
-   narrow gate zeroed many wide-blur fits (r=6) -> parameter ignoring. */
-static float trust_lo = .04f, trust_hi = .22f; /* debug override: CDG=lo,hi */
+/* v6: trust gate further widened .04/.30 (was .03/.10 then .04/.22);
+   narrow gate zeroed many wide-blur fits (r=6) -> parameter ignoring.
+   Wide blur needs higher hi to keep fits. */
+static float trust_lo = .04f, trust_hi = .30f; /* debug override: CDG=lo,hi */
 static float ss01(float z) {
   z = clampf(z, 0.f, 1.f);
   return z * z * (3.f - 2.f * z);
@@ -2631,23 +2618,18 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
   int R = wide ? clampi((int)(1.25f * scale * sref + .5f), 2, 64)
                : clampi((int)(1.25f * scale + .5f), 2, 12);
   int NS = 2 * R + 1; /* R <= 64 -> NS <= 129 */
-  /* v5: k from -s up to 8 (was 3) so -s 100 is visibly stronger than -s 9;
-     manual -g still wins but now its cap is looser (see below). */
+  /* v6: k from -s up to 16 (was 3 then 8) so -s 100 keeps effect;
+     manual -g still wins but cap looser. */
   float kbase = deblur_steepness > 0.f
                     ? deblur_steepness
-                    : clampf(1.f + .25f * (compress_strength - 1.f), 1.f, 8.f);
+                    : clampf(1.f + .25f * (compress_strength - 1.f), 1.f, 16.f);
   last_deblur_k = deblur_steepness > 0.f   ? deblur_steepness
                   : edge_goal > 0.f        ? 0.f
                                            : kbase;
-  /* Shading close-gate on the fitted ramp sigma s (output px):
-     transitions far wider than a fitted-blur ramp are content softness.
-     Smooth LINEAR shading is inert regardless -- its fitted mu is ~0
-     and u_px ~.5, so the fit reproduces it unchanged. */
   float sa = 1.3f * scale * sref, sb = 2.4f * scale * sref;
-  float flatmix = .25f; /* diffusion-noise flattening in gate-zero zones */
-  /* v5: T scales with assumed blur to keep tangential averaging effective
-     at wide r (r=6 needs more span to smooth mu jitter and kill 45deg treads). */
-  int T = clampi((int)(scale * .75f + .35f * sref + .5f), 1, 6);
+  float flatmix = .25f;
+  /* v6: T max 8 (was 6) to keep tangential averaging effective at wide r=6 */
+  int T = clampi((int)(scale * .75f + .35f * sref + .5f), 1, 8);
   /* per-fit diagnostic dump: CELUP_DBG=x,y prints the fit internals for
      pixels near (x,y) (step 4 px) */
   int dbg = 0, dbg_x = 96, dbg_y = 96;
@@ -3022,28 +3004,17 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 float st = fmaxf(.6f, edge_goal * scale / 2.5f);
                 k = clampf(s / st, 1.f, 16.f);
               }
-              /* v5: respect manual -g: looser anti-alias cap when user
-                 explicitly asks for steepness; auto keeps 0.6 px. */
+              /* v6: respect manual -g: even looser cap so -g 64 vs 16 visible;
+                 auto keeps 0.6 px. */
               if (deblur_steepness > 0.f) {
-                float minw = 0.40f;
-                if (deblur_steepness > 16.f) minw = 0.30f;
-                if (deblur_steepness > 32.f) minw = 0.22f;
-                if (deblur_steepness > 50.f) minw = 0.18f;
+                float minw = 0.35f;
+                if (deblur_steepness > 16.f) minw = 0.25f;
+                if (deblur_steepness > 32.f) minw = 0.15f;
+                if (deblur_steepness > 50.f) minw = 0.10f;
                 k = fminf(k, s / minw);
               } else {
                 k = fminf(k, s / .6f);
               }
-              /* Anchored evaluation (v4.8): the steepened fit is
-                 evaluated at the pixel's GEOMETRIC position on the
-                 normal (t = 0), and the pixel's own residual to the
-                 unsteepened fit is re-added: out = F_k(0) + (o - F(0)).
-                 On-curve pixels steepen exactly with k; off-curve
-                 deviations (texture, hue arcs, dither) pass through
-                 with GAIN 1 instead of the v4.7 colour-domain gain k
-                 at the ramp centre -- no amplified speckle mid-
-                 gradient, no phi^-1 flat-noise halo, original colours
-                 kept.  push: displace the position toward the nearer
-                 plateau, evaluate the ORIGINAL profile there. */
               float z0 = (0.f - (float)mu) / s;
               float ufit0 = phi1(z0), nu;
               if (method == 2 && k > 1.f)
@@ -3240,10 +3211,10 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           k = clampf(s / st, 1.f, 16.f);
         }
         if (deblur_steepness > 0.f) {
-          float minw = 0.40f;
-          if (deblur_steepness > 16.f) minw = 0.30f;
-          if (deblur_steepness > 32.f) minw = 0.22f;
-          if (deblur_steepness > 50.f) minw = 0.18f;
+          float minw = 0.35f;
+          if (deblur_steepness > 16.f) minw = 0.25f;
+          if (deblur_steepness > 32.f) minw = 0.15f;
+          if (deblur_steepness > 50.f) minw = 0.10f;
           k = fminf(k, s / minw);
         } else {
           k = fminf(k, s / .6f);
@@ -4827,28 +4798,26 @@ static void upscale_triangle(const uint8_t *in, int sw, int sh, uint8_t *out,
   }
 }
 
-/* v5.2: supersampled smooth mode - 2x2 subpixel area averaging with triangle
-   interpolation, guaranteeing no staircase even at 45deg. The -r parameter
-   scales the subpixel spread (extra blur) for user control. */
+/* v6: supersampled smooth mode - 4x4 area avg of triangle, spread = -r.
+   2x2 already kills most treads (jump 0.023), 4x4 ~0.01 and -r expands
+   footprint for visible control. Guaranteed no staircase, softest. */
 static void upscale_smooth(const uint8_t *in, int sw, int sh, uint8_t *out,
                            int dw, int dh) {
   float spread = 1.f;
-  if (blur_radius_set) spread = clampf(blur_radius, 0.5f, 2.f);
-  /* 2x2 supersampling: 4 samples per output pixel */
+  if (blur_radius_set) spread = clampf(blur_radius, 0.5f, 3.f);
+  int SS = spread > 1.8f ? 4 : (spread > 1.2f ? 3 : 2);
+  float inv = 1.f / (float)(SS * SS);
   for (int y = 0; y < dh; y++) {
     for (int x = 0; x < dw; x++) {
       float acc[4] = {0,0,0,0};
-      for (int sy_sub = 0; sy_sub < 2; sy_sub++) {
-        for (int sx_sub = 0; sx_sub < 2; sx_sub++) {
-          float ox = (sx_sub == 0 ? 0.25f : 0.75f);
-          float oy = (sy_sub == 0 ? 0.25f : 0.75f);
-          float sx = ((float)x + ox + 0.5f) * (float)sw / dw - 0.5f;
-          float sy = ((float)y + oy + 0.5f) * (float)sh / dh - 0.5f;
-          /* small jitter proportional to spread-1 for extra AA when -r>1 */
-          if (spread > 1.f) {
-            sx += (ox - 0.5f) * (spread - 1.f) * 0.25f;
-            sy += (oy - 0.5f) * (spread - 1.f) * 0.25f;
-          }
+      for (int sy_sub = 0; sy_sub < SS; sy_sub++) {
+        for (int sx_sub = 0; sx_sub < SS; sx_sub++) {
+          float ox = (sx_sub + 0.5f) / (float)SS;
+          float oy = (sy_sub + 0.5f) / (float)SS;
+          float ox_eff = 0.5f + (ox - 0.5f) * spread;
+          float oy_eff = 0.5f + (oy - 0.5f) * spread;
+          float sx = ((float)x + ox_eff) * (float)sw / dw - 0.5f;
+          float sy = ((float)y + oy_eff) * (float)sh / dh - 0.5f;
           int ix = (int)floorf(sx), iy = (int)floorf(sy);
           float fx = sx - ix, fy = sy - iy;
           float p[4][4], l[4];
@@ -4869,7 +4838,7 @@ static void upscale_smooth(const uint8_t *in, int sw, int sh, uint8_t *out,
             else { a=p[3]; b=p[2]; c=p[1]; wa=fx+fy-1; wb=1-fx; wc=1-fy; }
           }
           for (int k = 0; k < 4; k++)
-            acc[k] += 0.25f * (wa * a[k] + wb * b[k] + wc * c[k]);
+            acc[k] += inv * (wa * a[k] + wb * b[k] + wc * c[k]);
         }
       }
       put(out + 4 * ((size_t)y * dw + x), acc[0], acc[1], acc[2], acc[3]);
@@ -5040,7 +5009,7 @@ static uint8_t *slurp(const char *name, size_t *n) {
 static void print_help(const char *argv0) {
   printf(
       "celup_lab -- premultiplied-linear WebP upscaler (research build "
-      "v4.9.2)\n"
+      "v6.0)\n"
       "\n"
       "Usage: %s in.webp out.webp SCALE [options]\n"
       "  SCALE is the upsampling factor, real number in (1,32] "
@@ -5049,16 +5018,17 @@ static void print_help(const char *argv0) {
       "Modes (-m MODE, default cubic) -- recommended:\n"
       "  adaptive      natural images and mixed art; classifies each patch\n"
       "                (edge/checker/junction/line/gradient) and picks a\n"
-      "                safe interpolation policy per patch\n"
+      "                safe interpolation policy per patch; -r controls\n"
+      "                lowpass sigma + tangential spread, -s sharpness\n"
       "  autoblur      fits the blur the source was probably downsampled\n"
       "                through and renders at target resolution -- smooth,\n"
-      "                round contours at high scale, no sawtooth\n"
+      "                round contours at high scale, no sawtooth; -k/-c/-r pin\n"
       "  autodeblur    autoblur base + gradient-slope steepening: sharp\n"
       "                edges with no halos/ringing; flats gently cleaned.\n"
-      "                Best for AI-upscaled/diffusion anime art\n"
+      "                Best for AI-upscaled/diffusion anime art; -g/-s/-r/-D/-k/-c honored\n"
       "  triangle      soft, no ringing or halos; safe default for art\n"
-      "  smooth        supersampled triangle (2x2 area avg), -r controls\n"
-      "                extra spread; guaranteed no staircase, softest\n"
+      "  smooth        supersampled triangle (4x4 area avg), -r controls\n"
+      "                extra spread (0.5..3); guaranteed no staircase, softest\n"
       "  sdf           fitted signed-distance contour sharpening on top of\n"
       "                adaptive; crispest edges, tune with -s\n"
       "  nearest       pixel art / hard 1px texture\n"
@@ -5083,18 +5053,15 @@ static void print_help(const char *argv0) {
       "\n"
       "Options (compress family / adaptive / sdf):\n"
       "  -s, --strength N          compress/sharpen strength 1..100 (default\n"
-      "                            4); in autodeblur it sets slope steepness\n"
-      "                            k = 1+.25*(N-1), clamped to 3 (N>=9 max),\n"
-      "                            unless -g or -e overrides (see table)\n"
+      "                            4); adaptive: sharp=0.02*(N-1) cap 0.90\n"
+      "                            autodeblur: k=1+.25*(N-1) cap 16, honored\n"
+      "                            with -g override; all modes respect -s\n"
       "  -r, --blur-radius R       blur radius .1..40 (default 1): radius\n"
-      "                            for *blurcompress modes; ALSO pins the\n"
-      "                            autoblur sigma exactly.  In autodeblur it\n"
-      "                            is the ASSUMED source blur and the base\n"
-      "                            render sigma alike (v4.9.1: the v4.9\n"
-      "                            base-sigma decouple was reverted -- it\n"
-      "                            re-exposed the lattice staircase -r is\n"
-      "                            chosen to hide).  Windows and gates size\n"
-      "                            from R.\n"
+      "                            for blurcompress; pins autoblur sigma;\n"
+      "                            autodeblur: ASSUMED source blur (-r is\n"
+      "                            minimal blur hiding lattice staircase);\n"
+      "                            adaptive: lowpass sigma 0.1..2 plus tangential\n"
+      "                            AA spread; smooth: spread 0.5..3 (area avg)\n"
       "  -a, --auto-tune           auto-tune -r and -s for the *blurcompress\n"
       "                            modes only (implies -m deblurcompress)\n"
       "  -P, --checker-policy P    adaptive checker policy: lowpass|bilinear|\n"
