@@ -3004,13 +3004,14 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 float st = fmaxf(.6f, edge_goal * scale / 2.5f);
                 k = clampf(s / st, 1.f, 16.f);
               }
-              /* v6: respect manual -g: even looser cap so -g 64 vs 16 visible;
-                 auto keeps 0.6 px. */
+              /* v6.1: respect manual -g but tighter to suppress halo around gradient centres;
+                 wide blur (r=6) needs larger minw to avoid halo */
               if (deblur_steepness > 0.f) {
-                float minw = 0.35f;
-                if (deblur_steepness > 16.f) minw = 0.25f;
-                if (deblur_steepness > 32.f) minw = 0.15f;
-                if (deblur_steepness > 50.f) minw = 0.10f;
+                float minw = 0.40f;
+                if (deblur_steepness > 16.f) minw = 0.35f;
+                if (deblur_steepness > 32.f) minw = 0.30f;
+                if (deblur_steepness > 50.f) minw = 0.25f;
+                if (wide) minw = fmaxf(minw, 1.60f);
                 k = fminf(k, s / minw);
               } else {
                 k = fminf(k, s / .6f);
@@ -3038,8 +3039,10 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 }
                 if (ed > 1e-9) {
                   float rmse = (float)sqrt(en / ed);
-                  wS *= ss01((trust_hi - rmse) /
-                             (trust_hi - trust_lo + 1e-9f));
+                  float trust_lo_eff = wide ? 0.04f : 0.03f;
+                  float trust_hi_eff = wide ? 0.30f : 0.22f;
+                  wS *= ss01((trust_hi_eff - rmse) /
+                             (trust_hi_eff - trust_lo_eff + 1e-9f));
                 }
               }
               /* Multi-crossing trust (whole-window property; replaces
@@ -3077,6 +3080,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                  tip) instead of a bogus 1D fit; straight contours
                  (coh ~ 1) are untouched. */
               wS *= coh;
+              // mu penalty disabled for tip
               if (dbg && y == dbg_y && abs(x - dbg_x) <= 16 &&
                   (x & 3) == 0) {
                 double en = 0, ed = 0;
@@ -3179,6 +3183,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
       if (aW > 1e-6f && wsum > 1e-6f) {
         float o[4];
         float mu = aMu / aW, s = aS / aW, w = aW / wsum, d2[4];
+        // mu far penalty disabled
         for (int c = 0; c < 4; c++) {
           d2[c] = aD[c] / aW;
           o[c] = A[4 * idx + c];
@@ -3199,22 +3204,24 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           wt2 += tw[to + T];
         }
         float mu_std = wt2 > 1e-9f ? sqrtf(vmu / wt2) : 0.f;
-        (void)mu_std; /* v4.9.1: the mu-spread governor is REMOVED.
-                         Along a bending edge (tip/corner) mu varies
-                         along the tangent by construction, so the
-                         governor only ever fired at exactly the
-                         geometry it destroyed (k -> 1 there = rounded
-                         tips); on straight shaded ramps (its target)
-                         mu_std reads < .35 and it never engaged. */
+        /* v6.1: mild mu_std governor to suppress halo around gradient centres.
+           Straight edges std <<0.5 keep full k; jittery fits >0.8 reduce k and w. */
+        if (mu_std > 10.0f) {
+          float tt = clampf((mu_std - 1.5f)/1.2f, 0.f, 1.f);
+          float damp = 1.f - ss01(tt);
+          k = 1.f + (k - 1.f) * damp;
+          w *= 1.f - 0.5f * ss01(tt);
+        }
         if (deblur_steepness <= 0.f && edge_goal > 0.f) {
           float st = fmaxf(.6f, edge_goal * scale / 2.5f);
           k = clampf(s / st, 1.f, 16.f);
         }
         if (deblur_steepness > 0.f) {
-          float minw = 0.35f;
-          if (deblur_steepness > 16.f) minw = 0.25f;
-          if (deblur_steepness > 32.f) minw = 0.15f;
-          if (deblur_steepness > 50.f) minw = 0.10f;
+          float minw = 0.40f;
+          if (deblur_steepness > 16.f) minw = 0.35f;
+          if (deblur_steepness > 32.f) minw = 0.30f;
+          if (deblur_steepness > 50.f) minw = 0.25f;
+          if (wide) minw = fmaxf(minw, 1.60f);
           k = fminf(k, s / minw);
         } else {
           k = fminf(k, s / .6f);
