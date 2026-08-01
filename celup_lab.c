@@ -2401,6 +2401,7 @@ static int deblur_method = 0;
 static float deblur_steepness = 0.f; /* <=0: auto (-e adaptive or -s formula) */
 static int last_deblur_method = 0;   /* effective method of the last run */
 static float last_deblur_k = 0.f;    /* effective fixed steepness (0=adaptive) */
+static int autodeblur_is_photo = 0; /* set in upscale_autodeblur from class map */
 static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
                               int dw, int dh);
 /* Standard-normal CDF (libm erff). */
@@ -2623,6 +2624,10 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
   float kbase = deblur_steepness > 0.f
                     ? deblur_steepness
                     : clampf(1.f + .25f * (compress_strength - 1.f), 1.f, 16.f);
+  if (autodeblur_is_photo) {
+    /* for photos, don't quantize gradients into plateaus: cap k to 2.2 (was up to 16) */
+    kbase = fminf(kbase, 2.2f);
+  }
   last_deblur_k = deblur_steepness > 0.f   ? deblur_steepness
                   : edge_goal > 0.f        ? 0.f
                                            : kbase;
@@ -3312,6 +3317,20 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
 
 static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
                               int dw, int dh) {
+  /* v6.4 photo detection: if image is photo-like (not pixel-art, many soft links, many colours), reduce deblur strength to avoid plateau quantization */
+  {
+    class_map_t cm_tmp;
+    if (build_class_map(in, sw, sh, &cm_tmp)) {
+      int is_photo = (!cm_tmp.pixel_art && cm_tmp.soft_fraction > 0.09 && cm_tmp.unique_ratio > 0.12);
+      autodeblur_is_photo = is_photo;
+      if (is_photo) {
+        fprintf(stderr, "autodeblur: photo detected (soft %.3f uniq %.3f) -> limiting steepness to avoid plateau quantization\n", cm_tmp.soft_fraction, cm_tmp.unique_ratio);
+      }
+      free_class_map(&cm_tmp);
+    } else {
+      autodeblur_is_photo = 0;
+    }
+  }
   /* v4.9.1: the v4.9 base-sigma decouple is REVERTED.  It dodged the
      neon skirt by rendering the base at sigma r/min(K,8), but that
      re-exposed the source lattice staircase the user deliberately
