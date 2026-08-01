@@ -30,27 +30,38 @@ MODES = [
     ("Source (Nearest)", "source", "nearest", ()),
     ("Nearest Neighbor", "celup_lab", "nearest", ()),
     ("Bilinear", "celup_lab", "bilinear", ()),
-    ("PIL Bicubic (Ref)", "pil", "bicubic", ()),
-    ("PIL Lanczos (Ref)", "pil", "lanczos", ()),
-    ("scipy:spline5 (Ref)", "scipy", "spline5", ()),
-    ("cv2:lanczos4 (Ref)", "cv2", "lanczos4", ()),
-    ("py:edgedir (Ref)", "py", "edgedir", ()),
-    ("py:vector (Ref)", "py", "vector", ()),
-    ("celup_lab:cubic", "celup_lab", "cubic", ()),
-    ("celup_lab:mitchell", "celup_lab", "mitchell", ()),
-    ("celup_lab:lanczos3", "celup_lab", "lanczos3", ()),
-    ("celup_lab:triangle", "celup_lab", "triangle", ()),
-    ("celup_lab:adaptive", "celup_lab", "adaptive", ()),
-    ("celup_lab:sdf", "celup_lab", "sdf", ()),
-    ("celup_lab:scale2x", "celup_lab", "scale2x", ()),
-    ("celup_lab:autoblur (auto)", "celup_lab", "autoblur", ()),
-    ("celup_lab:autodeblur (auto)", "celup_lab", "autodeblur", ()),
+    ("Triangle", "celup_lab", "triangle", ()),
+    ("Scale2X", "celup_lab", "scale2x", ()),
+    ("Cubic", "celup_lab", "cubic", ()),
+    ("Mitchell", "celup_lab", "mitchell", ()),
+    ("Lanczos2", "celup_lab", "lanczos2", ()),
+    ("Lanczos3", "celup_lab", "lanczos3", ()),
+    ("Dehourglass", "celup_lab", "dehourglass", ()),
+    ("Blur", "celup_lab", "blur", ()),
+    ("Compress", "celup_lab", "compress", ()),
+    ("Safecompress s4", "celup_lab", "safecompress", ("--strength", "4")),
+    ("Hourglassfix", "celup_lab", "consistentcompress", ("--strength", "4")),
+    ("Hourglasscompress s4", "celup_lab", "hourglasscompress", ("--strength", "4")),
+    ("Blurcompress s4", "celup_lab", "blurcompress", ("--strength", "4")),
+    ("Safeblurcompress s4", "celup_lab", "safeblurcompress", ("--strength", "4")),
+    ("Edgecompress s4", "celup_lab", "edgecompress", ("--strength", "4")),
+    ("Deblurcompress s4", "celup_lab", "deblurcompress", ("--strength", "4", "--blur-radius", ".7")),
+    ("Adaptive", "celup_lab", "adaptive", ()),
+    ("Adaptive auto", "celup_lab", "adaptive", ("--checker-policy", "auto")),
+    ("Adaptive s2x", "celup_lab", "adaptive", ("--checker-policy", "scale2x")),
+    ("SDF", "celup_lab", "sdf", ()),
+    ("Autoblur (auto)", "celup_lab", "autoblur", ()),
+    ("Autodeblur (auto)", "celup_lab", "autodeblur", ()),
     ("autodeblur Smiley\n(-r 6 -s 100 -g 64 -D remap)", "celup_lab", "autodeblur",
      ("-c", "linear", "-k", "bspline", "-r", "6", "-s", "100", "-g", "64", "-D", "remap")),
     ("autodeblur Miya\n(-r 2.3 -s 100 -g 16 -D remap)", "celup_lab", "autodeblur",
      ("-c", "linear", "-k", "bspline", "-r", "2.3", "-s", "100", "-g", "16", "-D", "remap")),
+    ("PIL Bicubic (Ref)", "pil", "bicubic", ()),
+    ("PIL Lanczos (Ref)", "pil", "lanczos", ()),
+    ("scipy:spline5 (Ref)", "scipy", "spline5", ()),
+    ("cv2:lanczos4 (Ref)", "cv2", "lanczos4", ()),
+    ("py:vector (Ref)", "py", "vector", ()),
 ]
-
 
 def load_font(size):
     try:
@@ -168,7 +179,6 @@ def create_staircase_test_image(path_webp, path_png):
     rgba = np.dstack([lum, lum * 0.95 + 0.03, lum * 0.90 + 0.06, np.ones_like(lum)])
     rgba_u8 = (np.clip(rgba, 0, 1) * 255).astype(np.uint8)
     im = Image.fromarray(rgba_u8, "RGBA")
-    im.save(path_png)
     im.save(path_webp, lossless=True)
     return im
 
@@ -259,18 +269,16 @@ def main():
             smiley_crop_panels.append((label, crop_im))
 
         sheet_smiley = make_grid_sheet(
-            "poor_smiley.webp 2x Upscale Comparison (512x512)", smiley_panels, cols=6
+            "poor_smiley.webp 2x Upscale Comparison (512x512)", smiley_panels, cols=8
         )
-        sheet_smiley.save(SHEET_DIR / "poor_smiley_comparison.png")
         sheet_smiley.save(SHEET_DIR / "poor_smiley_comparison.webp", lossless=True)
         print("   -> saved poor_smiley_comparison.png (.webp)")
 
         sheet_smiley_crop = make_grid_sheet(
             "poor_smiley.webp 2x Upscale Central Detail Crop (256x256)",
             smiley_crop_panels,
-            cols=6,
+            cols=8,
         )
-        sheet_smiley_crop.save(SHEET_DIR / "poor_smiley_crop_comparison.png")
         sheet_smiley_crop.save(SHEET_DIR / "poor_smiley_crop_comparison.webp", lossless=True)
         print("   -> saved poor_smiley_crop_comparison.png (.webp)")
 
@@ -288,9 +296,8 @@ def main():
         sheet_stair = make_grid_sheet(
             "Staircase Problem Comparison — 45° Line, 30° Line, Circle & L-Corner (4x Upscale)",
             stair_panels,
-            cols=6,
+            cols=8,
         )
-        sheet_stair.save(SHEET_DIR / "staircase_comparison.png")
         sheet_stair.save(SHEET_DIR / "staircase_comparison.webp", lossless=True)
         print("   -> saved staircase_comparison.png (.webp)")
 
@@ -318,10 +325,9 @@ def main():
         sheet_diag45 = make_grid_sheet(
             "45° Diagonal Line Staircase Evaluation (tests/diagline48_src.webp 4x) — Quantitative Staircase Metrics",
             diag45_panels,
-            cols=6,
+            cols=8,
             label_h=66,
         )
-        sheet_diag45.save(SHEET_DIR / "staircase_diag45_comparison.png")
         sheet_diag45.save(SHEET_DIR / "staircase_diag45_comparison.webp", lossless=True)
         print("   -> saved staircase_diag45_comparison.png (.webp)")
 
