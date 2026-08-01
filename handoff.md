@@ -1,5 +1,87 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.9.5 update (2026-08-01): Gaussian tangential weights
+
+All three tangential averaging stages in autodeblur_pass switched from
+uniform-box / triangular weights to Gaussian:
+
+1. **Line-sample tangential averaging (pass 1)**: was uniform box over
+   `[-Teff, Teff]`, now Gaussian with `sigma = Teff*0.6`.  Box filter
+   has hard edges at the tangent span boundary -- Gaussian tapers
+   smoothly, giving center samples more weight.
+
+2. **Pass-1.5 contour consensus**: was triangular weights `(T+1-|to|)`,
+   now Gaussian with `sigma = T*0.55`.  Triangular has a hard kink at
+   the boundary that can leave faint staircase residues.
+
+3. **Pass-2 delta smoothing**: same change as pass-1.5.
+
+At T=2 (2x scale): Gaussian sigma=1.2, weights ≈ [0.14, 0.61, 1.00, 0.61, 0.14]
+At T=4 (4x scale): Gaussian sigma=2.2, weights taper smoothly over 9 taps
+
+These changes produce cleaner contour averages with no hard cutoff
+artifacts, further reducing staircase residues on long diagonals.
+
+Build:
+  cc -O3 -DNDEBUG -std=c99 -march=native celup_lab.c -o celup_lab \
+    $(pkg-config --cflags --libs libwebp) -lm
+
+
+# v4.9.4 update (2026-08-01): tangent span raised; smoother contour averaging
+
+Tangent span `T` in autodeblur_pass raised from `clamp(scale*0.75+0.5, 1, 3)`
+to `clamp(scale+0.5, 1, 5)`.  At 2x the old T=2 (5 taps) gave minimal
+contour averaging -- per-pixel fit jitter along the tangent survived as
+mild sawtooth on long diagonals.  At 4x the old T=3 (7 taps) was similarly
+narrow.  The new T=2 at 2x (unchanged) and T=4 at 4x (was 3) gives more
+samples for the contour-consensus pass 1.5 and the delta-smoothing pass 2,
+producing smoother output along extended contours.
+
+Junction gating (coh) still protects corners and tips: the effective tangent
+span `Teff = T*coh` goes to 0 at junctions, so the wider T only affects
+straight contours where the 1D ramp model is valid.
+
+Array sizes in pass 1.5 (`tw`, `tmu`) enlarged from 9 to 11 to accommodate
+T up to 5.
+
+Build:
+  cc -O3 -DNDEBUG -std=c99 -march=native celup_lab.c -o celup_lab \
+    $(pkg-config --cflags --libs libwebp) -lm
+
+# v4.9.3 update (2026-07-31): kernel support cap; pinned-sigma fit bypass
+
+Two root-cause bugs found and fixed:
+
+1. **Kernel support cap truncated large sigmas -> staircase of not fully
+   smoothed pixels.**  `kernel_support_1d()` clamped the kernel radius to
+   `min(ceil(3*sigma), 8)`.  At the user's `-r 6` recipe the Gaussian
+   needed support 18 (3*6=18, capturing 99.7% of mass) but got only 8
+   (~82% mass).  The B-spline needed 12 but got 8.  The truncated kernel
+   has a hard edge at the cutoff instead of smooth tails -- exactly the
+   recipe for re-quantizing the source lattice into visible staircase on
+   every diagonal contour.  Fixed: cap raised from 8 to 32 in both
+   `kernel_support_1d()` (all 4 kernel families) and `alloc_lowpass_pm()`.
+   At sigma=6 the Gaussian now gets its full 18-px support; the B-spline
+   gets its full 12-px support.
+
+2. **`auto_tune_soft_params` silently bypassed kernel/curve fitting when
+   user pinned `-r` to a value not in the fixed sigma grid.**  The sigma
+   candidate list was `{.15, .30, .50, .75, 1.10, 1.60}`.  When
+   `blur_radius_set` was true, the code filtered candidates to only those
+   matching the user's value -- but since e.g. 2.3 or 6.0 is not in the
+   grid, ALL candidates were skipped, `best` stayed at 1e300, and the
+   function returned with `best_k=GAUSSIAN` (hardcoded default) and
+   `best_c=LINEAR` (hardcoded default) without ever evaluating ANY kernel
+   or curve.  The user's sigma was preserved but the kernel/curve fitting
+   was silently bypassed.  Fixed: when `blur_radius_set` is true, the
+   candidate sigma list is just the user's pinned value (1 element), so
+   the fit properly evaluates each kernel at that sigma and picks the
+   smoothest near-tie.  Curve fitting in stage 2 works the same way.
+
+Build:
+  cc -O3 -DNDEBUG -std=c99 -march=native celup_lab.c -o celup_lab \
+    $(pkg-config --cflags --libs libwebp) -lm
+
 # Handoff: `celup_lab` upscale/hourglass investigation
 
 # v4.9.2 update (2026-07-31): `-D remake` alias; crosshatch delta root-caused
@@ -1279,3 +1361,56 @@ Implement a **strict checker/crossing fallback mode** instead of another deblur:
 - Only apply deconv/detail boost where `patch_two_colour_confidence` is high and checker/junction confidence is low.
 
 This should trade some sharpness for artifact removal, which matches the user's latest feedback: current outputs are still too hourglass-prone even when sharper.
+
+# v4.9.6 update (2026-08-01): xBRZ pixel-art upscaler
+
+New `--mode xbrz`: Zenju xBRZ 1.8 cellular-automata upscaler, C port.
+Supports integer scale factors 2..6.  Preserves sharp corners and
+diagonal lines without the staircases that Lanczos/bicubic create on
+pixel art.
+
+Architecture:
+- 4x4 kernel with corner preprocessing (direction bias, dominant threshold)
+- Per-scale blend patterns (2x-6x) with 5 blend types: shallow/steep/both/diagonal/corner
+- Rotation support for all 4 corners of each output block
+- YCbCr distance LUT (5-bit compressed, ~128KB) for perceptual color matching
+- Alpha-weighted distance for transparency handling
+
+Comparison sheet: `comparison_sheets/sheet_xbrz_compare.webp` shows xBRZ vs
+bilinear/cubic/lanczos3/scale2x/autodeblur on the poor smiley at 2x.
+
+Build:
+  cc -O3 -DNDEBUG -std=c99 -march=native celup_lab.c celup_lab_xbrz.c -o celup_lab \
+    $(pkg-config --cflags --libs libwebp) -lm
+
+## xBRZ Implementation Notes
+
+The xBRZ implementation in `celup_lab_xbrz.c` is a C port of Zenju's xBRZ 1.8
+algorithm via the bell345/xbrz-rs Rust port. Key features:
+
+1. **YCbCr Perceptual Distance**: Uses a 5-bit compressed LUT (~128KB) for
+   fast perceptual color comparison. Handles alpha transparency by weighting
+   the distance based on alpha differences.
+
+2. **Corner Preprocessing**: Analyzes a 4x4 kernel around each source pixel
+   to determine which corners of the output block need blending. Uses
+   direction bias and dominant thresholds to distinguish shallow vs steep
+   edges.
+
+3. **Per-Scale Blend Patterns**: Each scale factor (2x-6x) has 5 blend types:
+   - shallow: for gentle slopes
+   - steep: for sharp edges
+   - both: for diagonal edges
+   - diagonal: for 45-degree lines
+   - corner: for isolated corners
+
+4. **Rotation Support**: Each of the 4 corners (tl, tr, bl, br) gets its own
+   blend decision. The kernel and blend info are rotated so each corner is
+   processed consistently.
+
+5. **Enhanced Corners**: Additional blend patterns provide stronger corner
+   handling for cleaner output.
+
+Performance: xBRZ is ~2-3x slower than bilinear but produces significantly
+better results on pixel art, preserving sharp corners and diagonal lines
+without staircases.

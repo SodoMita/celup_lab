@@ -23,6 +23,10 @@
 #include <string.h>
 #include <webp/decode.h>
 #include <webp/encode.h>
+#include "celup_lab_xbrz.h"
+#include "celup_lab_xbr.h"
+#include "celup_lab_superxbr.h"
+#include "celup_lab_jinc2_bilateral.h"
 
 static float to_linear[256];
 static uint8_t to_srgb[4097];
@@ -364,8 +368,8 @@ static void blur_pm(const uint8_t *in, int w, int h, int x, int y, float q[4]) {
   int r = (int)ceilf(3.f * blur_radius);
   if (r < 1)
     r = 1;
-  if (r > 12)
-    r = 12;
+  if (r > 32) /* v4.9.3: raised from 12 so large -r pins get full support */
+    r = 32;
   q[0] = q[1] = q[2] = q[3] = 0;
   float sum = 0, inv2 = 1.f / (2.f * blur_radius * blur_radius);
   for (int j = -r; j <= r; j++)
@@ -1387,7 +1391,10 @@ static void mitchell_bounded_sample(const uint8_t *in, int sw, int sh,
    only non-inventing choice is to remove the aliased band outright. */
 static float *alloc_lowpass_pm(const uint8_t *in, int sw, int sh,
                                float sigma) {
-  int r = clampi((int)ceilf(3.f * sigma), 1, 8);
+  /* v4.9.3: cap raised from 8 to 32 so large user-pinned sigmas (e.g.
+     -r 6) get their full kernel support instead of a hard truncated
+     Gaussian that re-quantizes the source lattice into staircase. */
+  int r = clampi((int)ceilf(3.f * sigma), 1, 32);
   size_t n = (size_t)sw * sh;
   float *tmp = malloc(n * 4 * sizeof *tmp), *dst = malloc(n * 4 * sizeof *dst);
   float *ker = malloc((size_t)(2 * r + 1) * sizeof *ker);
@@ -1879,25 +1886,30 @@ static float kernel_profile_1d(int kind, float sigma, float x) {
   }
 }
 
+/* v4.9.3: cap raised 8 -> 32.  The old cap truncated the Gaussian/B-spline
+   tails whenever sigma > ~2.7 (Gaussian: 3*2.7=8), producing a hard-edged
+   effective kernel that re-quantized the source lattice into visible
+   staircase on diagonal contours.  At sigma=6 the old cap captured ~82% of
+   the Gaussian mass; the new cap captures ~100%. */
 static int kernel_support_1d(int kind, float sigma) {
   switch (kind) {
   case BK_BOX: {
     float h = 1.5f * sigma;
-    return clampi((int)ceilf(h < .75f ? .75f : h), 1, 8);
+    return clampi((int)ceilf(h < .75f ? .75f : h), 1, 32);
   }
   case BK_TRIANGLE: {
     float s = 1.1f * sigma + .5f;
-    return clampi((int)ceilf(s < 1.f ? 1.f : s), 1, 8);
+    return clampi((int)ceilf(s < 1.f ? 1.f : s), 1, 32);
   }
   case BK_BSPLINE: {
     float s = .9f * sigma + .25f;
     if (s < .7f)
       s = .7f;
-    return clampi((int)ceilf(2.f * s), 1, 8);
+    return clampi((int)ceilf(2.f * s), 1, 32);
   }
   default: {
     float s = sigma < .5f ? .5f : sigma;
-    return clampi((int)ceilf(3.f * s), 1, 8);
+    return clampi((int)ceilf(3.f * s), 1, 32);
   }
   }
 }
@@ -2081,7 +2093,20 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
     return 0;
   }
   static const int kernels[] = {BK_BOX, BK_TRIANGLE, BK_GAUSSIAN, BK_BSPLINE};
-  static const float sigmas[] = {.15f, .30f, .50f, .75f, 1.10f, 1.60f};
+  /* When the user pins -r, that value is the ONLY sigma candidate (the
+     fixed grid below would skip every entry if the pinned value is not in
+     it, leaving kernel/curve fitting entirely bypassed). */
+  float pinned_sigma[1] = { *sigma };
+  const float *sigmas;
+  size_t n_sigmas;
+  static const float sigma_grid[] = {.15f, .30f, .50f, .75f, 1.10f, 1.60f};
+  if (blur_radius_set) {
+    sigmas = pinned_sigma;
+    n_sigmas = 1;
+  } else {
+    sigmas = sigma_grid;
+    n_sigmas = sizeof sigma_grid / sizeof sigma_grid[0];
+  }
   static const struct {
     int kind;
     float param;
@@ -2099,20 +2124,18 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
      within 3% of the raw best (statistical ties -- the MSE-vs-sharp-target
      criterion cannot see blockiness) pick the largest sigma and then the
      smoothest kernel family. */
-  double s1[4 * 6];
+  double s1[4 * 7]; /* max 4 kernels * 7 sigmas (6 grid + 1 pinned) */
   for (size_t i = 0; i < sizeof s1 / sizeof s1[0]; i++)
     s1[i] = -1.0;
   for (size_t ki = 0; ki < sizeof kernels / sizeof kernels[0]; ki++) {
     if (*kk != BK_AUTO && kernels[ki] != *kk)
       continue;
-    for (size_t si = 0; si < sizeof sigmas / sizeof sigmas[0]; si++) {
-      if (blur_radius_set && fabsf(sigmas[si] - *sigma) > 1e-6f)
-        continue;
+    for (size_t si = 0; si < n_sigmas; si++) {
       if (!render_soft(train, tw, th, recon, sw, sh, kernels[ki], sigmas[si],
                        CK_LINEAR, 0.f))
         continue;
       double score = image_pm_mse(recon, in, sw, sh, 2);
-      s1[ki * 6 + si] = score;
+      s1[ki * n_sigmas + si] = score;
       if (score < best) {
         best = score;
         best_k = kernels[ki];
@@ -2126,10 +2149,8 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
     for (size_t ki = 0; ki < sizeof kernels / sizeof kernels[0]; ki++) {
       if (*kk != BK_AUTO && kernels[ki] != *kk)
         continue;
-      for (size_t si = 0; si < sizeof sigmas / sizeof sigmas[0]; si++) {
-        if (blur_radius_set && fabsf(sigmas[si] - *sigma) > 1e-6f)
-          continue;
-        double score = s1[ki * 6 + si];
+      for (size_t si = 0; si < n_sigmas; si++) {
+        double score = s1[ki * n_sigmas + si];
         if (score <= 0 || score > thr)
           continue;
         int rank = kernel_smooth_rank(kernels[ki]);
@@ -2550,7 +2571,11 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
      and u_px ~.5, so the fit reproduces it unchanged. */
   float sa = 1.3f * scale * sref, sb = 2.4f * scale * sref;
   float flatmix = .25f; /* diffusion-noise flattening in gate-zero zones */
-  int T = clampi((int)(scale * .75f + .5f), 1, 3); /* tangent span (v4.7) */
+  /* v4.9.4: tangent span raised from scale*0.75 (cap 3) to scale (cap 5).
+     Narrow T (2 at 2x, 3 at 4x) gave minimal contour averaging -- per-pixel
+     fit jitter along the tangent survived as mild sawtooth on long diagonals.
+     Junction gating (coh) still protects corners: Teff = T*coh -> 0 at tips. */
+  int T = clampi((int)(scale + .5f), 1, 5);
   /* per-fit diagnostic dump: CELUP_DBG=x,y prints the fit internals for
      pixels near (x,y) (step 4 px) */
   int dbg = 0, dbg_x = 96, dbg_y = 96;
@@ -2638,15 +2663,24 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
             hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f},
             mean[4] = {0, 0, 0, 0};
       for (int j = 0; j < NS; j++) {
-        float t = (float)(j - R), acc[4] = {0, 0, 0, 0};
+        float t = (float)(j - R), acc[4] = {0, 0, 0, 0}, wsum = 0.f;
+        /* v4.9.5: Gaussian tangential weights instead of uniform box.
+           Box filter creates hard edges at the tangent span boundary,
+           which can leave mild staircase residues on long diagonals.
+           Gaussian (sigma = Teff*0.6) tapers smoothly, giving center
+           samples more weight and producing cleaner contour averages. */
+        float tsigma = fmaxf((float)Teff * 0.6f, 0.5f);
+        float tinv2 = 1.f / (2.f * tsigma * tsigma);
         for (int to = -Teff; to <= Teff; to++) {
           float q[4];
           sample_pm(out, dw, dh, (float)x + t * dirx + (float)to * tanx,
                     (float)y + t * diry + (float)to * tany, q);
+          float wt = expf(-(float)(to * to) * tinv2);
           for (int c = 0; c < 4; c++)
-            acc[c] += q[c];
+            acc[c] += wt * q[c];
+          wsum += wt;
         }
-        float inv = 1.f / (2 * Teff + 1);
+        float inv = wsum > 1e-20f ? 1.f / wsum : 0.f;
         for (int c = 0; c < 4; c++) {
           C[j][c] = acc[c] * inv;
           mean[c] += C[j][c];
@@ -3070,18 +3104,24 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
      vocabulary: erf tail-shape misfit at the ramp foot once drove the
      step48 dark flank .149 -> .027) bounds the result to the colours
      observed in the pixel's own window. */
-  for (int y = 0; y < dh; y++)
-    for (int x = 0; x < dw; x++) {
-      size_t idx = (size_t)y * dw + x;
-      const float *pf = PF + 10 * idx;
-      float tanx = pf[8], tany = pf[9], cc = pf[7];
-      float aW = 0.f, aMu = 0.f, aS = 0.f, aD[4] = {0, 0, 0, 0},
-            wsum = 0.f, tw[9], tmu[9];
-      for (int to = -T; to <= T; to++) {
-        float wt = (float)(T + 1 - (to < 0 ? -to : to)), q[10];
-        sample_fn(PF, dw, dh, 10, (float)x + (float)to * tanx,
-                  (float)y + (float)to * tany, q);
-        wt *= sqrtf(cc * fmaxf(q[7], 0.f));
+  /* v4.9.5: Gaussian base weights (sigma = T*0.55) replace triangular
+     for smoother consensus -- triangular's hard kink at the boundary
+     can leave faint staircase residues on long diagonals. */
+  {
+    float p15sigma = fmaxf((float)T * 0.55f, 0.5f);
+    float p15inv2 = 1.f / (2.f * p15sigma * p15sigma);
+    for (int y = 0; y < dh; y++)
+      for (int x = 0; x < dw; x++) {
+        size_t idx = (size_t)y * dw + x;
+        const float *pf = PF + 10 * idx;
+        float tanx = pf[8], tany = pf[9], cc = pf[7];
+        float aW = 0.f, aMu = 0.f, aS = 0.f, aD[4] = {0, 0, 0, 0},
+              wsum = 0.f, tw[11], tmu[11];
+        for (int to = -T; to <= T; to++) {
+          float wt = expf(-(float)(to * to) * p15inv2), q[10];
+          sample_fn(PF, dw, dh, 10, (float)x + (float)to * tanx,
+                    (float)y + (float)to * tany, q);
+          wt *= sqrtf(cc * fmaxf(q[7], 0.f));
         tw[to + T] = wt;
         tmu[to + T] = q[0] > 1e-9f ? q[1] / q[0] : 0.f;
         aW += wt * q[0];
@@ -3150,29 +3190,35 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                   x, y, mu, s, k, ufit0, nu, w, mu_std);
       }
     }
+  }
   /* Pass 2: tangential smoothing of the residual delta.  Fit jitter is
      already absorbed by the pass-1.5 consensus; this only polishes the
      small delta noise of the flat-flatten path and any rounding of the
      consensus evaluation.  Junction-aware taps (v4.9): a corner's delta
      is not exchangeable with its contour neighbours' -- tangents rotate
-     there. */
-  for (int y = 0; y < dh; y++)
-    for (int x = 0; x < dw; x++) {
-      size_t idx = (size_t)y * dw + x;
-      const float *pf = PF + 10 * idx;
-      float cc = pf[7];
-      float acc[4] = {0, 0, 0, 0}, o[4], res[4], wsum = 0.f;
-      for (int to = -T; to <= T; to++) {
-        float wt = (float)(T + 1 - (to < 0 ? -to : to)), q[4], qc[10];
-        float sx = (float)x + (float)to * pf[8],
-              sy = (float)y + (float)to * pf[9];
-        sample_fn(PF, dw, dh, 10, sx, sy, qc);
-        wt *= sqrtf(cc * fmaxf(qc[7], 0.f));
-        sample_f4(DEL, dw, dh, sx, sy, q);
-        for (int c = 0; c < 4; c++)
-          acc[c] += wt * q[c];
-        wsum += wt;
-      }
+     there.  v4.9.5: Gaussian base weights (sigma = T*0.55) replace the
+     triangular weights for a smoother taper -- triangular has a hard
+     kink at the boundary that can leave faint staircase residues. */
+  {
+    float p2sigma = fmaxf((float)T * 0.55f, 0.5f);
+    float p2inv2 = 1.f / (2.f * p2sigma * p2sigma);
+    for (int y = 0; y < dh; y++)
+      for (int x = 0; x < dw; x++) {
+        size_t idx = (size_t)y * dw + x;
+        const float *pf = PF + 10 * idx;
+        float cc = pf[7];
+        float acc[4] = {0, 0, 0, 0}, o[4], res[4], wsum = 0.f;
+        for (int to = -T; to <= T; to++) {
+          float wt = expf(-(float)(to * to) * p2inv2), q[4], qc[10];
+          float sx = (float)x + (float)to * pf[8],
+                sy = (float)y + (float)to * pf[9];
+          sample_fn(PF, dw, dh, 10, sx, sy, qc);
+          wt *= sqrtf(cc * fmaxf(qc[7], 0.f));
+          sample_f4(DEL, dw, dh, sx, sy, q);
+          for (int c = 0; c < 4; c++)
+            acc[c] += wt * q[c];
+          wsum += wt;
+        }
       for (int c = 0; c < 4; c++) {
         o[c] = A[4 * idx + c];
         float v = wsum > 1e-6f ? o[c] + acc[c] / wsum : o[c];
@@ -3188,6 +3234,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
       }
       put(dst + 4 * idx, res[0], res[1], res[2], res[3]);
     }
+  }
   memcpy(out, dst, n * 4);
   free(dst);
   free(LOH);
@@ -4705,6 +4752,49 @@ static void upscale_triangle(const uint8_t *in, int sw, int sh, uint8_t *out,
   }
 }
 
+/* xBRZ pixel-art upscaler (Zenju xBRZ 1.8, C port in celup_lab_xbrz.c).
+ * Integer scale factors 2..6 only; preserves sharp edges without
+ * introducing the staircases that plain Lanczos/bicubic create on
+ * pixel art. */
+
+
+/* xBR pixel art upscaler (simpler than xBRZ).
+ * Supports integer scale factors 2, 3, 4. */
+static int upscale_xbr(const uint8_t *in, int sw, int sh, uint8_t *out,
+                       int dw, int dh) {
+  int f = dw / sw;
+  if (f < 2 || f > 4 || dw != sw * f || dh != sh * f)
+    return 0;
+  return xbr_scale(in, sw, sh, out, dw, dh, f) == 0;
+}
+
+
+/* Super xBR: two-pass edge-directed upscaling (2x only) */
+static int upscale_superxbr(const uint8_t *in, int sw, int sh, uint8_t *out,
+                            int dw, int dh) {
+  int f = dw / sw;
+  if (f != 2 || dw != sw * 2 || dh != sh * 2)
+    return 0;
+  return superxbr_scale(in, sw, sh, out, dw, dh) == 0;
+}
+
+
+/* Jinc2-Bilateral: post-processing edge-preserving smoothing */
+static int upscale_jinc2_bilateral(const uint8_t *in, int sw, int sh, uint8_t *out,
+                                   int dw, int dh) {
+  if (dw != sw || dh != sh)
+    return 0;
+  return jinc2_bilateral_scale(in, sw, sh, out, dw, dh) == 0;
+}
+
+static int upscale_xbrz(const uint8_t *in, int sw, int sh, uint8_t *out,
+                        int dw, int dh) {
+  int f = dw / sw;
+  if (f < 2 || f > 6 || dw != sw * f || dh != sh * f)
+    return 0;
+  return xbrz_scale(in, sw, sh, out, dw, dh, f) == 0;
+}
+
 static int upscale(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
                    int dh) {
   int *xi = malloc((size_t)dw * 4 * sizeof *xi),
@@ -4868,7 +4958,7 @@ static uint8_t *slurp(const char *name, size_t *n) {
 static void print_help(const char *argv0) {
   printf(
       "celup_lab -- premultiplied-linear WebP upscaler (research build "
-      "v4.9.2)\n"
+      "v4.9.5)\n"
       "\n"
       "Usage: %s in.webp out.webp SCALE [options]\n"
       "  SCALE is the upsampling factor, real number in (1,32] "
@@ -4888,6 +4978,10 @@ static void print_help(const char *argv0) {
       "  sdf           fitted signed-distance contour sharpening on top of\n"
       "                adaptive; crispest edges, tune with -s\n"
       "  nearest       pixel art / hard 1px texture\n"
+      "  xbrz          Zenju xBRZ 1.8: cellular-automata pixel-art upscaler;\n"
+      "                integer scale 2..6, sharp corners, no halos\n"
+      "  xbr           Hyllian xBR: simpler cellular-automata pixel-art upscaler;\n"
+      "                integer scale 2..4, sharp corners, no halos\n"
       "\n"
       "Modes -- other (accepted, but expect artifacts on art):\n"
       "  bilinear cubic mitchell lanczos2 lanczos3 blur\n"
@@ -5177,7 +5271,8 @@ int main(int ac, char **av) {
       strcmp(mode, "triangle") && strcmp(mode, "adaptive") &&
       strcmp(mode, "classmap") && strcmp(mode, "scale2x") &&
       strcmp(mode, "autoblur") && strcmp(mode, "sdf") &&
-      strcmp(mode, "autodeblur")) {
+      strcmp(mode, "autodeblur") && strcmp(mode, "xbrz") && strcmp(mode, "xbr") &&
+      strcmp(mode, "superxbr") && strcmp(mode, "jinc2_bilateral")) {
     fprintf(stderr, "Unknown mode: %s\n", mode);
     return 2;
   }
@@ -5314,6 +5409,26 @@ int main(int ac, char **av) {
     ok = upscale_autodeblur(in, w, h, out, ow, oh);
   else if (!strcmp(mode, "sdf"))
     ok = upscale_sdf(in, w, h, out, ow, oh);
+  else if (!strcmp(mode, "xbr")) {
+    /* xBR only supports integer scales 2..4; fall back to bilinear otherwise. */
+    int f = (int)(scale + 0.5f);
+    if (f >= 2 && f <= 4 && fabsf((float)f - scale) < 0.01f)
+      ok = upscale_xbr(in, w, h, out, ow, oh);
+    else {
+      fprintf(stderr, "xbr: scale %.2f not an integer in [2,4]; using bilinear\n", scale);
+      upscale_bilinear(in, w, h, out, ow, oh);
+    }
+  }
+  else if (!strcmp(mode, "xbrz")) {
+    /* xBRZ only supports integer scales 2..6; fall back to bilinear otherwise. */
+    int f = (int)(scale + 0.5f);
+    if (f >= 2 && f <= 6 && fabsf((float)f - scale) < 0.01f)
+      ok = upscale_xbrz(in, w, h, out, ow, oh);
+    else {
+      fprintf(stderr, "xbrz: scale %.2f not an integer in [2,6]; using bilinear\n", scale);
+      upscale_bilinear(in, w, h, out, ow, oh);
+    }
+  }
   if (!ok) {
     fprintf(stderr, "Allocation failed\n");
     free(out);
