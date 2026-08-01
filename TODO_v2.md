@@ -21,7 +21,12 @@
 # v4.9.4 Status & Future Directions
 
 ## Completed in v4.9.4
-1. **ARM64 / Android Segmentation Fault Fix for `sdf`, `msdf`, and `dsdf`**:
+1. **C1-continuous 3x3 Consensus DSDF (`--mode dsdf`)**:
+   - Diagnosed why `dsdf` produced spikes at integer pixel boundaries and offset edge caps 1 pixel away from circle/curve centers at arbitrarily high upscales.
+   - Root-caused to single-cell Voronoi evaluation: neighbor background cells (1 pixel outside the true edge) had their 5x5 window mean `t0 ~ 0.3` and drew false contours 1 pixel away.
+   - Replaced single-cell Voronoi lookup with C1-continuous Gaussian-kernel consensus across the 3x3 neighborhood around `(sx, sy)`, filtering false seeds by `fabsf(t0 - .5f) <= .65f * mag`.
+   - Verified 100% pass across all upscales 1.5x..24x (`tests/test_scales.py`): circle profiles are monotonic, continuous, and free of offset caps.
+2. **ARM64 / Android Segmentation Fault Fix for `sdf`, `msdf`, and `dsdf`**:
    - Diagnosed and fixed the segmentation fault reported on ARM phones when executing `--mode sdf`, `--mode msdf`, and `--mode dsdf`.
    - Root-caused to `suppress_speckle_pm(hr, dw, dh, ...)`, which is called by `upscale_adaptive` (invoked as the base renderer by all three SDF modes).
    - In `suppress_speckle_pm`, Pass 2 (the domino pair pass) iterated `for (int vert = 0; vert < 2; vert++) for (int y = 1; y + 1 < dh; y++) for (int x = 1; x + 1 < dw; x++)`.

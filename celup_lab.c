@@ -3725,20 +3725,45 @@ static int upscale_dsdf(const uint8_t *in, int sw, int sh, uint8_t *out,
     float sy = (y + .5f) * yscale - .5f;
     for (int x = 0; x < dw; x++) {
       float sx = (x + .5f) * xscale - .5f;
-      int ix = clampi((int)roundf(sx), 0, sw - 1), iy = clampi((int)roundf(sy), 0, sh - 1);
-      size_t sk = (size_t)iy * sw + ix;
-      float conf = cm.w_edge[sk] * (1.f - cm.w_checker[sk]);
-      if (conf <= .05f)
+      int ix0 = (int)floorf(sx + .5f), iy0 = (int)floorf(sy + .5f);
+      float w_sum = 0.f, d_sum = 0.f, conf_sum = 0.f;
+      float A_sum[4] = {0, 0, 0, 0}, B_sum[4] = {0, 0, 0, 0};
+      for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++) {
+          int cx = clampi(ix0 + i, 0, sw - 1), cy = clampi(iy0 + j, 0, sh - 1);
+          size_t sk = (size_t)cy * sw + cx;
+          float conf = cm.w_edge[sk] * (1.f - cm.w_checker[sk]);
+          if (conf <= .05f)
+            continue;
+          float gx = cm.edge_gx[sk], gy = cm.edge_gy[sk];
+          float mag = sqrtf(gx * gx + gy * gy) + 1e-6f;
+          float t0 = cm.edge_t0[sk];
+          if (fabsf(t0 - .5f) > .65f * mag)
+            continue;
+          float dx = sx - (float)cx, dy = sy - (float)cy;
+          float r2 = dx * dx + dy * dy;
+          float w = conf * expf(-r2 * 1.5f);
+          float d_geom = (t0 - .5f + gx * dx + gy * dy) / mag;
+          w_sum += w;
+          d_sum += w * d_geom;
+          conf_sum += w * conf;
+          const float *A_k = cm.edge_side + 8 * sk,
+                      *B_k = cm.edge_side + 8 * sk + 4;
+          for (int c = 0; c < 4; c++) {
+            A_sum[c] += w * A_k[c];
+            B_sum[c] += w * B_k[c];
+          }
+        }
+      if (w_sum <= 1e-6f)
         continue;
-      float gx = cm.edge_gx[sk], gy = cm.edge_gy[sk];
-      float mag = sqrtf(gx * gx + gy * gy) + 1e-6f;
-      float t0 = cm.edge_t0[sk];
-      float d_geom = (t0 - .5f + gx * (sx - ix) + gy * (sy - iy)) / mag;
+      float inv_w = 1.f / w_sum;
+      float d_geom = d_sum * inv_w;
+      float conf = clampf(conf_sum * inv_w, 0.f, 1.f);
       float t_sharp = clampf(.5f + d_geom * 1.5f, 0.f, 1.f);
-      const float *A = cm.edge_side + 8 * sk, *B = cm.edge_side + 8 * sk + 4;
       uint8_t *dst = out + 4 * ((size_t)y * dw + x);
       for (int c = 0; c < 4; c++) {
-        float tgt = A[c] + t_sharp * (B[c] - A[c]);
+        float A_c = A_sum[c] * inv_w, B_c = B_sum[c] * inv_w;
+        float tgt = A_c + t_sharp * (B_c - A_c);
         float orig = c < 3 ? to_linear[dst[c]] : dst[c] * (1.f / 255.f);
         float res = orig + conf * (tgt - orig);
         if (c < 3)
