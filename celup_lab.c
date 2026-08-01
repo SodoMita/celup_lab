@@ -25,8 +25,6 @@
 #include <webp/encode.h>
 #include "celup_lab_xbrz.h"
 #include "celup_lab_xbr.h"
-#include "celup_lab_superxbr.h"
-#include "celup_lab_jinc2_bilateral.h"
 
 static float to_linear[256];
 static uint8_t to_srgb[4097];
@@ -4770,22 +4768,9 @@ static int upscale_xbr(const uint8_t *in, int sw, int sh, uint8_t *out,
 
 
 /* Super xBR: two-pass edge-directed upscaling (2x only) */
-static int upscale_superxbr(const uint8_t *in, int sw, int sh, uint8_t *out,
-                            int dw, int dh) {
-  int f = dw / sw;
-  if (f != 2 || dw != sw * 2 || dh != sh * 2)
-    return 0;
-  return superxbr_scale(in, sw, sh, out, dw, dh) == 0;
-}
 
 
 /* Jinc2-Bilateral: post-processing edge-preserving smoothing */
-static int upscale_jinc2_bilateral(const uint8_t *in, int sw, int sh, uint8_t *out,
-                                   int dw, int dh) {
-  if (dw != sw || dh != sh)
-    return 0;
-  return jinc2_bilateral_scale(in, sw, sh, out, dw, dh) == 0;
-}
 
 static int upscale_xbrz(const uint8_t *in, int sw, int sh, uint8_t *out,
                         int dw, int dh) {
