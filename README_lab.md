@@ -38,6 +38,15 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
+## v4.9.4: fix ARM64 / Android segfault in `suppress_speckle_pm` (out-of-bounds heap read)
+
+- **ARM64 / Android segmentation fault fix for `sdf`, `msdf`, and `dsdf`**:
+  - Root-caused the crash reported on ARM phones when running `--mode sdf`, `--mode msdf`, and `--mode dsdf`. All three modes call `upscale_adaptive` to build the adaptive reference image underneath. `upscale_adaptive` terminates with `suppress_speckle_pm(hr, dw, dh, ...)`.
+  - In `suppress_speckle_pm`, Pass 2 (the domino pair pass) previously iterated `for (int vert = 0; vert < 2; vert++) for (int y = 1; y + 1 < dh; y++) for (int x = 1; x + 1 < dw; x++)`.
+  - For a horizontal pair (`vert = 0`), the 3x4 bounding box around the pair needs `j` up to `+2`, which accessed `y + 2` at `y = dh - 2` (`dh` -> out of bounds by 1 row). For a vertical pair (`vert = 1`), the 4x3 bounding box around the pair needs `i` up to `+2`, which accessed `x + 2` at `x = dw - 2` (`dw` -> out of bounds by 1 column).
+  - On ARM Linux/Android (including Android's default Scudo allocator), reads 4 bytes past heap allocation limits trap immediately with `SIGSEGV` (segmentation fault).
+  - Fixed by correcting loop bounds to `for (int vert = 0; vert < 2; vert++) for (int y = 1; y + 2 - vert < dh; y++) for (int x = 1; x + 1 + vert < dw; x++)`. Verified zero AddressSanitizer / UndefinedBehaviorSanitizer (`-fsanitize=address,undefined`) heap-buffer overflows or memory errors across all modes.
+
 ## v4.9.3: SDF line-angle invariance, junction/entrance-corner fix, 10-pixel border fade removal; 32-mode WebP sheets
 
 - **SDF line-angle invariance (30°, 45°, 60°, shallow angles)**:

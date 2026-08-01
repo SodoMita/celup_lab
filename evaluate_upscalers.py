@@ -132,7 +132,7 @@ def encode_pm(p):
  rgba=np.dstack((np.clip(sr*255,0,255),a*255)).astype(np.uint8)
  return Image.fromarray(rgba,'RGBA')
 def main():
- cands=[candidate(x) for x in sys.argv[1:]] or [(Path('./celup5').resolve(),None)]
+ cands=[candidate(x) for x in sys.argv[1:]] or [(Path('./celup_lab').resolve(),None)]
  with tempfile.TemporaryDirectory() as td:
   td=Path(td)
   print('metric: linear premultiplied RGBA MAE; lower is better')

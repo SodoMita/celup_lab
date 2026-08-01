@@ -1,5 +1,16 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.9.4 update (2026-08-01): ARM64 / Android Segmentation Fault Fix for `sdf`, `msdf`, and `dsdf`
+
+- **ARM64 / Android segmentation fault fix in `suppress_speckle_pm`**:
+  - Scientific diagnosis: Resolved the segmentation fault reported on ARM phones when executing `--mode sdf`, `--mode msdf`, and `--mode dsdf`. All three modes invoke `upscale_adaptive` as their base renderer underneath, which completes by running `suppress_speckle_pm(hr, dw, dh, ...)`.
+  - In `suppress_speckle_pm`, Pass 2 (the domino pair pass) previously iterated `for (int vert = 0; vert < 2; vert++) for (int y = 1; y + 1 < dh; y++) for (int x = 1; x + 1 < dw; x++)`.
+  - For a horizontal pair (`vert = 0`), the 3x4 bounding box around the pair needs `j` up to `+2`, which accessed `y + 2` at `y = dh - 2` (`dh` -> out of bounds by 1 row). For a vertical pair (`vert = 1`), the 4x3 bounding box around the pair needs `i` up to `+2`, which accessed `x + 2` at `x = dw - 2` (`dw` -> out of bounds by 1 column).
+  - On ARM Linux/Android (such as Android's Scudo allocator), reading 4 bytes past heap allocation limits traps immediately with `SIGSEGV` (segmentation fault).
+  - Fixed by correcting loop bounds to `for (int vert = 0; vert < 2; vert++) for (int y = 1; y + 2 - vert < dh; y++) for (int x = 1; x + 1 + vert < dw; x++)`.
+  - Verified zero AddressSanitizer / UndefinedBehaviorSanitizer (`-fsanitize=address,undefined`) heap-buffer overflows or memory errors across all modes (`sdf`, `msdf`, `dsdf`, `adaptive`, etc.).
+  - Evaluated quantitative results: confirmed that `dsdf` achieves the lowest residual error on diagonal lines (`res95 = 0.0363px`), while `msdf` orientation-channel median combination exhibits inherent corner artifacting on complex line art (matching reference `py:msdf`).
+
 # v4.9.3 update (2026-07-31): SDF line-angle invariance, junction/entrance-corner fix, 10-pixel border fade removal; 32-mode WebP sheets
 
 - **SDF line-angle invariance (30°, 45°, 60°, shallow angles)**:
