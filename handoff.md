@@ -1,15 +1,19 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
-# Handoff: `celup_lab` upscale/hourglass investigation
+# v4.9.3 update (2026-07-31): SDF line-angle invariance, junction/entrance-corner fix, 10-pixel border fade removal; 32-mode WebP sheets
 
-# v4.9.3 update (2026-07-31): SDF 4-pass staircase suppression; vector-graphics upscaler benchmarks; parameter override & 3x3 checker fixes
-
-- **SDF 4-pass staircase suppression everywhere**:
-  - Previously, `upscale_sdf` ran only a single pass of `[1,2,1]/4` smoothing on the signed-distance field `d` and used strict edge gates (`ck <= .35f`, `|grad d|` in `.5f, .8f`), which caused a 1-source-pixel periodic staircase wobble (`jump95 = 0.306px`) on diagonal lines and failed to suppress staircases on softer edges.
-  - Replaced the single pass with 4 iterative separable passes on `d0/d1` and loosened the edge confidence/derivative gates (`ck <= .18f`, `|grad d|` threshold `.15f, .50f`, extent `3.5f`). This eliminates the periodic wobble and reduces SDF staircase step `jump95` from `0.306px` to **`0.065px`** (almost 5× smoother) with `res95 = 0.063px`, suppressing staircases across all edges.
+- **SDF line-angle invariance (30°, 45°, 60°, shallow angles)**:
+  - Scientific diagnosis: In `build_class_map`, discrete staircase steps on 30° and shallow lines have higher 5x5 plane MSE (`~0.035`) and lower `R^2` (`~0.50`) than 45° lines, causing `plane_conf` and `plane_r2` to reject them so `w_edge` dropped below `.18f`.
+  - Fixed by loosening `plane_mse` threshold to `.020f, .085f` and `plane_r2` threshold to `.25f, .70f`, allowing SDF to recognize and smooth lines at arbitrary angles with 100% confidence.
+- **SDF junction & entrance-to-big-object artifact removal**:
+  - Scientific diagnosis: When thin lines enter large solid objects or turn corners, splatting linear distance planes up to 3.5 source pixels away caused planes from thin features to radiate across junctions and bevel/chamfer corners (`check_corners.py`). Furthermore, 1D diagonal lines were sometimes misidentified as junctions.
+  - Fixed by adding 2D gradient structure tensor coherence (`coh_2d` and `junc_2d = 1.f - ramp01(coh_2d, .35f, .75f)`) in `build_class_map`, preventing confident 1D lines from being marked as junctions. In `upscale_sdf`, splat cutoff is restricted from `3.5f` to `2.0f` source pixels with tighter Gaussian weighting (`1.1f`), preventing linear planes from radiating across entrances to big objects.
+- **SDF 10-pixel border fade removal**:
+  - Scientific diagnosis: `upscale_sdf` previously penalized SDF confidence `f[10]` by splat weight normalization (`ramp01(iw, .15f, .5f)`) and smoothed gradient magnitude (`ramp01(|grad d|, .15f, .5f)`). Because border pixels have truncated neighborhoods and clamped boundary gradients, SDF faded out over ~10 pixels around image borders.
+  - Fixed by removing `f[10] *= ramp01(iw, .15f, .5f)` completely and lowering the gradient threshold to `.05f, .20f`, maintaining 100% SDF confidence around image borders right up to coordinate 0.
 - **Vector-like graphics & advanced library upscaler benchmarks**:
   - Added `py:vector` (Vector-Contour Edge-Directed Upscaler, designed specifically for vector-like graphics and pixel art to produce C1-continuous contours without staircase treads) alongside `scipy:spline5`, `cv2:lanczos4`, and `py:edgedir` in `evaluate_upscalers.py`, `hourglass_metric.py`, and `make_smiley_staircase_sheets.py`.
-  - Quantitative staircase evaluation (`staircase_diag45_comparison.png`, 95th-percentile step jump / res95):
+  - Quantitative staircase evaluation (`staircase_diag45_comparison.webp`, 95th-percentile step jump / res95):
     - `py:vector` (Vector-Contour): **jump95 = 0.112px | res95 = 0.105px** (zero staircase treads)
     - `celup_lab:sdf`: **jump95 = 0.065px | res95 = 0.063px** (suppressed everywhere)
     - `cv2:lanczos4`: jump95 = 0.181px | res95 = 0.146px
