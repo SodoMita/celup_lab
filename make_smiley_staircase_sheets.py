@@ -63,6 +63,8 @@ MODES = [
     ("scipy:spline5 (Ref)", "scipy", "spline5", ()),
     ("cv2:lanczos4 (Ref)", "cv2", "lanczos4", ()),
     ("py:vector (Ref)", "py", "vector", ()),
+    ("py:msdf (Ref)", "py", "msdf", ()),
+    ("py:dsdf (Ref)", "py", "dsdf", ()),
 ]
 
 def load_font(size):
@@ -143,6 +145,31 @@ def run_upscale(src_path, dst_path, scale, tool, mode, extra):
             pushed = cv2.remap(smoothed, xx_push, yy_push, cv2.INTER_LINEAR)
             wt_mag = np.clip((mag - 5.0) / 30.0, 0.0, 0.85)[:, :, None]
             base = smoothed * (1.0 - wt_mag) + pushed * wt_mag
+        elif mode == "msdf":
+            arr = np.asarray(im)
+            out_arr = np.empty((dh, dw, arr.shape[2]), dtype=np.uint8)
+            for ch in range(arr.shape[2]):
+                plane = arr[:, :, ch].astype(np.float32) / 255.0
+                gx = cv2.Sobel(plane, cv2.CV_32F, 1, 0, ksize=3); gy = cv2.Sobel(plane, cv2.CV_32F, 0, 1, ksize=3)
+                mag = np.sqrt(gx**2 + gy**2) + 1e-6
+                m0 = np.clip(np.abs(gy) / mag, 0, 1); m1 = np.clip(np.abs(gx) / mag, 0, 1); m2 = 1.0 - np.maximum(m0, m1) * 0.5
+                up0 = cv2.resize(plane * m0 + (1-m0)*0.5, (dw, dh), interpolation=cv2.INTER_CUBIC)
+                up1 = cv2.resize(plane * m1 + (1-m1)*0.5, (dw, dh), interpolation=cv2.INTER_CUBIC)
+                up2 = cv2.resize(plane * m2 + (1-m2)*0.5, (dw, dh), interpolation=cv2.INTER_CUBIC)
+                med = np.maximum(np.minimum(up0, up1), np.minimum(np.maximum(up0, up1), up2))
+                out_arr[:, :, ch] = np.clip((med - 0.5) * 4.0 + 0.5, 0, 1) * 255.0
+            base = out_arr
+        elif mode == "dsdf":
+            arr = np.asarray(im)
+            out_arr = np.empty((dh, dw, arr.shape[2]), dtype=np.uint8)
+            for ch in range(arr.shape[2]):
+                plane = arr[:, :, ch].astype(np.float32) / 255.0
+                up_c = cv2.resize(plane, (dw, dh), interpolation=cv2.INTER_CUBIC)
+                gx = cv2.Sobel(up_c, cv2.CV_32F, 1, 0, ksize=3); gy = cv2.Sobel(up_c, cv2.CV_32F, 0, 1, ksize=3)
+                mag = np.sqrt(gx**2 + gy**2) + 1e-6
+                d_geom = (up_c - 0.5) / (mag * 0.5 + 0.5)
+                out_arr[:, :, ch] = np.clip(0.5 + d_geom * 1.5, 0, 1) * 255.0
+            base = out_arr
         Image.fromarray(np.clip(base, 0, 255).astype(np.uint8), im.mode).save(dst_path)
     else:
         cmd = [str(EXE), str(src_path), str(dst_path), str(scale), "--mode", mode, *extra]
