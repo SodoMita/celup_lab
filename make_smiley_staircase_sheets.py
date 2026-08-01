@@ -21,6 +21,8 @@ ROOT = Path(__file__).resolve().parent
 EXE = ROOT / "celup_lab"
 SMILEY_SRC = ROOT / "images/examples/poor_smiley.webp"
 DIAG_SRC = ROOT / "tests/diagline48_src.webp"
+CAT_SRC = ROOT / "images/examples/cat.webp"
+PIKACHU_SRC = ROOT / "images/examples/pikachu.webp"
 SHEET_DIR = ROOT / "images/comparison_sheets"
 TEST_DIR = ROOT / "images/tests"
 
@@ -115,9 +117,7 @@ def run_upscale(src_path, dst_path, scale, tool, mode, extra):
             yy, xx = np.mgrid[0:dh, 0:dw]
             xx_push = np.clip(xx - nx * 0.8, 0, dw - 1).astype(np.float32)
             yy_push = np.clip(yy - ny * 0.8, 0, dh - 1).astype(np.float32)
-            pushed = np.empty_like(base)
-            for ch in range(base.shape[2]):
-                pushed[:, :, ch] = cv2.remap(base[:, :, ch], xx_push, yy_push, cv2.INTER_LINEAR)
+            pushed = cv2.remap(base, xx_push, yy_push, cv2.INTER_LINEAR)
             wt = np.clip((mag - 10.0) / 40.0, 0.0, 0.7)[:, :, None]
             base = base * (1.0 - wt) + pushed * wt
         elif mode == "vector":
@@ -134,16 +134,13 @@ def run_upscale(src_path, dst_path, scale, tool, mode, extra):
                 wt = np.exp(-0.5 * (step / 1.5)**2)
                 xs = np.clip(xx + tx * step, 0, dw - 1).astype(np.float32)
                 ys = np.clip(yy + ty * step, 0, dh - 1).astype(np.float32)
-                for ch in range(base.shape[2]):
-                    acc[:, :, ch] += wt * cv2.remap(base[:, :, ch], xs, ys, cv2.INTER_LINEAR)
+                acc += wt * cv2.remap(base, xs, ys, cv2.INTER_LINEAR)
                 w_tot += wt
             smoothed = acc / w_tot
             shift = 0.6
             xx_push = np.clip(xx - nx * shift, 0, dw - 1).astype(np.float32)
             yy_push = np.clip(yy - ny * shift, 0, dh - 1).astype(np.float32)
-            pushed = np.empty_like(base)
-            for ch in range(base.shape[2]):
-                pushed[:, :, ch] = cv2.remap(smoothed[:, :, ch], xx_push, yy_push, cv2.INTER_LINEAR)
+            pushed = cv2.remap(smoothed, xx_push, yy_push, cv2.INTER_LINEAR)
             wt_mag = np.clip((mag - 5.0) / 30.0, 0.0, 0.85)[:, :, None]
             base = smoothed * (1.0 - wt_mag) + pushed * wt_mag
         Image.fromarray(np.clip(base, 0, 255).astype(np.uint8), im.mode).save(dst_path)
@@ -329,7 +326,47 @@ def main():
             label_h=66,
         )
         sheet_diag45.save(SHEET_DIR / "staircase_diag45_comparison.webp", lossless=True)
-        print("   -> saved staircase_diag45_comparison.png (.webp)")
+        print("   -> saved staircase_diag45_comparison.webp")
+
+        # --------------------------------------------------------------------
+        # Sheet 5: cat_crop_comparison (cat.webp 128x128 crop -> 256x256 2x)
+        # --------------------------------------------------------------------
+        print("5. Generating cat_crop_comparison sheet (2x upscale detail crop)...")
+        cat_src_crop = td / "cat_src_128.webp"
+        Image.open(CAT_SRC).crop((136, 100, 264, 228)).save(cat_src_crop, lossless=True)
+        cat_crop_panels = []
+        for label, tool, mode, extra in MODES:
+            out_p = td / f"cat_{tool}_{mode}_{len(cat_crop_panels)}.webp"
+            run_upscale(cat_src_crop, out_p, 2, tool, mode, extra)
+            im = Image.open(out_p).convert("RGB")
+            cat_crop_panels.append((label, im))
+        sheet_cat_crop = make_grid_sheet(
+            "cat.webp 2x Upscale Detail Crop (256x256 around eyes/whiskers)",
+            cat_crop_panels,
+            cols=8,
+        )
+        sheet_cat_crop.save(SHEET_DIR / "cat_crop_comparison.webp", lossless=True)
+        print("   -> saved cat_crop_comparison.webp")
+
+        # --------------------------------------------------------------------
+        # Sheet 6: pikachu_crop_comparison (pikachu.webp 128x128 crop -> 256x256 2x)
+        # --------------------------------------------------------------------
+        print("6. Generating pikachu_crop_comparison sheet (2x upscale line-art crop)...")
+        pika_src_crop = td / "pika_src_128.webp"
+        Image.open(PIKACHU_SRC).crop((100, 500, 228, 628)).save(pika_src_crop, lossless=True)
+        pikachu_crop_panels = []
+        for label, tool, mode, extra in MODES:
+            out_p = td / f"pika_{tool}_{mode}_{len(pikachu_crop_panels)}.webp"
+            run_upscale(pika_src_crop, out_p, 2, tool, mode, extra)
+            im = Image.open(out_p).convert("RGB")
+            pikachu_crop_panels.append((label, im))
+        sheet_pika_crop = make_grid_sheet(
+            "pikachu.webp 2x Upscale Line-Art Detail Crop (256x256 around vector contours)",
+            pikachu_crop_panels,
+            cols=8,
+        )
+        sheet_pika_crop.save(SHEET_DIR / "pikachu_crop_comparison.webp", lossless=True)
+        print("   -> saved pikachu_crop_comparison.webp")
 
     print("Done! All comparison sheets created successfully.")
 

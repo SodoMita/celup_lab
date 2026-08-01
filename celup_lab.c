@@ -1155,7 +1155,7 @@ static int build_class_map(const uint8_t *in, int sw, int sh, class_map_t *cm) {
         if (chk2 > checker_ev)
           checker_ev = chk2;
         checker_conf = contrast_conf * checker_ev;
-        junction_conf = contrast_conf * (1.f - line_conf * plane_conf) *
+        junction_conf = contrast_conf * (1.f - fmaxf(line_conf, plane_conf)) *
                         (1.f - checker_ev);
         float plane_q =
             plane_conf > plane_r2_conf ? plane_conf : plane_r2_conf;
@@ -3334,7 +3334,7 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
       /* Checker/Nyquist ambiguity suppresses seeding outright: re-fitting
          geometry there invents structure the class policy says we cannot
          know. */
-      float ck = cm.w_edge[k] * (1.f - cm.w_checker[k]);
+      float ck = cm.w_edge[k] * (1.f - cm.w_checker[k]) * (1.f - cm.w_junction[k]);
       float gx = cm.edge_gx[k], gy = cm.edge_gy[k];
       float g2 = gx * gx + gy * gy;
       if (ck <= .18f || g2 < .08f * .08f || g2 > 1.8f * 1.8f)
@@ -3492,6 +3492,9 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
       float f[11];
       field_bilinear_sample(fld, sw, sh, 11, sx, sy, f);
       float conf = clampf(f[10], 0.f, 1.f);
+      int ix0 = clampi((int)roundf(sx), 0, sw - 1), iy0 = clampi((int)roundf(sy), 0, sh - 1);
+      float jconf = cm.w_junction[iy0 * sw + ix0];
+      conf *= clampf(1.f - 3.f * jconf, 0.f, 1.f);
       if (conf > 1e-4f) {
         float base[4];
         raw_pm(out, dw, dh, x, y, base);
