@@ -1,5 +1,36 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.9.9 update (2026-08-01): zero-grey completion on step-class sources + pole fix
+
+- User: "deblur to 0 grey on a BW image; remove the highest caps in
+  most cases; XY-pole blur artifacts since 4.8; autodeblur is a
+  deblur."  Verdict: all delivered; details below.
+- Residual-grey forensics (r6): 55% washed stroke cores (eye rings,
+  local window never saw the true level), 68%-of-rest 1px fixpoint
+  column, remainder evidence-dead columns.  Fixes are cap REMOVALS:
+  full endpoint extension on quantized sources (floor remnant .084
+  linear measured and removed), true-AA corridor kept for continuous
+  content only, binary payment (.30/.12), admission = max(fit trust,
+  flank-pair proof, mismatch+step-span straggler channel).  Value-side
+  (own-hull diagonal from own colour) is the only safe orientation:
+  positional mu tie-break DOUBLED the ring into hash; nu-side join
+  drew white specks in ink (halo 107) -- frame flips make both
+  untrustworthy, colour side is frame-eating.
+- Completion premise gating: fires only where base blur was assumed
+  (sref > 1.2), so -r 0.5 keeps the staircase and check_stairs'
+  probe-crisp stays honest.
+- Pole artifact root: axis-aligned evidence box blur mixes
+  opposite-flank evidence at XY poles of circles (measured extra
+  wash + nu flips at exact pole rows).  Fix: tangent-oriented
+  evidence integration (bilinear taps along the per-pixel tangent),
+  uniform rule, no pole special-casing.  Residual: a sub-pixel dash
+  at the r6 bottom pole remains (wash out-spans probe reach).
+- Scoreboard smiley (v4.9.5/97/98/99): r6 grey 17.69/17.61/4.99/
+  1.62%, r6 halo 17.37/16.25/8.99/2.91, r6 ink .949/.951/.957/.964;
+  r2.3 grey 12.71/12.22/2.96/1.13%, r2.3 halo 4.75/4.17/0.49/0.00,
+  r2.3 ink .969/.970/.976/.988.  Gates all PASS (corners, stairs,
+  scales); miya 4x = contour crisping only (qconf 0 => caps active).
+
 # v4.9.8 update (2026-08-01): the grey test -- erf-gain post-map on the finished colour
 
 - New user acceptance test: mid-grey on the (45-level quantized)

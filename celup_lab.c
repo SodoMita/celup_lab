@@ -3732,44 +3732,55 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
     static const int slots5[5] = {20, 21, 22, 23, 24};
     static const int *slotsetA[3] = {slots2, slots3, slots5};
     static const int nslotsA[3] = {7, 10, 5};
-    static const int radiiA[3] = {2, 3, 5};
-    float *ev = malloc((size_t)dw * dh * sizeof *ev);
-    if (ev)
+    static int radiiA[3] = {2, 3, 5};
+    {
+      const char *e = getenv("CELUP_RADA");
+      if (e) {
+        int r2, r3, r5;
+        if (sscanf(e, "%d,%d,%d", &r2, &r3, &r5) == 3) {
+          radiiA[0] = r2;
+          radiiA[1] = r3;
+          radiiA[2] = r5;
+        }
+      }
+    }
+    /* v4.9.9e: TANGENT-ORIENTED evidence integration.  The separable
+       axis-aligned box blur reaches R px across the contour
+       everywhere, but at a contour's XY poles that axis coincides
+       with the contour NORMAL: at the ring's top/bottom/left/right
+       the +-3 box mixes the inner flank's evidence with the outer
+       flank's (opposite deltas cancel, nu claims flip per pixel) --
+       the measured "additional blur at the poles of circles since
+       v4.8", left by both tangential mechanisms' shared premise that
+       averaging must follow the contour.  Everywhere else the same
+       arithmetic is the intended consensus.  Marching the taps along
+       the per-pixel tangent (bilinear samples, tent kernel, sign-
+       free by symmetry) keeps exactly the old effective support
+       along-trace and removes any cross-contour reach: no special-
+       case code, one rule for all angles. */
+    float *tmp = malloc((size_t)dw * dh * sizeof *tmp);
+    if (tmp)
       for (int sset = 0; sset < 3; sset++)
         for (int sl = 0; sl < nslotsA[sset]; sl++) {
           const int q = slotsetA[sset][sl], R = radiiA[sset];
-        for (int y = 0; y < dh; y++)
-          for (int x = 0; x < dw; x++) {
-            double acc = 0.;
-            int cnt = 0;
-            for (int dx = -R; dx <= R; dx++) {
-              int xx = x + dx;
-              if (xx < 0)
-                xx = 0;
-              if (xx >= dw)
-                xx = dw - 1;
-              acc += PF[25 * ((size_t)y * dw + xx) + q];
-              cnt++;
+          for (int y = 0; y < dh; y++)
+            for (int x = 0; x < dw; x++) {
+              size_t idx = (size_t)y * dw + x;
+              const float *pf = PF + 25 * idx;
+              double acc = 0., ws = 0.;
+              for (int to = -R; to <= R; to++) {
+                float wt = (float)(R + 1 - (to < 0 ? -to : to)), qv[25];
+                sample_fn(PF, dw, dh, 25, (float)x + (float)to * pf[8],
+                          (float)y + (float)to * pf[9], qv);
+                acc += (double)wt * qv[q];
+                ws += wt;
+              }
+              tmp[idx] = ws > 1e-9 ? (float)(acc / ws) : 0.f;
             }
-            ev[(size_t)y * dw + x] = (float)(acc / cnt);
-          }
-        for (int x = 0; x < dw; x++)
-          for (int y = 0; y < dh; y++) {
-            double acc = 0.;
-            int cnt = 0;
-            for (int dy = -R; dy <= R; dy++) {
-              int yy = y + dy;
-              if (yy < 0)
-                yy = 0;
-              if (yy >= dh)
-                yy = dh - 1;
-              acc += ev[(size_t)yy * dw + x];
-              cnt++;
-            }
-            PF[25 * ((size_t)y * dw + x) + q] = (float)(acc / cnt);
-          }
-      }
-    free(ev);
+          for (size_t k = 0; k < (size_t)dw * dh; k++)
+            PF[25 * k + q] = tmp[k];
+        }
+    free(tmp);
   }
   /* Pass 1.5: contour-consensus evaluation (v4.9).  Raw per-pixel fits
      jitter (mu by up to 1-2 out px near wedges/apexes) and the anchored
@@ -4335,7 +4346,15 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                proof: monotone map, range (0,1), proven endpoints --
                no overshoot is possible, only geometry decided by the
                colour itself. */
-            float qq = ss01((adb_qconf - .60f) * (1.f / .30f));
+            /* step-class completion needs TWO premises: a quantized
+               source AND real blur to undo.  At -r <= ~1.2 the base
+               adds no composite wash -- the source staircase is then
+               true quantizer structure the renderer must preserve
+               verbatim (the -l 0.5 crisp probe: hide the treads and
+               the staircase detector goes toothless), so the
+               completion fades out there. */
+            float qq = ss01((adb_qconf - .60f) * (1.f / .30f)) *
+                       ss01((sref - 1.2f) * (1.f / .8f));
             /* huge local hull span = a true step lives here, not a
                smooth-gradient fragment (skin/hair shading spans far
                less): extend the endpoints toward the source-global
@@ -4345,7 +4364,17 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                ACTUALLY connects.  calh = the source-GLOBAL channel
                range span; rmp engages only when the local window
                demonstrably straddles a global-extremes step. */
-            float rmp = ss01((alh - .35f * calh) * (1.f / .6f)) *
+            /* v4.9.9c full extension on quantized sources: the r6
+               wash band's local hull spans 60-90% of the global
+               range, so the proportional extension left (1-rcp) of
+               the washed floor inside the snap target -- measured
+               remnants .084 linear ~ lum 80.  On a step-class source
+               every map-admissible step is taken to connect the
+               source-global extremes (small local steps -- colour
+                 pairs in multi-level content -- never pass the alh
+                 admission floor), so extend to the extremes outright
+                 whenever the step-span gate fires at all. */
+            float rmp = ss01((alh - .22f * calh) * (1.f / .45f)) *
                         ss01((adb_qconf - .5f) * (1.f / .3f));
             /* v4.9.9 washed-core full extension ("remove the highest
                caps"): the model claims this pixel sits DEEP on a
@@ -4368,16 +4397,50 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
 #ifndef CELUP_EVW2V
 #define CELUP_EVW2V 1
 #endif
-#if CELUP_EVW2V
-            float agr = 1.f - fabsf(nu - m);
-            float evz = fmaxf(w, w2v * ss01((agr - .50f) * (1.f / .35f)));
-#else
-            float evz = fmaxf(w, w2v);
-#endif
-            /* weight: real step span x corridor exit x evidence. */
+            /* admission: fit trust w, plus flank-pair proof w2v
+               where the steepened model's verdict nu and the
+               measured colour fraction m DISAGREE -- the analytic
+               signature of blur wash (a genuine gradient has m ~ nu,
+               wash does not).  Frame-flip safety comes from the
+               target, not the gate: the map pays to the pixel's OWN
+               proven hull along the colour diagonal reached from its
+               own colour -- a frame-flipped fit changes WHICH side
+               the fit claims, never which side the colour is on. */
+            float mis = ss01((fabsf(nu - m) - .10f) * (1.f / .30f));
+            float evz = fmaxf(w, w2v * mis);
+            /* v4.9.9e straggler channel: occasionally a whole
+               vertical/horizontal strip of pixels carries HEAVY
+               model-vs-colour mismatch while both trust channels
+               read ~0 (the nearest-lobe framing is unstable along
+               the exact XY-pole rows of circles: wS and the flank-
+               pair restoration both fall silent there, and the map's
+               own gate then leaves the wash in place as a gray seam
+               cutting the ring -- the "additional blur at the poles"
+               the user sees).  The signature is unambiguous on a
+               quantized source: mismatch near full scale plus a hull
+               that still spans the global step.  Let the colour side
+               settle those too: the target is the same own proven
+               hull, so snap-away is still by-decision-only.  Photos:
+               qq = 0, unreachable. */
+            if (qq > 1e-3f) {
+              float alt = ss01((fabsf(nu - m) - .45f) *
+                               (1.f / .30f)) *
+                          qq * ss01((alh - .80f) * (1.f / .50f));
+              if (alt > evz)
+                evz = alt;
+            }
+            /* weight: real step span x corridor exit x evidence.
+               The true-AA corridor (|mu| <= a) is kept ONLY for
+               continuous sources: there the boundary column's value
+               encodes exact sub-pixel feature width (crisp-GT check:
+               repainting it costs MAE 13.2 -> 19).  On quantized
+               (step-class) sources that column is quantizer residue,
+               and its linear hull fraction (footprint-majority
+               coverage) assigns it to its own side's proven
+               plateau. */
             float wz = ss01((evz - .10f) * (1.f / .4f)) *
                        ss01((alh - .30f) * (1.f / .25f)) *
-                       ss01((mmu - a) * (1.f / .7f));
+                       fmaxf(ss01((mmu - a) * (1.f / .7f)), qq);
             float elo3[3], ehi3[3];
             for (int c = 0; c < 3; c++) {
               elo3[c] = vblo[c] + rcp * (adb_srclo[c] - vblo[c]);
@@ -4422,8 +4485,12 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                  the partial lerp used to leave 30-50% of the proven
                  deblur behind on exactly the washed pixels it exists
                  for. */
+              /* cap removal, second pass: .30/.12 fullness -- the
+                 .55/.20 band left .1-linear floor remnants (lum 80)
+                 on exactly the pixels it half-paid.  Gates below
+                 keep their evidence role; the payment is binary. */
               float wz2 =
-                  wz > .55f ? 1.f : ss01((wz - .20f) * (1.f / .35f));
+                  wz > .30f ? 1.f : ss01((wz - .12f) * (1.f / .18f));
               for (int c = 0; c < 3; c++) {
                 /* target = mm-fraction across the channel's own HULL
                    span (hull amplitude is proven; the LSQ d2
@@ -6307,7 +6374,7 @@ static uint8_t *slurp(const char *name, size_t *n) {
 static void print_help(const char *argv0) {
   printf(
       "celup_lab -- premultiplied-linear WebP upscaler (research build "
-      "v4.9.8)\n"
+      "v4.9.9)\n"
       "\n"
       "Usage: %s in.webp out.webp SCALE [options]\n"
       "  SCALE is the upsampling factor, real number in (1,32] "
