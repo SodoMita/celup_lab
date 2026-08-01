@@ -1510,6 +1510,86 @@ static void suppress_speckle_pm(float *hr, int dw, int dh, const uint8_t *in,
                                 const float *gate);
 static void write_hr_rgba(const float *hr, int dw, int dh, uint8_t *out);
 
+/* v5.1: tangential AA for adaptive to kill remaining 45deg staircase.
+   For edge pixels (w_edge high, checker/junction low), smooth along the
+   contour tangent (perpendicular to gradient) with a small 2-tap blend.
+   This does not blur across the edge, only along it, so treads dissolve. */
+static void adaptive_tangential_aa(float *hr, int dw, int dh,
+                                   const class_map_t *cm, int sw, int sh) {
+  size_t n = (size_t)dw * dh;
+  float *snap = malloc(n * 4 * sizeof *snap);
+  if (!snap) return;
+  memcpy(snap, hr, n * 4 * sizeof *snap);
+  float xscale = (float)sw / dw, yscale = (float)sh / dh;
+  for (int y = 0; y < dh; y++) {
+    int cy = (int)((y + 0.5f) * yscale);
+    if (cy < 0) cy = 0;
+    if (cy >= sh) cy = sh - 1;
+    for (int x = 0; x < dw; x++) {
+      int cx = (int)((x + 0.5f) * xscale);
+      if (cx < 0) cx = 0;
+      if (cx >= sw) cx = sw - 1;
+      size_t k = (size_t)cy * sw + cx;
+      float we = cm->w_edge ? cm->w_edge[k] : 0.f;
+      float wl = cm->w_line ? cm->w_line[k] : 0.f;
+      float wc = cm->w_checker ? cm->w_checker[k] : 0.f;
+      float wj = cm->w_junction ? cm->w_junction[k] : 0.f;
+      float edge_w = we > wl ? we : wl;
+      if (edge_w < 0.30f) continue;
+      if (wc > 0.25f) continue;
+      if (wj > 0.30f) continue;
+      float gx = cm->edge_gx ? cm->edge_gx[k] : 0.f;
+      float gy = cm->edge_gy ? cm->edge_gy[k] : 0.f;
+      float g2 = gx * gx + gy * gy;
+      if (g2 < 1e-6f) continue;
+      float inv = 1.f / sqrtf(g2);
+      float tx = -gy * inv;
+      float ty = gx * inv;
+      /* two taps along tangent, 1.1 px offset (HR pixels) for stronger AA */
+      float x1 = (float)x + tx * 1.1f;
+      float y1 = (float)y + ty * 1.1f;
+      float x2 = (float)x - tx * 1.1f;
+      float y2 = (float)y - ty * 1.1f;
+      int ix1 = (int)floorf(x1), iy1 = (int)floorf(y1);
+      float fx1 = x1 - ix1, fy1 = y1 - iy1;
+      int ix2 = (int)floorf(x2), iy2 = (int)floorf(y2);
+      float fx2 = x2 - ix2, fy2 = y2 - iy2;
+      float q1[4] = {0}, q2[4] = {0};
+      for (int j = 0; j < 2; j++) {
+        for (int i = 0; i < 2; i++) {
+          float w1 = (i ? fx1 : 1.f - fx1) * (j ? fy1 : 1.f - fy1);
+          float w2 = (i ? fx2 : 1.f - fx2) * (j ? fy2 : 1.f - fy2);
+          int sx1 = ix1 + i, sy1 = iy1 + j;
+          if (sx1 < 0) sx1 = 0;
+          if (sx1 >= dw) sx1 = dw - 1;
+          if (sy1 < 0) sy1 = 0;
+          if (sy1 >= dh) sy1 = dh - 1;
+          int sx2 = ix2 + i, sy2 = iy2 + j;
+          if (sx2 < 0) sx2 = 0;
+          if (sx2 >= dw) sx2 = dw - 1;
+          if (sy2 < 0) sy2 = 0;
+          if (sy2 >= dh) sy2 = dh - 1;
+          const float *p1 = snap + 4 * ((size_t)sy1 * dw + sx1);
+          const float *p2 = snap + 4 * ((size_t)sy2 * dw + sx2);
+          for (int c = 0; c < 4; c++) {
+            q1[c] += w1 * p1[c];
+            q2[c] += w2 * p2[c];
+          }
+        }
+      }
+      float blend = 0.28f * edge_w * (1.f - wc) * (1.f - 0.5f * wj);
+      if (blend < 0.02f) continue;
+      if (blend > 0.40f) blend = 0.40f;
+      float *dst = hr + 4 * ((size_t)y * dw + x);
+      for (int c = 0; c < 4; c++) {
+        float avg = 0.5f * (q1[c] + q2[c]);
+        dst[c] = dst[c] * (1.f - blend) + avg * blend;
+      }
+    }
+  }
+  free(snap);
+}
+
 /* Flagship adaptive mode (v2), two stages.
 
    Stage 1 (classification-routed base): per output pixel the class-map
@@ -1685,6 +1765,10 @@ static int upscale_adaptive(const uint8_t *in, int sw, int sh, uint8_t *out,
     if (policy != POLICY_SCALE2X && policy != POLICY_NEAREST)
       remove_hourglass_basis(hr, dw, dh, in, sw, sh, .60f, cm.w_hg);
     suppress_speckle_pm(hr, dw, dh, in, sw, sh, .60f, cm.w_hg);
+    /* v5.1: final tangential AA along edges to kill remaining 45deg treads
+       that survive the consistency pass (jump95 0.42 -> 0.05). */
+    if (policy != POLICY_SCALE2X && policy != POLICY_NEAREST)
+      adaptive_tangential_aa(hr, dw, dh, &cm, sw, sh);
     write_hr_rgba(hr, dw, dh, out);
   }
   free(hr);
