@@ -38,6 +38,46 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
+## v4.9.4: accumulate-mass deblur -- stroke interiors filled, membership gate recentered
+
+User's complaint: autodeblur **"water colors, produce halo. it
+supposed to accumulate colors back at deblur phase."**  What the
+numbers showed (smiley 2x, user's `-r 6 -g 64` recipe, ROI ink total
+with nearest-neighbour as 1.0, core darkness NN = 254):
+
+- **The restored plateau was claimed correctly but PAID almost
+  nowhere.**  v4.9.3's pass-1.5 membership gates (`uf0/uf1`) read the
+  unsteepened base-model saturation with centre .78.  A narrow
+  `-r 6` stroke is only ~2.9 model-sigma wide, so its whole interior
+  sits at ufit0 .6-.9 and only the dead-centre sliver was paid the
+  restoration; the rest kept the attenuated plateau = washed stroke.
+  The steepened `nu` cannot take the gate over (`phi1(k*z0)`
+  saturates at |z0| > 2.5/k, so it calls 4 px inside and 4 px outside
+  identically "plateau" -- trying it painted washed skirts black,
+  diagline GT MAE 13.7 -> 17.6).  Fix: keep the side-truth ufit0 and
+  recenter the gate .78 -> .70 (scanned .55-.78 on both fixtures;
+  .70 is the best joint point).
+- **Mass-correct restore depth.**  Recovering contrast by `1/att`
+  still leaves a narrow feature ink-short: the blurred deficit spans
+  `~(wsrc+2.83*sigma)` while the k-steepened ramp repays it over only
+  `2.83*sigma/k`.  The restore factor now blends in
+  `min(k,8)/att * wsrc/(wsrc+2.83*sigma)` (narrow-feature-gated by
+  att < .85, capped 4x, source-range clamp unchanged).  The pass-1
+  steepness k is computed above the restoration block so the depth
+  matches what the contour is actually rendered with.
+- **Full payment deep inside proven features.**  Where steepened
+  saturation, base-model saturation and value-membership all agree
+  (`nu ~ 0/1`, `uf > .98`, `gInn > .6`) the restoration fires at
+  full strength instead of the blurred consensus weight (~.5-.7) --
+  the smearing used to cap interiors at ~60% of the proven depth.
+- Results in that metric: interior ink .805 (v4.9.2) -> .879
+  (v4.9.3) -> **.912**, core darkness 195 -> 215 -> **223**, halo
+  19.9 -> 17.8 -> **17.6** (unchanged; transporting the skirt mass
+  back into the stroke is still the open part).  Diagline GT MAE
+  14.2 vs v4.9.2's 13.7; the `-r 2.3` (miya) recipe stays where it
+  was.  Gates: check_stairs, check_corners, test_scales (incl. miya
+  face sweep) all pass.
+
 ## v4.9.3: honest effective-k, narrow-line amplitude restoration, terrace cleanup
 
 User's complaints: **"ignoring parameters"** (e.g. `-g 16` and `-g 64`
