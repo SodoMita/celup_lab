@@ -1,5 +1,56 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.9.8 update (2026-08-01): the grey test -- erf-gain post-map on the finished colour
+
+- New user acceptance test: mid-grey on the (45-level quantized)
+  smiley output = incorrect deblur, by definition.  v4.9.7 left
+  17.6% mid-grey at r6 (NN: 0.02%).  Plus the standing demand:
+  formulas derived so overshoot is impossible by construction.
+- Mechanism: AFTER the colour is finished (steepening + plateau
+  restoration + own-line transport), write it as the step fraction
+  m = ((v-P0).A)/(A.A) against the pixel's own local colour hull
+  [P0,P1] (LOH; hull==NN colours within ~1 step), then steepen in
+  z-space: m' = Phi(g Phi^-1(m)) (g=2.2).  Monotone, range (0,1),
+  hue-safe (shared scalar m per pixel), true ramp core at m=.5 is a
+  fixpoint.  Endpoint extension toward the source-global range only
+  on hard-quantized sources (qconf gate -- photos never reach it;
+  measured failure: image-global red injected at purple|green edges
+  = neon fringes on the wand smoke).
+- Forensic notes for the next round:
+  - w2v (dip-line consensus) covers ~0% of the ordinary contour wash
+    -- any gate built on it is blind on exactly the veil class.
+  - The v4.9 model plateaus (o +- ufit*d2 + off) are uncalibrated on
+    washed flanks: |A| ~1.3 in a 0..1 range, P0 ~ -1.  Never use the
+    LSQ amplitude as a snap target; the hull amplitude is the proven
+    one.
+  - d2's sign flips with the pass-1 u-reversal: plateau targets must
+    be indexed along the hull diagonal (dark..bright) or per-channel
+    d2[c]-sign -- never a global "bright = mm=1" rule (catastrophe:
+    ink .64, halo 103).
+  - Pass 2 UNDOES any pass-1.5 snap unless told otherwise: the final
+    hull clamp raises the washed floor back (LOH lo ~ 49/255 inside
+    a wide wash) and the staircase cleanup lerps the pixel back
+    toward the washed base average.  Fix: write the mapped hull to
+    LOH, and stand the cleanup/smoothing down where the map fired
+    (per-pixel ZM weight array).
+  - Positional repaint of the AA corridor (linear ramp T(mu)) is
+    dead by measurement: crisp-GT MAE 13.2 -> 19+.  Boundary AA
+    values encode sub-pixel feature width; only the source signal
+    carries it.  CELUP_ZAA corridor knob kept (default ~0).
+  - The grey test and the diagline crisp-GT metric contradict by
+    definition (GT contains AA grays; the test forbids them): MAE
+    13.20 -> ~15.0 is the accepted price on that fixture.
+- Scoreboard: r6 grey 17.61->4.99%, halo 16.25->8.99, ink .951->.957,
+  darkmean 30.4->11.4; r2.3 grey 12.22->2.96%, halo 4.17->0.49,
+  ink .970->.976, darkmean 19.2->7.3.  miya: diff>16 = 268k px but
+  all contour-crisping (mouth/bow/bangs/skin near-identical, no
+  rings; wand smoke hue borders mildly tightened).  Gates: stairs
+  (recalibrated .30: ship .098/probe .362), corners PASS, scales
+  204 rows PASS.
+- Residual: r6 still ~5% grey (junction hotspots at half-weight and
+  the 1-2px soft ramp the map keeps by design); ship2x jump95 .098
+  (smoother than v4.9.7's .171); diagline MAE ~15.0.
+
 # v4.9.7 update (2026-08-01): v4.9.6 halo regression root-caused; overshoot-free transport
 
 - User regression report on v4.9.6: "black halo around miya mouth

@@ -2369,6 +2369,61 @@ static float estimate_qconf(const uint8_t *in, int sw, int sh) {
 }
 /* Standard-normal CDF (libm erff). */
 static float phi1(float z) { return .5f * (1.f + erff(z * 0.70710678f)); }
+/* v4.9.8: inverse normal CDF Phi^-1(p), p in (0,1) -- Acklam's
+   rational approximation (max abs error ~3e-9 in z, far below the
+   1/255 output quantum).  Used by the erf-gain post-map. */
+static float probit01(float p) {
+  static const float a[6] = {-3.969683028665376e+01f,
+                             2.209460984245205e+02f,
+                             -2.759285104469687e+02f,
+                             1.383577518672690e+02f,
+                             -3.066479806614716e+01f,
+                             2.506628277459239e+00f};
+  static const float b[5] = {-5.447609879822406e+01f,
+                             1.615858368580409e+02f,
+                             -1.556989798598866e+02f,
+                             6.680131188771972e+01f,
+                             -1.328068155288572e+01f};
+  static const float c[6] = {-7.784894002430293e-03f,
+                             -3.223964580411365e-01f,
+                             -2.400758277161838e+00f,
+                             -2.549732539343734e+00f,
+                             4.374664141464968e+00f,
+                             2.938163982698783e+00f};
+  static const float d[4] = {7.784695709041462e-03f,
+                             3.224671290700398e-01f,
+                             2.445134137142996e+00f,
+                             3.754408661907416e+00f};
+  const float plow = .02425f, phigh = 1.f - .02425f;
+  if (p <= 1e-6f)
+    return -4.7534f; /* phi1(-4.7534) ~ 1e-6 */
+  if (p >= 1.f - 1e-6f)
+    return 4.7534f;
+  if (p < plow) {
+    float q = sqrtf(-2.f * logf(p));
+    return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) *
+                q +
+            c[5]) /
+           ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.f);
+  }
+  if (p <= phigh) {
+    float q = p - .5f, r = q * q;
+    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) *
+                r +
+            a[5]) *
+           q /
+           (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) *
+                r +
+            1.f);
+  }
+  {
+    float q = sqrtf(-2.f * logf(1.f - p));
+    return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) *
+                 q +
+             c[5]) /
+            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.f);
+  }
+}
 
 /* v4.9.6 dip/line-profile helper: the box(h)-gauss(sig) dip shape,
    normalized to 1 at the centre (p = |position - line centre|). */
@@ -2639,12 +2694,14 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
   float *PF = malloc(n * 25 * sizeof *PF);
   uint8_t *LOH = malloc(n * 8);              /* local hull, u8/chan    */
   uint8_t *dst = malloc(n * 4);
-  if (!A || !DEL || !PF || !LOH || !dst) {
+  float *ZM = calloc(n, sizeof *ZM); /* v4.9.8 erf-gain map weight/px */
+  if (!A || !DEL || !PF || !LOH || !dst || !ZM) {
     free(A);
     free(DEL);
     free(PF);
     free(LOH);
     free(dst);
+    free(ZM);
     return 0;
   }
   for (int y = 0; y < dh; y++)
@@ -4105,6 +4162,55 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                       0, 255);
             }
           }
+        /* v4.9.8 erf-gain post-map (the grey test: mid-grey on the
+           output of a step-class source is wash, by definition).
+           Goal: modify the gradient to increase its slope with zero
+           possibility of overshoot.  Derivation: a Gaussian-blurred
+           edge is v(x) = P0 + A*Phi((x-x0)/s); de-blurring the edge
+           s -> s/g is exactly (x-x0) -> g*(x-x0), so with the
+           rendered colour written as the hull fraction
+           m = ((v-P0).A)/(A.A)  (A = P1-P0 = the pixel's OWN local
+           colour hull, i.e. observed/proven colours only), the map
+             m' = Phi(g * Phi^-1(m)),   v' = P0 + m'*A
+           IS that de-blur.  Safety by construction, not by tuning:
+           Phi o (g*Phi^-1) is a composition of monotone maps with
+           range (0,1), so v' is ALWAYS strictly inside the proven
+           hull [P0,P1] -- overshoot (ringing) is impossible, and the
+           colour stays on the hull diagonal between two observed
+           colours (no foreign hues can enter).  The plateaus are
+           attractors (m ~ 0/1 snap fully: wash shoulders and
+           cross-wash are re-absorbed into their own plateau),
+           m = .5 is a fixpoint (the soft ramp core survives,
+           compressed by 1/g), and the wash gate |m - nu| (applied
+           after the colour is finished, below) fires only where the
+           k-steepened model's position claim disagrees with the
+           actual colour -- the analytic signature of blur wash.
+           Genuine gradients render m ~ nu and stay verbatim. */
+#ifndef CELUP_ZG_DEF
+#define CELUP_ZG_DEF 2.2f
+#endif
+#ifndef CELUP_ZAA_DEF
+#define CELUP_ZAA_DEF .001f
+#endif
+        float vv[4] = {0.f, 0.f, 0.f, 0.f},
+              vblo[4] = {0.f, 0.f, 0.f, 0.f},
+              vbhi[4] = {0.f, 0.f, 0.f, 0.f};
+        float zg = CELUP_ZG_DEF, zaa = CELUP_ZAA_DEF, zmw = 0.f,
+              zrmp = 0.f;
+        int zno = 0;
+        {
+          static int noz = -1;
+          static float zg_env = -1.f;
+          if (noz < 0)
+            noz = getenv("CELUP_NOZ") != NULL;
+          if (zg_env < 0.f) {
+            const char *e = getenv("CELUP_ZG");
+            zg_env = e && *e ? (float)atof(e) : 0.f;
+          }
+          if (zg_env > .5f)
+            zg = zg_env;
+          zno = noz;
+        }
         for (int c = 0; c < 4; c++) {
           float blo = c < 3 ? to_linear[LOH[8 * idx + c]]
                             : LOH[8 * idx + c] * (1.f / 255.f),
@@ -4133,11 +4239,11 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
              agrees (gInn > .6), fire the proven offset at full
              strength instead (still no weight when any gate is
              partial, so rims/skirts keep the diluted path). */
-          if (nu < .02f && uf0 > .98f && gInn > .6f)
+        if (nu < .02f && uf0 > .98f && gInn > .6f)
             vr = gInn * uf0;
           if (nu > .98f && uf1 > .98f && gInn > .6f)
             vr = gInn * uf1;
-          /* dip-core tent component (v4.9.5): conservative same-sign
+        /* dip-core tent component (v4.9.5): conservative same-sign
              component of the two offsets, paid at the dip centre
              where the side gates are silent; uses the ordinary
              diluted weight (no fullfire -- shape, not depth). */
@@ -4151,7 +4257,160 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                            blo, bhi);
           if (wpeel > 0.f)
             v = clampf(v + wpeel * (atap[c] - v), blo, bhi);
-          dd[c] += v - o[c];
+          vv[c] = v;
+          vblo[c] = blo;
+          vbhi[c] = bhi;
+        }
+        /* v4.9.8 erf-gain post-map, applied to the FINISHED colour:
+           m -> Phi(zg * Phi^-1(m)) along the pixel's own proven
+           plateau line (see above), re-clamped to the local hull.
+           Alpha is left alone (smoke-fringe class, parked). */
+        float zm_dbg = -1.f, zmm_dbg = -1.f, zal_dbg = -1.f,
+              wz_dbg = 0.f;
+        {
+          /* endpoints = the pixel's OWN local colour hull (LOH:
+             separable extrema of observed colours, consensus-widened;
+             measured earlier: hull colours == NN colours within ~1
+             8-bit step inside NN zones), NOT the LSQ step amplitude,
+             which is under-read on washed flanks (m measured against
+             o+-.ufit*d2+offs was uncalibrated: |A| ~ 1.3 in a 0..1
+             range, P0 ~ -1).  m = hull fraction of the finished
+             colour; steepen in z-space: mm = Phi(zg * Phi^-1(m)). */
+          float num = 0.f, den = 0.f, calh = 0.f;
+          for (int c = 0; c < 3; c++) {
+            float Aq = vbhi[c] - vblo[c], rq = adb_srchi[c] - adb_srclo[c];
+            num += (vv[c] - vblo[c]) * Aq;
+            den += Aq * Aq;
+            calh += rq * rq;
+          }
+          calh = sqrtf(calh);
+          if (den > 1e-8f) {
+            float m = clampf(num / den, 0.f, 1.f);
+            float alh = sqrtf(den);
+            /* v4.9.8b corridor map: the base model reports this
+               pixel's signed offset mu from the PROVEN step centre.
+               Within the true-AA corridor |mu| <= a (= zaa*scale out
+               px) the rendered value is LEFT ALONE: it encodes the
+               feature's exact sub-pixel width -- information that
+               lives only in the boundary pixels' values; any
+               positional repaint (linear ramp etc.) destroys it
+               (crisp-GT check: MAE 13.2 -> 19+).  BEYOND the
+               corridor a mid value cannot be true anti-aliasing --
+               the underlying crisp image has its plateau there -- so
+               it is blur wash, mapped fully to the pixel's own
+               proven plateau (hull endpoint on the side d2 points
+               to, globally extended on global-extremes steps).
+               Monotone side selection + proven endpoints + hull
+               clamp: overshoot impossible by construction. */
+            {
+              static float zaa_env = -2.f;
+              if (zaa_env < -1.f) {
+                const char *e = getenv("CELUP_ZAA");
+                zaa_env = e && *e ? (float)atof(e) : 0.f;
+              }
+              if (zaa_env > 0.f)
+                zaa = zaa_env;
+            }
+            float a = zaa * scale;
+            float mmu = mu < 0.f ? -mu : mu;
+            /* outside the corridor: value-space erf-gain map of the
+               rendered colour (orientation-free: m is measured along
+               the hull diagonal, so the pass-1 u-reversal cannot
+               flip it) */
+            float mm = phi1(zg * probit01(m));
+            /* huge local hull span = a true step lives here, not a
+               smooth-gradient fragment (skin/hair shading spans far
+               less): extend the endpoints toward the source-global
+               range -- in a wide wash the local extrema never reach
+               the true plateau (the washed floor ~49/255 reads as the
+               "plateau"), so the snap targets the span the step
+               ACTUALLY connects.  calh = the source-GLOBAL channel
+               range span; rmp engages only when the local window
+               demonstrably straddles a global-extremes step. */
+            float rmp = ss01((alh - .35f * calh) * (1.f / .6f)) *
+                        ss01((adb_qconf - .5f) * (1.f / .3f));
+            /* the extension gate must be SPATIALLY CONSISTENT along
+               the contour (an on/off flicker renders as treads): on
+               quantized sources alh stays near calh along the whole
+               feature, so this fires uniformly; photos never reach
+               here at all (qconf ~ 0) -- the purple|green red-range
+               injection class stays locked out. */
+            float rcp = rmp;
+            /* weight: fit trust x real step span x corridor exit
+               (inside the true-AA corridor the rendered value stays:
+               it encodes the feature's exact sub-pixel width, which
+               no positional law can reproduce). */
+            float wz = ss01((w - .5f) * (1.f / .3f)) *
+                       ss01((alh - .30f) * (1.f / .25f)) *
+                       ss01((mmu - a) * (1.f / .7f));
+            zm_dbg = m;
+            zmm_dbg = mm;
+            zal_dbg = alh;
+            wz_dbg = wz;
+            zmw = zno ? 0.f : wz;
+            zrmp = rmp;
+            if (!zno && wz > 1e-3f)
+              for (int c = 0; c < 3; c++) {
+                /* target = mm-fraction across the channel's own HULL
+                   span (hull amplitude is proven; the LSQ d2
+                   amplitude is not -- a washed flank under-reads it
+                   ~2x), oriented per channel by the d2 sign (the
+                   pass-1 u-reversal flips the axis: never index
+                   plateaus as dark/bright).  Channels the step does
+                   not move (|d2| tiny against the hull span) are left
+                   alone. */
+                float elo = vblo[c] + rcp * (adb_srclo[c] - vblo[c]);
+                float ehi = vbhi[c] + rcp * (adb_srchi[c] - vbhi[c]);
+                float tgt = elo + mm * (ehi - elo);
+                vv[c] = clampf(vv[c] + wz * (tgt - vv[c]), elo, ehi);
+              }
+          }
+        }
+        for (int c = 0; c < 4; c++)
+          dd[c] += vv[c] - o[c];
+        /* The map owns this pixel's colour now: (a) pass 2's final
+           hull clamp must not raise the washed floor back onto it --
+           extend LOH toward the global range by the same rmp so the
+           later clamp agrees with the map's span; (b) record the map
+           weight so pass 2's staircase cleanup (which lerps the
+           pixel back toward the WASHED base average) and the
+           tangential delta smoothing stand down exactly where the
+           map fired. */
+        if (zmw > 1e-3f) {
+          ZM[idx] = zmw;
+          if (zrmp > 1e-3f)
+            for (int c = 0; c < 3; c++) {
+              float elo = vblo[c] + zrmp * (adb_srclo[c] - vblo[c]),
+                    ehi = vbhi[c] + zrmp * (adb_srchi[c] - vbhi[c]);
+              int lv = to_srgb[clampi((int)(clampf(elo, 0.f, 1.f) *
+                                            4096.f),
+                                      0, 4096)] -
+                       1,
+                  hv = to_srgb[clampi((int)(clampf(ehi, 0.f, 1.f) *
+                                            4096.f),
+                                      0, 4096)] +
+                       1;
+              if (lv < LOH[8 * idx + c])
+                LOH[8 * idx + c] = (uint8_t)clampi(lv, 0, 255);
+              if (hv > LOH[8 * idx + 4 + c])
+                LOH[8 * idx + 4 + c] = (uint8_t)clampi(hv, 0, 255);
+            }
+        }
+        {
+          static FILE *zm = NULL;
+          static int zm_on = -1;
+          if (zm_on < 0) {
+            const char *e = getenv("CELUP_ZDBG");
+            zm_on = e && *e;
+            if (zm_on)
+              zm = fopen(e, "w");
+          }
+          if (zm)
+            fprintf(zm,
+                    "%d %d %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f "
+                    "%.5f %.5f %.5f\n",
+                    x, y, w, w2v, nu, ufit0, wpeel, zal_dbg, zm_dbg,
+                    zmm_dbg, wz_dbg, o[0], vv[0]);
         }
         {
           static FILE *wm = NULL;
@@ -4245,13 +4504,22 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           tw2 += nk[no + 2];
         }
         float inv = tw2 > 1e-6f ? 1.f / tw2 : 0.f;
-        qn = adb_qconf * pf[0] * skirt * .7f;
+        qn = adb_qconf * pf[0] * skirt * .7f *
+             (1.f - ss01((ZM[idx] - .05f) * (1.f / .25f)));
         for (int c = 0; c < 4; c++)
           navg[c] = qn * (navg[c] * inv - A[4 * idx + c]);
       }
+      float zmq = ZM[idx];
       for (int c = 0; c < 4; c++) {
         o[c] = A[4 * idx + c];
         float v = wsum > 1e-6f ? o[c] + acc[c] / wsum : o[c];
+        /* v4.9.8: where the erf-gain map owns this pixel, keep its
+           own (mapped) delta instead of the tangentially averaged
+           one -- the average mixes the snapped colour with its
+           unmapped neighbours' wash and re-introduces the mid band
+           the map just removed. */
+        if (zmq > 1e-3f && wsum > 1e-6f)
+          v += zmq * .85f * (DEL[4 * idx + c] - acc[c] / wsum);
         v += navg[c];
         /* Final hull clamp (v4.9): pass-1.5 clamps each pixel's own
            evaluation, but the smoothed delta can still leave the hull
@@ -4271,6 +4539,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
   free(PF);
   free(DEL);
   free(A);
+  free(ZM);
   return 1;
 }
 
@@ -5965,7 +6234,7 @@ static uint8_t *slurp(const char *name, size_t *n) {
 static void print_help(const char *argv0) {
   printf(
       "celup_lab -- premultiplied-linear WebP upscaler (research build "
-      "v4.9.7)\n"
+      "v4.9.8)\n"
       "\n"
       "Usage: %s in.webp out.webp SCALE [options]\n"
       "  SCALE is the upsampling factor, real number in (1,32] "
