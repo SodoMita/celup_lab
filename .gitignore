@@ -5,6 +5,7 @@ celup_lab
 celup_lab_baseline
 *.o
 docs/*.png
+docs/*.webp
 *.png
 # test fixtures are regenerated bit-exactly by tests/make_test_sources.py
 tests/*_src.webp
