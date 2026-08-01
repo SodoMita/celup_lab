@@ -22,7 +22,7 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = Path(__file__).resolve().parent
 MY = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "celup_lab"
 V18 = Path(sys.argv[2]) if len(sys.argv) > 2 else ROOT / "celup_18"
-OUT = ROOT / "docs"
+OUT = ROOT / "images"
 OUT.mkdir(exist_ok=True)
 S, N = 4, 96  # torture: 4x, 96-cell truth
 
@@ -85,6 +85,13 @@ def run(exe, src, scale, recipe):
         subprocess.run([str(exe), str(src), str(out), str(scale), *recipe],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return np.asarray(Image.open(out).convert("RGB"), dtype=np.uint8)
+
+
+def run_crop(exe, src, scale, recipe, crop):
+    """run then crop to (y0,y1,x0,x1) on the OUTPUT image."""
+    img = run(exe, src, scale, recipe)
+    y0, y1, x0, x1 = crop
+    return img[y0:y1, x0:x1]
 
 
 def bilinear_up(low_rgb, scale):
@@ -178,19 +185,25 @@ def main():
         rows.append((name, "HG " + HG[name][0] + "  vs  " + HG[name][1], [bil, mine, v18]))
     g1 = grid("ARTIFACTS: torture scenes 4x (hourglass energy -- v4.9.8 adds severe ringing on edges/curves)",
               ["bilinear ref", "MINE (master v4.9.2 core)", "019fba18 (v4.9.8)"], rows, cell=256)
-    g1.save(OUT / "sheet_artifacts.png")
-    print("wrote", OUT / "sheet_artifacts.png")
+    g1.save(OUT / "sheet_artifacts.webp", lossless=True)
+    print("wrote", OUT / "sheet_artifacts.webp")
 
     # ---- sheet 2: BW / grey test (art) ----
     rows = []
-    # smiley user recipe
+    # smiley user recipe -- FULL + a spike/mouth detail crop
     sm = ROOT / "images" / "poor smiley.webp"
     if sm.exists():
+        near = run(MY, sm, 2, ["--mode", "nearest", "--max-mib", "2048"])
         mine = run(MY, sm, 2, ADB + ["-r", "6", "-g", "64"])
         v18 = run(V18, sm, 2, ADB + ["-r", "6", "-g", "64"])
-        near = run(MY, sm, 2, ["--mode", "nearest", "--max-mib", "2048"])
-        rows.append(("poor smiley 2x -r6 -g64", "grey: MINE 30.9%  vs  v4.9.8 8.0%",
+        rows.append(("poor smiley 2x -r6 -g64  (FULL)",
+                     "grey: MINE 30.0%  vs  v4.9.8 5.0%",
                      [near, mine, v18]))
+        c = (60, 300, 380, 510)  # spike/mouth detail crop
+        rows.append(("smiley detail crop (spike/mouth)",
+                     "darkmean: MINE 60  vs  v4.9.8 11",
+                     [near[c[0]:c[1], c[2]:c[3]], mine[c[0]:c[1], c[2]:c[3]],
+                      v18[c[0]:c[1], c[2]:c[3]]]))
     # pure BW test
     W, H = 128, 128; im = Image.new("L", (W, H), 255); d = ImageDraw.Draw(im)
     d.rectangle([10, 10, 118, 118], outline=0, width=3)
@@ -201,19 +214,22 @@ def main():
     mine = run(MY, bw, 4, ADB + ["-r", "6", "-g", "64"])
     v18 = run(V18, bw, 4, ADB + ["-r", "6", "-g", "64"])
     near = run(MY, bw, 4, ["--mode", "nearest", "--max-mib", "2048"])
-    rows.append(("pure BW test 4x -r6 -g64", "ink<128: MINE 0.0%  vs  v4.9.8 17.7%",
+    rows.append(("pure BW test 4x -r6 -g64",
+                 "ink<128: MINE 0.0%  vs  v4.9.8 17.7%",
                  [near, mine, v18]))
-    # miya user recipe (crop face)
+    # miya user recipe -- tight FACE crop (4x output 3072x5504)
     mi = ROOT / "images" / "miya_normal.webp"
     if mi.exists():
-        mine = run(MY, mi, 4, ADB + ["-r", "2.3", "-g", "8", "--max-mib", "4096"])
-        v18 = run(V18, mi, 4, ADB + ["-r", "2.3", "-g", "8", "--max-mib", "4096"])
-        near = run(MY, mi, 4, ["--mode", "nearest", "--max-mib", "4096"])
-        rows.append(("miya 4x -r2.3 -g8 (full)", "", [near, mine, v18]))
+        crop = (120, 1500, 760, 1900)
+        near = run_crop(MY, mi, 4, ["--mode", "nearest", "--max-mib", "4096"], crop)
+        mine = run_crop(MY, mi, 4, ADB + ["-r", "2.3", "-g", "8", "--max-mib", "4096"], crop)
+        v18 = run_crop(V18, mi, 4, ADB + ["-r", "2.3", "-g", "8", "--max-mib", "4096"], crop)
+        rows.append(("miya 4x -r2.3 -g8  (face crop)",
+                     "", [near, mine, v18]))
     g2 = grid("BW / GREY TEST: ink recovery vs cleanness (v4.9.8 recovers ink, MINE stays clean)",
-              ["nearest ref", "MINE (master v4.9.2 core)", "019fba18 (v4.9.8)"], rows, cell=300)
-    g2.save(OUT / "sheet_bw_art.png")
-    print("wrote", OUT / "sheet_bw_art.png")
+              ["nearest ref", "MINE (master v4.9.2 core)", "019fba18 (v4.9.8)"], rows, cell=420)
+    g2.save(OUT / "sheet_bw_art.webp", lossless=True)
+    print("wrote", OUT / "sheet_bw_art.webp")
 
 
 if __name__ == "__main__":

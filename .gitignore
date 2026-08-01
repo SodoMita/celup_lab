@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 celup_lab
 celup_lab_baseline
+celup_18
 *.o
 docs/*.png
 docs/*.webp
