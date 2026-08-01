@@ -268,6 +268,24 @@ static float checker2x2_confidence_pm(float p[4][4]) {
   return clampf(contrast_conf * diag_conf, 0.f, 1.f);
 }
 
+static float checker3x3_at_pm(const uint8_t *in, int sw, int sh, int cx, int cy) {
+  float p[9][4];
+  for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++)
+      raw_pm(in, sw, sh, cx + dx, cy + dy, p[(dy + 1) * 3 + (dx + 1)]);
+  float d_corn = fmaxf(fmaxf(dist4_pm(p[0], p[2]), dist4_pm(p[0], p[6])),
+                       fmaxf(dist4_pm(p[0], p[8]), dist4_pm(p[0], p[4])));
+  float d_edge = fmaxf(fmaxf(dist4_pm(p[1], p[3]), dist4_pm(p[1], p[5])),
+                       dist4_pm(p[1], p[7]));
+  float d_cross = dist4_pm(p[4], p[1]);
+  if (d_cross < 1e-8f)
+    return 0.f;
+  float ratio = fmaxf(d_corn, d_edge) / d_cross;
+  float contrast_conf = ramp01(d_cross, 4e-4f, 3e-2f);
+  float pattern_conf = ramp01(ratio, .75f, .20f);
+  return clampf(contrast_conf * pattern_conf, 0.f, 1.f);
+}
+
 static void bilinear_sample_pm(const uint8_t *in, int sw, int sh, float sx,
                                float sy, float q[4], float cell[4][4]) {
   int ix = (int)floorf(sx), iy = (int)floorf(sy);
@@ -2121,6 +2139,7 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
   double s1[4 * 6];
   for (size_t i = 0; i < sizeof s1 / sizeof s1[0]; i++)
     s1[i] = -1.0;
+  int n_sig = blur_radius_set ? 1 : (int)(sizeof sigmas / sizeof sigmas[0]);
   for (size_t ki = 0; ki < sizeof kernels / sizeof kernels[0]; ki++) {
     if (*kk != BK_AUTO && kernels[ki] != *kk)
       continue;
@@ -2135,7 +2154,7 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
       if (score < best) {
         best = score;
         best_k = kernels[ki];
-        best_s = sigmas[si];
+        best_s = sig_cand;
       }
     }
   }
@@ -2152,9 +2171,9 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
         if (score <= 0 || score > thr)
           continue;
         int rank = kernel_smooth_rank(kernels[ki]);
-        if (sigmas[si] > best_s + 1e-6f ||
-            (fabsf(sigmas[si] - best_s) <= 1e-6f && rank > brank)) {
-          best_s = sigmas[si];
+        if (sig_cand > best_s + 1e-6f ||
+            (fabsf(sig_cand - best_s) <= 1e-6f && rank > brank)) {
+          best_s = sig_cand;
           best_k = kernels[ki];
           brank = rank;
         }
