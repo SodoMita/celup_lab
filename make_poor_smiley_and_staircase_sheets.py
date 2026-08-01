@@ -85,6 +85,8 @@ if poor.exists():
         ("nearest", "nearest", []),
         ("bilinear", "bilinear", []),
         ("triangle", "triangle", []),
+        ("smooth", "smooth", []),
+        ("smooth r1.5", "smooth", ["-r","1.5"]),
         ("cubic", "cubic", []),
         ("mitchell", "mitchell", []),
         ("lanczos3", "lanczos3", []),
@@ -100,7 +102,6 @@ if poor.exists():
         ("autodeblur r6 g16", "autodeblur", ["-k","bspline","-c","linear","-r","6","-g","16","-D","remap"]),
         ("autodeblur r1.5 g8", "autodeblur", ["-k","bspline","-c","linear","-r","1.5","-g","8","-D","remap"]),
         ("sdf", "sdf", []),
-        ("triangle vs autodeblur diff", "triangle", []), # placeholder, will be replaced?
     ]
     for label, mode, extra in mode_list:
         out = tmpdir / f"celup_{label.replace(' ','_').replace('(','').replace(')','')}.webp"
@@ -157,10 +158,11 @@ if diag.exists():
         ("cubic\n0.508", "cubic", []),
         ("mitchell\n0.267", "mitchell", []),
         ("lanczos3\n0.229", "lanczos3", []),
-        ("triangle\n0.014 best", "triangle", []),
+        ("triangle\n0.014", "triangle", []),
+        ("smooth\n0.023 v5.2", "smooth", []),
         ("autoblur bspline r0.5\n0.024 v5 fix (was 0.73)", "autoblur", ["-k","bspline","-c","linear","-r","0.5"]),
         ("autoblur auto\n0.382", "autoblur", []),
-        ("adaptive\n0.428", "adaptive", []),
+        ("adaptive\n0.365 v5.1 AA", "adaptive", []),
         ("autodeblur r2.3 g16\n0.017 smoothest", "autodeblur", ["-k","bspline","-c","linear","-r","2.3","-g","16","-D","remap"]),
         ("autodeblur r6 g64\n0.057", "autodeblur", ["-k","bspline","-c","linear","-r","6","-g","64","-D","remap","-s","100"]),
         ("autodeblur r0.5 g64\nold probe now smooth", "autodeblur", ["-k","bspline","-c","linear","-r","0.5","-g","64","-D","remap"]),
