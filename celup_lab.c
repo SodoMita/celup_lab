@@ -1455,23 +1455,24 @@ static void scale2x_sample(const uint8_t *in, int sw, int sh, float sx,
                            float sy, float q[4]) {
   int cx = clampi((int)floorf(sx + .5f), 0, sw - 1),
       cy = clampi((int)floorf(sy + .5f), 0, sh - 1);
-  float P[4], B[4], D[4], E[4], F[4];
+  float P[4], B[4], D[4], F[4], H[4];
   raw_pm(in, sw, sh, cx, cy, P);
   raw_pm(in, sw, sh, cx, cy - 1, B);
   raw_pm(in, sw, sh, cx - 1, cy, D);
-  raw_pm(in, sw, sh, cx + 1, cy, E);
-  raw_pm(in, sw, sh, cx, cy + 1, F);
+  raw_pm(in, sw, sh, cx + 1, cy, F);
+  raw_pm(in, sw, sh, cx, cy + 1, H);
   const float *r = P;
-  if (!same_colour_pm(B, E) && !same_colour_pm(D, F)) {
+  /* correct Scale2x condition: B!=H && D!=F */
+  if (!same_colour_pm(B, H) && !same_colour_pm(D, F)) {
     int right = sx >= (float)cx, down = sy >= (float)cy;
     if (!right && !down)
       r = same_colour_pm(D, B) ? D : P;
     else if (right && !down)
-      r = same_colour_pm(B, E) ? E : P;
+      r = same_colour_pm(B, F) ? F : P;
     else if (!right && down)
-      r = same_colour_pm(D, F) ? D : P;
+      r = same_colour_pm(D, H) ? D : P;
     else
-      r = same_colour_pm(E, F) ? E : P;
+      r = same_colour_pm(H, F) ? F : P;
   }
   q[0] = r[0];
   q[1] = r[1];
@@ -1479,13 +1480,75 @@ static void scale2x_sample(const uint8_t *in, int sw, int sh, float sx,
   q[3] = r[3];
 }
 
+/* v7: full 2x Scale2x block for integer 2x, then optional -r blend to bilinear for -r control */
+static void upscale_scale2x_2x(const uint8_t *in, int sw, int sh, uint8_t *out) {
+  int dw = sw*2, dh = sh*2;
+  for (int y=0; y<sh; y++) {
+    for (int x=0; x<sw; x++) {
+      float A[4],B[4],C[4],D[4],E[4],F[4],G[4],H[4],I[4];
+      raw_pm(in, sw, sh, x-1, y-1, A);
+      raw_pm(in, sw, sh, x,   y-1, B);
+      raw_pm(in, sw, sh, x+1, y-1, C);
+      raw_pm(in, sw, sh, x-1, y,   D);
+      raw_pm(in, sw, sh, x,   y,   E);
+      raw_pm(in, sw, sh, x+1, y,   F);
+      raw_pm(in, sw, sh, x-1, y+1, G);
+      raw_pm(in, sw, sh, x,   y+1, H);
+      raw_pm(in, sw, sh, x+1, y+1, I);
+      float E0[4],E1[4],E2[4],E3[4];
+      for (int c=0;c<4;c++) E0[c]=E1[c]=E2[c]=E3[c]=E[c];
+      if (!same_colour_pm(B, H) && !same_colour_pm(D, F)) {
+        if (same_colour_pm(D, B)) for(int c=0;c<4;c++) E0[c]=D[c];
+        if (same_colour_pm(B, F)) for(int c=0;c<4;c++) E1[c]=F[c];
+        if (same_colour_pm(D, H)) for(int c=0;c<4;c++) E2[c]=D[c];
+        if (same_colour_pm(H, F)) for(int c=0;c<4;c++) E3[c]=F[c];
+      }
+      put(out + 4 * ((size_t)(y*2) * dw + x*2), E0[0],E0[1],E0[2],E0[3]);
+      put(out + 4 * ((size_t)(y*2) * dw + x*2+1), E1[0],E1[1],E1[2],E1[3]);
+      put(out + 4 * ((size_t)(y*2+1) * dw + x*2), E2[0],E2[1],E2[2],E2[3]);
+      put(out + 4 * ((size_t)(y*2+1) * dw + x*2+1), E3[0],E3[1],E3[2],E3[3]);
+    }
+  }
+}
+
 static void upscale_scale2x(const uint8_t *in, int sw, int sh, uint8_t *out,
                             int dw, int dh) {
+  /* v7: if exact 2x, use full 2x Scale2x block (more accurate). For other scales, use per-pixel sample with optional -r smoothing. */
+  if (dw == sw*2 && dh == sh*2) {
+    upscale_scale2x_2x(in, sw, sh, out);
+    /* optional -r smoothing for scale2x: blend with bilinear by amount based on -r */
+    if (blur_radius_set) {
+      float blend = clampf((blur_radius - 0.5f) * 0.35f, 0.f, 0.55f);
+      if (blend > 0.01f) {
+        for (int y=0; y<dh; y++) {
+          float sy = (y + .5f) * (float)sh / dh - .5f;
+          int iy = (int)floorf(sy); float fy = sy - iy;
+          for (int x=0; x<dw; x++) {
+            float sx = (x + .5f) * (float)sw / dw - .5f;
+            int ix = (int)floorf(sx); float fx = sx - ix;
+            float q[4], b[4];
+            raw_pm(out, dw, dh, x, y, q); /* current scale2x result */
+            bilinear_cell_pm(in, sw, sh, ix, iy, fx, fy, b);
+            for (int c=0;c<4;c++) q[c] = q[c]*(1.f-blend) + b[c]*blend;
+            put(out + 4 * ((size_t)y * dw + x), q[0], q[1], q[2], q[3]);
+          }
+        }
+      }
+    }
+    return;
+  }
   for (int y = 0; y < dh; y++) {
     float sy = (y + .5f) * (float)sh / dh - .5f;
     for (int x = 0; x < dw; x++) {
-      float sx = (x + .5f) * (float)sw / dw - .5f, q[4];
+      float sx = (x + .5f) * (float)sw / dw - .5f, q[4], b[4];
       scale2x_sample(in, sw, sh, sx, sy, q);
+      if (blur_radius_set) {
+        float blend = clampf((blur_radius - 0.5f) * 0.30f, 0.f, 0.50f);
+        if (blend > 0.01f) {
+          bilinear_cell_pm(in, sw, sh, (int)floorf(sx), (int)floorf(sy), sx - floorf(sx), sy - floorf(sy), b);
+          for (int c=0;c<4;c++) q[c] = q[c]*(1.f-blend) + b[c]*blend;
+        }
+      }
       put(out + 4 * ((size_t)y * dw + x), q[0], q[1], q[2], q[3]);
     }
   }
@@ -4588,15 +4651,46 @@ static int upscale_consistentcompress(const uint8_t *in, int sw, int sh,
   free(tmp_rgba);
   if (!hr)
     return 0;
-  int ok = refine_hourglass_checker(hr, in, sw, sh, dw, dh, 4);
+  class_map_t cm;
+  int has_cm = build_class_map(in, sw, sh, &cm);
+  /* v7: more iterations + stronger removal + class-map gated */
+  int ok = refine_hourglass_checker(hr, in, sw, sh, dw, dh, 8);
   if (ok)
-    ok = refine_downsample_consistency(hr, in, sw, sh, dw, dh, 1, .35f, 0.f,
-                                       NULL);
+    ok = refine_downsample_consistency(hr, in, sw, sh, dw, dh, 2, .45f, 0.f,
+                                       has_cm ? &cm : NULL);
   if (ok) {
-    remove_hourglass_basis(hr, dw, dh, in, sw, sh, .80f, NULL);
-    suppress_speckle_pm(hr, dw, dh, in, sw, sh, .80f, NULL);
+    remove_hourglass_basis(hr, dw, dh, in, sw, sh, 1.00f, has_cm ? cm.w_hg : NULL);
+    suppress_speckle_pm(hr, dw, dh, in, sw, sh, 1.00f, has_cm ? cm.w_hg : NULL);
+    /* extra bilinear blend for high checker confidence */
+    for (int y=0; y<dh; y++) {
+      float sy = (y + 0.5f) * (float)sh / dh - 0.5f;
+      int iy = (int)floorf(sy); float fy = sy - iy;
+      for (int x=0; x<dw; x++) {
+        float sx = (x + 0.5f) * (float)sw / dw - 0.5f;
+        int ix = (int)floorf(sx); float fx = sx - ix;
+        float chk = 0.f;
+        if (has_cm) {
+          int cx = clampi((int)floorf(sx + 0.5f), 0, sw-1);
+          int cy = clampi((int)floorf(sy + 0.5f), 0, sh-1);
+          chk = cm.w_checker[(size_t)cy * sw + cx];
+        } else {
+          float cell[4][4];
+          for (int j=0;j<2;j++) for (int i=0;i<2;i++) raw_pm(in, sw, sh, ix+i, iy+j, cell[j*2+i]);
+          chk = checker2x2_confidence_pm(cell);
+        }
+        if (chk > 0.30f) {
+          float t[4];
+          bilinear_cell_pm(in, sw, sh, ix, iy, fx, fy, t);
+          float *h = hr + 4 * ((size_t)y * dw + x);
+          float blend = (chk - 0.30f)/0.70f;
+          if (blend>1.f) blend=1.f;
+          for (int c=0;c<4;c++) h[c]=h[c]*(1.f-blend)+t[c]*blend;
+        }
+      }
+    }
     write_hr_rgba(hr, dw, dh, out);
   }
+  if (has_cm) free_class_map(&cm);
   free(hr);
   return ok;
 }
@@ -4620,18 +4714,39 @@ static int upscale_dehourglass(const uint8_t *in, int sw, int sh, uint8_t *out,
     free(hr);
     return 0;
   }
-  /* Gated removal (v2): hit ambiguous checker/junction cells hard, leave
-     coherent-edge detail almost untouched.  The old uniform pass traded away
-     real sharpness everywhere. */
+  /* v7: gated removal + lowpass blend for checker cells + 2-pass hourglass removal.
+     First pass 0.95 removes most hourglass, second 0.85 removes residual. Lowpass blend for high checker confidence suppresses bow-tie pattern that appears after upscale. */
   remove_hourglass_basis(hr, dw, dh, in, sw, sh, .95f, cm.w_hg);
-    suppress_speckle_pm(hr, dw, dh, in, sw, sh, .95f, cm.w_hg);
-  /* One very light consistency pass restores exact source average bias without
-     reintroducing much hourglass structure; its correction is gated too. */
-  ok = refine_downsample_consistency(hr, in, sw, sh, dw, dh, 1, .35f, 0.f,
-                                     &cm);
+  suppress_speckle_pm(hr, dw, dh, in, sw, sh, .95f, cm.w_hg);
+  ok = refine_downsample_consistency(hr, in, sw, sh, dw, dh, 1, .35f, 0.f, &cm);
   if (ok) {
-    remove_hourglass_basis(hr, dw, dh, in, sw, sh, .55f, cm.w_hg);
-    suppress_speckle_pm(hr, dw, dh, in, sw, sh, .55f, cm.w_hg);
+    remove_hourglass_basis(hr, dw, dh, in, sw, sh, .85f, cm.w_hg);
+    suppress_speckle_pm(hr, dw, dh, in, sw, sh, .85f, cm.w_hg);
+    /* v7: extra checker suppression - blend high-checker HR pixels towards bilinear (lowest HG 0.00005) */
+    {
+      for (int y=0; y<dh; y++) {
+        int cy = (int)((y + 0.5f) * (float)sh / dh);
+        if (cy<0) cy=0; if (cy>=sh) cy=sh-1;
+        for (int x=0; x<dw; x++) {
+          int cx = (int)((x + 0.5f) * (float)sw / dw);
+          if (cx<0) cx=0; if (cx>=sw) cx=sw-1;
+          size_t k = (size_t)cy * sw + cx;
+          float wc = cm.w_checker[k];
+          if (wc > 0.35f) {
+            float t[4];
+            float sx = (x + 0.5f) * (float)sw / dw - 0.5f;
+            float sy = (y + 0.5f) * (float)sh / dh - 0.5f;
+            int ix = (int)floorf(sx), iy = (int)floorf(sy);
+            float fx = sx - ix, fy = sy - iy;
+            bilinear_cell_pm(in, sw, sh, ix, iy, fx, fy, t);
+            float *h = hr + 4 * ((size_t)y * dw + x);
+            float blend = (wc - 0.35f) / 0.65f;
+            if (blend>1.f) blend=1.f;
+            for (int c=0;c<4;c++) h[c] = h[c]*(1.f-blend) + t[c]*blend;
+          }
+        }
+      }
+    }
     write_hr_rgba(hr, dw, dh, out);
   }
   free_class_map(&cm);
@@ -4843,8 +4958,12 @@ static void upscale_triangle(const uint8_t *in, int sw, int sh, uint8_t *out,
 static void upscale_smooth(const uint8_t *in, int sw, int sh, uint8_t *out,
                            int dw, int dh) {
   float spread = 1.f;
-  if (blur_radius_set) spread = clampf(blur_radius, 0.5f, 3.f);
-  int SS = spread > 1.8f ? 4 : (spread > 1.2f ? 3 : 2);
+  if (blur_radius_set) spread = clampf(blur_radius, 0.5f, 3.5f);
+  int SS;
+  if (spread <= 0.8f) SS = 2;
+  else if (spread <= 1.3f) SS = 4;
+  else if (spread <= 2.2f) SS = 6;
+  else SS = 8;
   float inv = 1.f / (float)(SS * SS);
   for (int y = 0; y < dh; y++) {
     for (int x = 0; x < dw; x++) {
@@ -4859,25 +4978,18 @@ static void upscale_smooth(const uint8_t *in, int sw, int sh, uint8_t *out,
           float sy = ((float)y + oy_eff) * (float)sh / dh - 0.5f;
           int ix = (int)floorf(sx), iy = (int)floorf(sy);
           float fx = sx - ix, fy = sy - iy;
-          float p[4][4], l[4];
-          for (int j = 0; j < 2; j++)
-            for (int i = 0; i < 2; i++) {
-              int k = j * 2 + i;
-              raw_pm(in, sw, sh, ix + i, iy + j, p[k]);
-              l[k] = .2126f * p[k][0] + .7152f * p[k][1] + .0722f * p[k][2] + .5f * p[k][3];
-            }
-          float gx = l[1] + l[3] - l[0] - l[2], gy = l[2] + l[3] - l[0] - l[1];
-          const float *a,*b,*c;
-          float wa,wb,wc;
-          if (gx * gy < 0) {
-            if (fx >= fy) { a=p[0]; b=p[1]; c=p[3]; wa=1-fx; wb=fx-fy; wc=fy; }
-            else { a=p[0]; b=p[2]; c=p[3]; wa=1-fy; wb=fy-fx; wc=fx; }
-          } else {
-            if (fx + fy <= 1) { a=p[0]; b=p[1]; c=p[2]; wa=1-fx-fy; wb=fx; wc=fy; }
-            else { a=p[3]; b=p[2]; c=p[1]; wa=fx+fy-1; wb=1-fx; wc=1-fy; }
+          float p00[4], p10[4], p01[4], p11[4];
+          raw_pm(in, sw, sh, ix,     iy,     p00);
+          raw_pm(in, sw, sh, ix + 1, iy,     p10);
+          raw_pm(in, sw, sh, ix,     iy + 1, p01);
+          raw_pm(in, sw, sh, ix + 1, iy + 1, p11);
+          float w00 = (1.f - fx) * (1.f - fy);
+          float w10 = fx * (1.f - fy);
+          float w01 = (1.f - fx) * fy;
+          float w11 = fx * fy;
+          for (int k = 0; k < 4; k++) {
+            acc[k] += inv * (w00 * p00[k] + w10 * p10[k] + w01 * p01[k] + w11 * p11[k]);
           }
-          for (int k = 0; k < 4; k++)
-            acc[k] += inv * (wa * a[k] + wb * b[k] + wc * c[k]);
         }
       }
       put(out + 4 * ((size_t)y * dw + x), acc[0], acc[1], acc[2], acc[3]);
