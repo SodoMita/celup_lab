@@ -4299,8 +4299,8 @@ static void suppress_speckle_pm(float *hr, int dw, int dh, const uint8_t *in,
   /* Domino pass on the updated image (fresh snapshot). */
   memcpy(snap, hr, n * 4 * sizeof *snap);
   for (int vert = 0; vert < 2; vert++)
-    for (int y = 1; y + 1 < dh; y++)
-      for (int x = 1; x + 1 < dw; x++) {
+    for (int y = 1; y + 2 - vert < dh; y++)
+      for (int x = 1; x + 1 + vert < dw; x++) {
         /* Pair occupies (x,y),(x+vert,y+1-vert); the 10 ring pixels are the
            outer frame of the 3x4 (or 4x3) box around the pair. */
         const float *p0 = SPK_P(snap, x, y),

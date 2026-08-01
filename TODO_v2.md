@@ -18,6 +18,18 @@
 
 ---
 
+# v4.9.4 Status & Future Directions
+
+## Completed in v4.9.4
+1. **ARM64 / Android Segmentation Fault Fix for `sdf`, `msdf`, and `dsdf`**:
+   - Diagnosed and fixed the segmentation fault reported on ARM phones when executing `--mode sdf`, `--mode msdf`, and `--mode dsdf`.
+   - Root-caused to `suppress_speckle_pm(hr, dw, dh, ...)`, which is called by `upscale_adaptive` (invoked as the base renderer by all three SDF modes).
+   - In `suppress_speckle_pm`, Pass 2 (the domino pair pass) iterated `for (int vert = 0; vert < 2; vert++) for (int y = 1; y + 1 < dh; y++) for (int x = 1; x + 1 < dw; x++)`.
+   - For a horizontal pair (`vert = 0`), the 3x4 bounding box around the pair needs `j` up to `+2`, which accessed `y + 2` at `y = dh - 2` (`dh` -> out of bounds by 1 row). For a vertical pair (`vert = 1`), the 4x3 bounding box around the pair needs `i` up to `+2`, which accessed `x + 2` at `x = dw - 2` (`dw` -> out of bounds by 1 column).
+   - On ARM Linux/Android (including Android's default Scudo allocator), reads 4 bytes past heap allocation limits trap immediately with `SIGSEGV` (segmentation fault).
+   - Fixed by correcting loop bounds to `for (int vert = 0; vert < 2; vert++) for (int y = 1; y + 2 - vert < dh; y++) for (int x = 1; x + 1 + vert < dw; x++)`.
+   - Verified zero AddressSanitizer / UndefinedBehaviorSanitizer (`-fsanitize=address,undefined`) heap-buffer overflows or memory errors across all modes.
+
 # v4.9.3 Status & Future Directions
 
 ## Completed in v4.9.3

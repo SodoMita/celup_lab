@@ -4,8 +4,7 @@ __pycache__/
 celup_lab
 celup_lab_baseline
 *.o
-examples/
-comparison_sheets/
 docs/*.png
 *.png
-*.webp
+tests/*.webp
+tests/*.png
