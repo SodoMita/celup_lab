@@ -3206,6 +3206,20 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
      visible"), and brought back per-tread speckle and forked caps.
      Neon is prevented where it actually arises -- partial-trust
      blends -- by the lobe map, consensus evaluation and hull clamp. */
+  /* Auto-stair/halo guard (vNext): hard pixel-art sources get a
+     wider autoblur sigma + modest steepness cap so the automatic
+     choice never produces staircases or halos. */
+  {
+    extern double unique_ratio;
+    extern double soft_fraction;
+    if (soft_fraction < 0.12 || unique_ratio > 0.18) {
+      if (!blur_radius_set && blur_kernel_kind == BK_AUTO)
+        blur_radius = fmaxf(blur_radius, 2.1f);
+      if (deblur_steepness <= 0.f)
+        deblur_steepness = 2.2f;
+    }
+  }
+
   adb_sigma_div = 0.f;
   adb_assumed_sigma = 0.f;
   if (!upscale_autoblur(in, sw, sh, out, dw, dh))
