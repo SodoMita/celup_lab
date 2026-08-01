@@ -152,26 +152,23 @@ def run_upscale(src_path, dst_path, scale, tool, mode, extra):
 def create_staircase_test_image(path_webp, path_png):
     from scipy.ndimage import gaussian_filter
 
-    yy, xx = np.mgrid[0:96, 0:96]
-    lum = np.ones((96, 96), dtype=np.float64)
+    yy, xx = np.mgrid[0:48, 0:48]
+    lum = np.ones((48, 48), dtype=np.float64)
 
-    # Top left: 45-degree diagonal line
-    lum[0:48, 0:48] = np.where(np.abs((xx[0:48, 0:48] - 5) - (yy[0:48, 0:48] - 5)) <= 2, 0.08, 0.95)
+    # Top left: Bold 45-degree diagonal half-plane edge
+    lum[0:24, 0:24] = np.where((yy[0:24, 0:24] - xx[0:24, 0:24]) > 2, 0.08, 0.95)
 
-    # Top right: 30-degree shallow diagonal line (slope 1/2)
-    lum[0:48, 48:96] = np.where(
-        np.abs((xx[0:48, 48:96] - 48) - 2.0 * (yy[0:48, 48:96] - 6)) <= 2.5, 0.08, 0.95
-    )
+    # Top right: Bold 30-degree shallow diagonal edge
+    lum[0:24, 24:48] = np.where(yy[0:24, 24:48] > (0.5 * (xx[0:24, 24:48] - 24) + 6), 0.08, 0.95)
 
-    # Bottom left: Anti-aliased circle
-    dist_circ = np.sqrt((xx[48:96, 0:48] - 24) ** 2 + (yy[48:96, 0:48] - 24) ** 2)
-    lum[48:96, 0:48] = np.where(np.abs(dist_circ - 14) <= 2, 0.08, 0.95)
+    # Bottom left: Bold circular disk contour
+    dist_circ = np.sqrt((xx[24:48, 0:24] - 12) ** 2 + (yy[24:48, 0:24] - 36) ** 2)
+    lum[24:48, 0:24] = np.where(dist_circ <= 8.5, 0.08, 0.95)
 
-    # Bottom right: L-corner / junction
-    lum[58:86, 68:71] = 0.08
-    lum[58:61, 71:86] = 0.08
+    # Bottom right: Bold square L-corner block
+    lum[30:44, 30:44] = 0.08
 
-    lum = gaussian_filter(lum, 0.5)
+    lum = gaussian_filter(lum, 0.4)
     lum = np.round(lum * 44.0) / 44.0
     rgba = np.dstack([lum, lum * 0.95 + 0.03, lum * 0.90 + 0.06, np.ones_like(lum)])
     rgba_u8 = (np.clip(rgba, 0, 1) * 255).astype(np.uint8)
@@ -282,21 +279,21 @@ def main():
         # --------------------------------------------------------------------
         # Sheet 2: staircase_comparison (staircase_test.webp 96x96 -> 384x384 4x)
         # --------------------------------------------------------------------
-        print("3. Generating staircase_comparison sheet (4x upscale)...")
+        print("3. Generating staircase_comparison sheet (8x upscale)...")
         stair_panels = []
         for label, tool, mode, extra in MODES:
             out_p = td / f"stair_{tool}_{mode}_{len(stair_panels)}.webp"
-            run_upscale(stair_webp, out_p, 4, tool, mode, extra)
+            run_upscale(stair_webp, out_p, 8, tool, mode, extra)
             im = Image.open(out_p).convert("RGB")
             stair_panels.append((label, im))
 
         sheet_stair = make_grid_sheet(
-            "Staircase Problem Comparison — 45° Line, 30° Line, Circle & L-Corner (4x Upscale)",
+            "Staircase Problem Comparison — 45° Line, 30° Line, Circle & L-Corner (8x Upscale of 48x48)",
             stair_panels,
             cols=8,
         )
         sheet_stair.save(SHEET_DIR / "staircase_comparison.webp", lossless=True)
-        print("   -> saved staircase_comparison.png (.webp)")
+        print("   -> saved staircase_comparison.webp")
 
         # --------------------------------------------------------------------
         # Sheet 3: staircase_diag45_comparison (diagline48_src.webp 64x64 -> 256x256 4x)
