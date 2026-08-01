@@ -67,9 +67,7 @@ def run_candidate(c, inp, out):
     yy, xx = np.mgrid[0:dh, 0:dw]
     xx_push = np.clip(xx - nx * 0.8, 0, dw - 1).astype(np.float32)
     yy_push = np.clip(yy - ny * 0.8, 0, dh - 1).astype(np.float32)
-    pushed = np.empty_like(base)
-    for ch in range(base.shape[2]):
-     pushed[:, :, ch] = cv2.remap(base[:, :, ch], xx_push, yy_push, cv2.INTER_LINEAR)
+    pushed = cv2.remap(base, xx_push, yy_push, cv2.INTER_LINEAR)
     wt = np.clip((mag - 10.0) / 40.0, 0.0, 0.7)[:, :, None]
     base = base * (1.0 - wt) + pushed * wt
    elif mode == 'vector':
@@ -86,16 +84,13 @@ def run_candidate(c, inp, out):
      wt = np.exp(-0.5 * (step / 1.5)**2)
      xs = np.clip(xx + tx * step, 0, dw - 1).astype(np.float32)
      ys = np.clip(yy + ty * step, 0, dh - 1).astype(np.float32)
-     for ch in range(base.shape[2]):
-      acc[:, :, ch] += wt * cv2.remap(base[:, :, ch], xs, ys, cv2.INTER_LINEAR)
+     acc += wt * cv2.remap(base, xs, ys, cv2.INTER_LINEAR)
      w_tot += wt
     smoothed = acc / w_tot
     shift = 0.6
     xx_push = np.clip(xx - nx * shift, 0, dw - 1).astype(np.float32)
     yy_push = np.clip(yy - ny * shift, 0, dh - 1).astype(np.float32)
-    pushed = np.empty_like(base)
-    for ch in range(base.shape[2]):
-     pushed[:, :, ch] = cv2.remap(smoothed[:, :, ch], xx_push, yy_push, cv2.INTER_LINEAR)
+    pushed = cv2.remap(smoothed, xx_push, yy_push, cv2.INTER_LINEAR)
     wt_mag = np.clip((mag - 5.0) / 30.0, 0.0, 0.85)[:, :, None]
     base = smoothed * (1.0 - wt_mag) + pushed * wt_mag
    Image.fromarray(np.clip(base, 0, 255).astype(np.uint8), im.mode).save(out)
