@@ -2369,6 +2369,71 @@ static float estimate_qconf(const uint8_t *in, int sw, int sh) {
 }
 /* Standard-normal CDF (libm erff). */
 static float phi1(float z) { return .5f * (1.f + erff(z * 0.70710678f)); }
+
+/* v4.9.6 dip/line-profile helper: the box(h)-gauss(sig) dip shape,
+   normalized to 1 at the centre (p = |position - line centre|). */
+static float dipnorm(float p, float h, float sig) {
+  if (p < 0.f)
+    p = -p;
+  if (h < 0.f)
+    h = 0.f;
+  if (sig < .05f)
+    sig = .05f;
+  float den = 2.f * phi1(h / sig) - 1.f;
+  if (den < 1e-3f) { /* h << sig: gaussian-limit bump */
+    float z = p / sig;
+    return expf(-.5f * z * z);
+  }
+  return (phi1((p + h) / sig) - phi1((p - h) / sig)) / den;
+}
+
+/* Half-width calibration: the |du|-weighted flank centroids of a
+   blurred line sit at the half-depth points of the box-gauss dip,
+   z*(r) sigma from centre, with r = true half-width / sigma.  For
+   r << 1 z* -> 1.177 (gaussian half-max); for r >> 1 z* -> r.  LUT
+   maps the observed half-span q (= z*) back to r. */
+#define ZSTAR_N 1024
+static float zstar_r[ZSTAR_N], zstar_z[ZSTAR_N];
+static int zstar_ready = 0;
+static void zstar_init(void) {
+  if (zstar_ready)
+    return;
+  for (int i = 0; i < ZSTAR_N; i++) {
+    float r = .02f * powf(400.f, (float)i / (float)(ZSTAR_N - 1));
+    float target = phi1(r) - .5f; /* dip(0)/2 */
+    float lo = 0.f, hi = r + 5.f;
+    if (target < 1e-4f) {
+      zstar_z[i] = 1.17741f;
+    } else {
+      for (int it = 0; it < 60; it++) {
+        float z = .5f * (lo + hi);
+        float du = phi1(z + r) - phi1(z - r);
+        if (du > target)
+          lo = z;
+        else
+          hi = z;
+      }
+      zstar_z[i] = .5f * (lo + hi);
+    }
+    zstar_r[i] = r;
+  }
+  zstar_ready = 1;
+}
+static float r_from_zstar(float q) {
+  zstar_init();
+  if (q <= zstar_z[0])
+    return zstar_r[0];
+  int lo = 0, hi = ZSTAR_N - 1;
+  while (hi - lo > 1) {
+    int mid = (lo + hi) / 2;
+    if (zstar_z[mid] <= q)
+      lo = mid;
+    else
+      hi = mid;
+  }
+  float t = (q - zstar_z[lo]) / (zstar_z[hi] - zstar_z[lo] + 1e-9f);
+  return zstar_r[lo] + clampf(t, 0.f, 1.f) * (zstar_r[hi] - zstar_r[lo]);
+}
 static float trust_lo = .03f, trust_hi = .10f; /* fit-rmse trust gate; debug override: CDG=lo,hi */
 static float ss01(float z) {
   z = clampf(z, 0.f, 1.f);
@@ -2571,7 +2636,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
      contour-consensus fit instead of its own jittering 1D fit
      (near-apex windows misplace mu by 1-2 out px and raw per-pixel
      deltas swung +-0.25 with alternating sign). */
-  float *PF = malloc(n * 20 * sizeof *PF);
+  float *PF = malloc(n * 25 * sizeof *PF);
   uint8_t *LOH = malloc(n * 8);              /* local hull, u8/chan    */
   uint8_t *dst = malloc(n * 4);
   if (!A || !DEL || !PF || !LOH || !dst) {
@@ -2760,6 +2825,15 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
             fd2[4] = {0, 0, 0, 0}, offv0[4] = {0, 0, 0, 0},
             offv1[4] = {0, 0, 0, 0}, Pc0[4] = {0, 0, 0, 0},
             Pc1[4] = {0, 0, 0, 0};
+      /* v4.9.6 dip/line-class claim (pass 1.5 renders the feature
+         from the shared dip model instead of the fat washed shoulder
+         mid-contour): lW = fire flag, lVX/lVY = image-space vector
+         from the pixel to the line centre (frame-free, so the
+         consensus may average it), lDw = observed dip depth at the
+         centre against this window's own fit, lH = calibrated true
+         half-width in out px. */
+      float lW = 0.f, lVX = 0.f, lVY = 0.f, lDw = 0.f, lH = 0.f;
+      int uflip = 0;
       if (L2 >= 6.4e-5f) { /* |d| >= .008: not a flat */
         for (int j = 0; j < NS; j++) {
           float uu = 0.f;
@@ -2772,6 +2846,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
         for (int j = 0; j < NS; j++)
           corr += (float)(j - R) * u[j];
         if (corr < 0.f) { /* orient u increasing along +t */
+          uflip = 1;
           for (int j = 0; j < NS / 2; j++) {
             for (int c = 0; c < 4; c++) {
               float tmp = C[j][c];
@@ -3238,6 +3313,41 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                      tent-shaped line profiles misfit the erf ramp
                      while their PLATEAU is still measured solid) */
                   wS2 = 1.f;
+                  /* v4.9.6 dip/line-class claim.  Every gate the
+                     plateau restoration passes (extremum sandwich,
+                     direction consistency, coherence) proves these
+                     two flank lobes are ONE feature -- but the erf
+                     step model then tracks the mid-SHOULDER of the
+                     washed tent, which for a narrow line sits
+                     ~(1.2-1.4)s outside the true half-depth contour:
+                     steepening that contour paints the background
+                     ~2 px wide = the bright-field halo (and fat,
+                     rounded line ends).  The dip model replaces the
+                     contour with the line CENTRE and the calibrated
+                     TRUE half-width so the rendered stroke keeps the
+                     source's geometry; first (nearest) firing pair
+                     wins. */
+                  if (lW <= 0.f) {
+                    float muc = .5f * (mus[li] + mus[nb]);
+                    float span = fabsf(mus[li] - mus[nb]);
+                    float sloc = fs > .3f ? fs : .3f;
+                    float hh = r_from_zstar(span / (2.f * sloc)) * sloc;
+                    int jc = (int)lrintf(muc) + R;
+                    if (jc < 0)
+                      jc = 0;
+                    if (jc > NS - 1)
+                      jc = NS - 1;
+                    {
+                      float zj = ((float)(jc - R) - (float)fmu) / sloc;
+                      float Fc = ab_a + ab_c * zj + ab_b * phi1(zj);
+                      float sgn = uflip ? -1.f : 1.f;
+                      lVX = muc * sgn * dirx;
+                      lVY = muc * sgn * diry;
+                      lDw = Fc - raw[jc];
+                      lH = hh;
+                      lW = 1.f;
+                    }
+                  }
                   /* feature membership BY VALUE for the pass-1.5
                      gate: how far the pixel's own BASE colour sits
                      from the inner (this side) plateau relative to
@@ -3477,7 +3587,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
          write time via o[c] (texture stays per-pixel). */
       {
         float fw = ss01((.025f - rng) * (1.f / .017f)) * (1.f - wS);
-        float *dd = DEL + 4 * idx, *p = PF + 20 * idx;
+        float *dd = DEL + 4 * idx, *p = PF + 25 * idx;
         for (int c = 0; c < 4; c++)
           dd[c] = fw * flatmix * (mean[c] - o[c]);
         p[0] = wS;
@@ -3493,7 +3603,12 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           p[14 + c] = wS2 * offv1[c]; /* denominator is aW2 (v4.9.3)  */
         }
         p[18] = wS2;
-        p[19] = wS2 * frel; /* base-value feature membership (v4.9.3) */
+        p[19] = wS2 * frel; /* base-value feature membership (v4.9.3)  */
+        p[20] = lW;  /* v4.9.6 dip/line-class claim: image-space     */
+        p[21] = lW * lVX; /* vector to the line centre, depth and    */
+        p[22] = lW * lVY; /* true half-width (the blur below spreads */
+        p[23] = lW * lDw; /* them to all windows that merely SEE the */
+        p[24] = lW * lH;  /* feature, which is exactly the veil zone)*/
         /* v4.9.3: widen the hull by the CORRECTED plateaus only (they
            are extrapolated past the observed window range by design;
            nothing else may exceed the observed colours). */
@@ -3554,14 +3669,18 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
        48px probe).  Fit-parameter slots stay +-2 (sharper). */
     static const int slots2[7] = {0, 1, 2, 3, 4, 5, 6};
     static const int slots3[10] = {10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
-    static const int radii[2] = {2, 3};
-    static const int *slotset[2] = {slots2, slots3};
-    static const int nslots[2] = {7, 10};
+    /* dip/line-claim slots (20-24) reach +-5 px: firing windows sit a
+       full flank width away from the veil zone they describe, and the
+       veil is exactly where the replacement must land. */
+    static const int slots5[5] = {20, 21, 22, 23, 24};
+    static const int *slotsetA[3] = {slots2, slots3, slots5};
+    static const int nslotsA[3] = {7, 10, 5};
+    static const int radiiA[3] = {2, 3, 5};
     float *ev = malloc((size_t)dw * dh * sizeof *ev);
     if (ev)
-      for (int sset = 0; sset < 2; sset++)
-        for (int sl = 0; sl < nslots[sset]; sl++) {
-          const int q = slotset[sset][sl], R = radii[sset];
+      for (int sset = 0; sset < 3; sset++)
+        for (int sl = 0; sl < nslotsA[sset]; sl++) {
+          const int q = slotsetA[sset][sl], R = radiiA[sset];
         for (int y = 0; y < dh; y++)
           for (int x = 0; x < dw; x++) {
             double acc = 0.;
@@ -3572,7 +3691,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 xx = 0;
               if (xx >= dw)
                 xx = dw - 1;
-              acc += PF[20 * ((size_t)y * dw + xx) + q];
+              acc += PF[25 * ((size_t)y * dw + xx) + q];
               cnt++;
             }
             ev[(size_t)y * dw + x] = (float)(acc / cnt);
@@ -3590,7 +3709,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
               acc += ev[(size_t)yy * dw + x];
               cnt++;
             }
-            PF[20 * ((size_t)y * dw + x) + q] = (float)(acc / cnt);
+            PF[25 * ((size_t)y * dw + x) + q] = (float)(acc / cnt);
           }
       }
     free(ev);
@@ -3613,16 +3732,17 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
   for (int y = 0; y < dh; y++)
     for (int x = 0; x < dw; x++) {
       size_t idx = (size_t)y * dw + x;
-      const float *pf = PF + 20 * idx;
+      const float *pf = PF + 25 * idx;
       float tanx = pf[8], tany = pf[9], cc = pf[7];
       float aW = 0.f, aW2 = 0.f, aR = 0.f, aMu = 0.f, aS = 0.f,
             aD[4] = {0, 0, 0, 0}, aO0[4] = {0, 0, 0, 0},
             aO1[4] = {0, 0, 0, 0}, wsum = 0.f, tw[9], tmu[9];
+      float aWL = 0.f, aVX = 0.f, aVY = 0.f, aWD = 0.f, aHH = 0.f;
       for (int to = -T; to <= T + 2; to++) {
-        float wt, q[20];
+        float wt, q[25];
         if (to <= T) { /* tangential taps (the v4.8 consensus) */
           wt = (float)(T + 1 - (to < 0 ? -to : to));
-          sample_fn(PF, dw, dh, 20, (float)x + (float)to * tanx,
+          sample_fn(PF, dw, dh, 25, (float)x + (float)to * tanx,
                     (float)y + (float)to * tany, q);
         } else { /* v4.9.3: one NORMAL tap to each side, lower weight.
                     The per-pixel evidence field (wS) has holes at
@@ -3637,7 +3757,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                     cancels) while filling the holes. */
           float no = to == T + 1 ? -1.f : 1.f;
           wt = .55f * (T + 1) * .5f;
-          sample_fn(PF, dw, dh, 20, (float)x + no * -tany,
+          sample_fn(PF, dw, dh, 25, (float)x + no * -tany,
                     (float)y + no * tanx, q);
         }
         wt *= sqrtf(cc * fmaxf(q[7], 0.f));
@@ -3650,6 +3770,11 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
         aR += wt * q[19];
         aMu += wt * q[1];
         aS += wt * q[2];
+        aWL += wt * q[20];
+        aVX += wt * q[21];
+        aVY += wt * q[22];
+        aWD += wt * q[23];
+        aHH += wt * q[24];
         for (int c = 0; c < 4; c++) {
           aD[c] += wt * q[3 + c];
           aO0[c] += wt * q[10 + c];
@@ -3667,10 +3792,10 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
            interior: restore); innerness near 0 = the skirt or the
            background, where saturation-only claims used to repaint
            dark blobs around blurred lines (-r6 diagline probe). */
-        float gInn = .5f;
+        float gInn = .5f, inn_ = .5f;
         if (aW2 > 1e-6f) {
-          float inn = clampf(aR / aW2, -.2f, 1.2f);
-          gInn = ss01((inn - .5f) * (1.f / .3f));
+          inn_ = clampf(aR / aW2, -.2f, 1.2f);
+          gInn = ss01((inn_ - .5f) * (1.f / .3f));
         }
         /* offsets normalize by their OWN fire evidence aW2: windows
            that could not prove a flank pair keep wS2 = 0 and must not
@@ -3737,7 +3862,66 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
         else
           nu = phi1(k * z0);
         nu = clampf(nu, 0.f, 1.f);
-        /* saturation membership: the BASE (unremapped) model must
+        /* v4.9.6 dip/line render: where the consensus carries a
+           flank-pair line claim, REPLACE the erf-step evaluation of
+           the feature by the calibrated dip: the washed profile loses
+           the observed centre depth (u -= Dw*dipN(.;h,s)), the
+           steepened profile carries the restoration-proven depth at
+           the TRUE half-width (nu -= Dt*dipN(.;h,s/k)).  The step
+           part keeps its own semantics (ul != ur backgrounds ride the
+           step as before); far from the feature dipN ~ 0 and the
+           claim is a no-op, and the vector-to-centre field is
+           image-space so the consensus average is frame-free.  The
+           mid-shoulder fat-contour pathology ("halo" = the steepened
+           fat contour painting the background ~2 px wide) cannot
+           arise: the dip flanks sit at the true half-depth width. */
+        {
+          static int nodip = -1;
+          if (nodip < 0)
+            nodip = getenv("CELUP_NODIP") != NULL;
+#ifndef CELUP_DIP_DEF
+#define CELUP_DIP_DEF 0
+#endif
+          {
+            static int dipon = -1;
+            if (dipon < 0)
+              dipon = getenv("CELUP_DIP") != NULL ? 1 : CELUP_DIP_DEF;
+            if (!dipon || nodip)
+              aWL = 0.f;
+          }
+          /* consensus-diluted claim strength: even one firing tap
+             against 8 non-firing neighbours reads wLc ~ .12, so the
+             gate sits low; the flank-pair tests in pass 1 already
+             proved the geometry, this is only a spatial reach
+             control. */
+          if (aWL > 1e-6f && wsum > 1e-6f) {
+            float wLc = aWL / wsum;
+            float lfac = ss01((wLc - .03f) * (1.f / .10f));
+            if (lfac > 1e-3f) {
+              float vx = aVX / aWL, vy = aVY / aWL;
+              float pabs = sqrtf(vx * vx + vy * vy);
+              float hh = clampf(aHH / aWL, 0.f, 40.f);
+              float dwc = clampf(aWD / aWL, -1.2f, 1.2f);
+              float sp = s / (k > .05f ? k : .05f);
+              sp = clampf(sp, .32f, 40.f);
+              float sw2 = clampf(s, .4f, 40.f);
+              float dnw = dipnorm(pabs, hh, sw2);
+              float dns = dipnorm(pabs, hh, sp);
+              float num = 0.f, den = 0.f;
+              for (int c = 0; c < 4; c++) {
+                num += (off0e[c] + off1e[c]) * d2[c];
+                den += d2[c] * d2[c];
+              }
+              float dt = den > 1e-9f ? -num / den : 0.f;
+              dt = clampf(dt, -1.2f, 1.2f);
+              ufit0 -= lfac * dwc * dnw;
+              nu -= lfac * dt * dns;
+              ufit0 = clampf(ufit0, -.2f, 1.2f);
+              nu = clampf(nu, 0.f, 1.f);
+            }
+          }
+        }
+        /* saturation membership: the BASE (unsteepened) model must
            still place the pixel on this side's plateau before the
            restored plateau may be claimed for it -- nu cannot do this
            job: phi1(k*z0) saturates at |z0| > ~2.5/k, so it reads
@@ -3773,6 +3957,99 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
            two offsets, gated by shape to vanish at both plateaus so
            it cannot add anything to one-sided edges. */
         float uft = ss01((.5f - fabsf(ufit0 - .5f) - .2f) * (1.f / .15f));
+        /* v4.9.6 skirt transport (bright side): at pixels the model
+           itself places on the SATURATED bright plateau (nu ~ 1) the
+           anchored evaluation still re-adds the gain-1 residual
+           o-F(0), and the erf tail undercalls the composite blur
+           skirt (lobe s is read off the |du|-weighted shoulder; a
+           neighbouring stroke's far tail belongs to no window's
+           model) -- that leftover is the bright veil around strokes
+           (smiley r6 halo 17.4 vs NN 1.9) and the chroma bleed at
+           colour borders.  No DC-exact smoother can remove that
+           mass, so TRANSPORT it: look ~2.6s farther along the normal
+           (both directions; the tangent->normal map flips sign with
+           the pass-1 u-reversal), and where an evidence-backed tap
+           is itself claimed bright-plateau-saturated with an
+           agreeing step direction, pull the pixel toward the
+           OBSERVED base colour there.  Targets are neighbourhood
+           observations (no invented colours; hull-clamped after),
+           seams between close strokes reject themselves (the tap
+           lands on the next stroke's ramp: no same-side saturation),
+           and dark interiors are untouched (core depth is the
+           restoration terms' job). */
+        float wpeel = 0.f, atap[4] = {0, 0, 0, 0};
+#ifndef CELUP_NOPEEL_ENV
+        {
+          static int nopeel = -1;
+          if (nopeel < 0)
+            nopeel = getenv("CELUP_NOPEEL") != NULL;
+          /* v4.9.6 skirt transport.  The moment-fit s underreads the
+             true composite blur ~2.5x at -r >= 4 ("sigma 6 reads as
+             2.5"), so the steepened model saturates before the tail
+             ends: the anchored removal stops being paid exactly
+             where the long blur skirt lives (the halo), and across
+             the wash trough it even saturates DARK at truly bright
+             pixels.  Cleanup is licensed by the pixel's OWN model
+             (no independent tap fit -- at 2.6s distance there often
+             is none): where the model claims plateau saturation,
+             the colour observed ~2.6s farther along the normal is a
+             sample of the same claimed plateau.  Value does the
+             guarding: bright-plateau claims (nu > .88) may pull only
+             toward taps that do not darken along the step; deep
+             dark-interior claims (nu < .12) MORE than 1.2s past the
+             fitted contour (wash trough, not rim: rim pixels sit
+             |z0| < ~1 and wide-ink interiors never find a brighter
+             tap) may pull only toward strictly brighter taps.
+             Targets are neighbourhood observations (nothing
+             invented; hull clamp after), so seams between close
+             strokes that offer no clean plateau simply never fire. */
+          float satb = ss01((nu - .88f) * (1.f / .09f));
+          /* dark branch gates: saturated dark claim (nu < .12) FAR
+             past the fitted contour (|z0| > 1.2 sigma: the trough,
+             not the rim) AND value far from the proven washed inner
+             level (inn < .6 -- inn alone separates the fog (inn ~
+             .45) from the ink rim (inn > .7) even at -r 6 wash
+             compression; cutting on inn rather than gInn keeps the
+             .5/.3 ss01 gate's own shape out of the geometry). */
+          float satd = ss01((.12f - nu) * (1.f / .06f)) *
+                       ss01((-z0 - 1.2f) * (1.f / .6f)) *
+                       ss01((.60f - inn_) * (1.f / .15f)) *
+                       ss01((s - 2.f) * (1.f / 2.f));
+          float sat = satb > satd ? satb : satd;
+          if (!nopeel && w > .04f && sat > .02f) {
+            float nax = pf[9], nay = -pf[8];
+            float accw = 0.f;
+            float dist = clampf(2.6f * s, 5.f, 20.f);
+            for (int sgn = -1; sgn <= 1; sgn += 2) {
+              float tx = (float)x + (float)sgn * dist * nax,
+                    ty = (float)y + (float)sgn * dist * nay, qa[4];
+              float pv = 0.f, nn_ = 0.f;
+              sample_f4(A, dw, dh, tx, ty, qa);
+              for (int c = 0; c < 4; c++) {
+                pv += (qa[c] - o[c]) * d2[c];
+                nn_ += d2[c] * d2[c];
+              }
+              pv = nn_ > 1e-9f ? pv / sqrtf(nn_) : 0.f;
+              float ok = satd > satb
+                             ? ss01((pv - .015f) * (1.f / .03f))
+                             : ss01((pv + .002f) * (1.f / .03f));
+              if (ok < 1e-3f)
+                continue;
+              for (int c = 0; c < 4; c++)
+                atap[c] += ok * qa[c];
+              accw += ok;
+              if (ok > wpeel)
+                wpeel = ok;
+            }
+            if (accw > 1e-6f) {
+              for (int c = 0; c < 4; c++)
+                atap[c] /= accw;
+              wpeel = wpeel * w * sat;
+            } else
+              wpeel = 0.f;
+          }
+        }
+#endif
         float *dd = DEL + 4 * idx;
         float c0blo_dbg = -1.f;
         /* v4.9.3: widen the local colour hull by the CONSENSUS
@@ -3863,7 +4140,28 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                                      uf1 * nu * off1e[c]) +
                                w2v * gInn * uft * tc,
                            blo, bhi);
+          if (wpeel > 0.f)
+            v = clampf(v + wpeel * (atap[c] - v), blo, bhi);
           dd[c] += v - o[c];
+        }
+        {
+          static FILE *wm = NULL;
+          static int wm_on = -1;
+          if (wm_on < 0) {
+            const char *e = getenv("CELUP_WMAP");
+            wm_on = e && *e;
+            if (wm_on)
+              wm = fopen(e, "w");
+          }
+          if (wm) {
+            float pabs_d =
+                aWL > 1e-6f
+                    ? sqrtf(aVX / aWL * (aVX / aWL) +
+                            aVY / aWL * (aVY / aWL))
+                    : 0.f;
+            fprintf(wm, "%d %d %.5f %.5f %.5f %.5f %.5f %.4f %.4f\n",
+                    x, y, w, w2v, nu, ufit0, wpeel, pabs_d);
+          }
         }
         if (dbg && y == dbg_y && abs(x - dbg_x) <= 16 && (x & 1) == 0)
           fprintf(stderr,
@@ -3894,14 +4192,14 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
   for (int y = 0; y < dh; y++)
     for (int x = 0; x < dw; x++) {
       size_t idx = (size_t)y * dw + x;
-      const float *pf = PF + 20 * idx;
+      const float *pf = PF + 25 * idx;
       float cc = pf[7];
       float acc[4] = {0, 0, 0, 0}, o[4], res[4], wsum = 0.f;
       for (int to = -T; to <= T; to++) {
-        float wt = (float)(T + 1 - (to < 0 ? -to : to)), q[4], qc[20];
+        float wt = (float)(T + 1 - (to < 0 ? -to : to)), q[4], qc[25];
         float sx = (float)x + (float)to * pf[8],
               sy = (float)y + (float)to * pf[9];
-        sample_fn(PF, dw, dh, 20, sx, sy, qc);
+        sample_fn(PF, dw, dh, 25, sx, sy, qc);
         wt *= sqrtf(cc * fmaxf(qc[7], 0.f));
         sample_f4(DEL, dw, dh, sx, sy, q);
         for (int c = 0; c < 4; c++)
@@ -5658,7 +5956,7 @@ static uint8_t *slurp(const char *name, size_t *n) {
 static void print_help(const char *argv0) {
   printf(
       "celup_lab -- premultiplied-linear WebP upscaler (research build "
-      "v4.9.5)\n"
+      "v4.9.6)\n"
       "\n"
       "Usage: %s in.webp out.webp SCALE [options]\n"
       "  SCALE is the upsampling factor, real number in (1,32] "

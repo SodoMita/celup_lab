@@ -1,5 +1,39 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.9.6 update (2026-08-01): veil root-caused (s-underread) + skirt transport shipped
+
+- Trigger: external review of the miya/smiley sheets ("halos, mush,
+  bleeding, inconsistent sharpness").  Smile r6 veil decomposed by
+  distance bands: 26.8 @2-4px, 11.2 @4-6, 6.4 @6-10, still 2.1 @10-16
+  (NN ~1.9 at 2-4).  Two carrier populations measured: (a) pixels the
+  model saturates BRIGHT but whose gain-1 residual keeps the tail --
+  the |du|-moment s reads ~4 out-px while the base skirt runs
+  sigma ~10-12 out-px (two-scale profile), so `(nu-ufit0)*d2` pays
+  ~0 out there; (b) pixels the model saturates DARK (nu<.12, HALF the
+  veil band) -- the wash trough is mis-owned as ink interior, only
+  resolvable by VALUE gates.
+- Shipped: value-gated skirt transport (peel): saturated claims
+  sample ~2.6s farther along the normal; bright claims require
+  non-darkening taps (along d2), dark claims require |z0|>1.2 AND
+  inn<.6 (the washed-inner membership; ink rims keep inn~.8-1, trough
+  fog reads .4-.55) AND strictly brighter taps AND s>2.  Targets are
+  observed base colours, hull-clamped; nothing is DC-spread (the
+  terrace pass is DC-exact and provably cannot remove veil mass).
+- Numbers: r6 halo 17.4 -> 14.8, ink .949 -> .942; r2.3 halo 4.75 ->
+  3.35, ink .969 -> .971, darkmean 20.6 -> 16.0; diagline GT MAE
+  15.26 -> 13.37; ship4x jump95 .023 -> .001; all gates green.
+- Dip/line class built (vec-to-centre field + zstar LUT width
+  inversion + pass-1.5 dip evaluation) but OFF by default
+  (CELUP_DIP=1 to test): in multi-feature troughs the chosen flank
+  pair gives garbage widths (point-line floor).  Next honest step:
+  tail-calibrated sigma (two-scale LS at consensus level) -- it is
+  also what the anchored removal needs to chase the +-20 px tail
+  directly instead of by peel.
+- Open (updated): cusp/radial tip class; comb-teeth in dense miya
+  lash zone; wand-smoke alpha-fringe chroma junk (pre-existing);
+  residual narrow-gap fog where NO brighter tap exists within 2.6s
+  (needs the sigma fix, not more peel).
+
 # v4.9.5 update (2026-08-01): mass-conserving deblur depth; mouth doubling fixed; tip anatomy
 
 - User on v4.9.4: "improved color restore, but more artifacts, miya

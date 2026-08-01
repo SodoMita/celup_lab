@@ -38,6 +38,54 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
+## v4.9.6: skirt transport kills the veil (halo 17.4 -> 14.8, diagline MAE 15.3 -> 13.4)
+
+Third-party review of the 4x/2x sheets: "loss of fine detail, edge
+halos/ringing, over-smoothing, inconsistent sharpness, colour
+bleeding near edges".  Forensics on the smiley `-r 6` veil (mean
+darkness in the 2-4 px band outside the ink, NN reference 1.9):
+
+- The base render's skirt is a two-scale profile: a sigma ~4 out-px
+  bell over a sigma ~10-12 out-px tail (measurements at the brow row:
+  35 units at 4 px, 13 at 10 px, still 3 at 14 px outside the true
+  edge).  The per-pixel |du|-moment width systematically underreads
+  the composite blur ~2.5x (the code's own comment: "sigma 6 reads
+  as 2.5"), so the anchored steepening-removal `(nu-ufit0)*d2`
+  saturates and pays ~nothing exactly where the long tail lives.
+  Worse, inside the wash trough the model saturates DARK (nu < .12)
+  at pixels whose truth is bright background -- half the veil band is
+  mis-owned like that, and no saturation gate can ever clean it.
+
+- **Fix shipped (value-gated skirt transport):** where the consensus
+  model itself claims saturation, the colour observed ~2.6 sigma
+  farther along the normal is a sample of the same claimed plateau
+  (no independent tap model required -- there usually is none at
+  that distance).  Bright-plateau claims (nu > .88) may pull only
+  toward taps that do not darken along the step direction; deep
+  dark-interior claims (nu < .12) must additionally lie > 1.2 sigma
+  past the fitted contour, far from the proven washed inner level
+  (inn < .6), and only at genuinely blurred models (s > 2) -- then
+  may pull only toward strictly brighter taps.  All targets are
+  neighbourhood observations (nothing is invented; the local colour
+  hull still clamps), seams between close strokes simply never fire.
+- Scoreboard: smiley r6 halo 17.4 -> **14.8** (ink .949 -> .942),
+  r2.3 halo 4.75 -> **3.35** with ink .969 -> **.971** and DEEPER ink
+  (darkmean 20.6 -> 16.0); diagline crisp-GT MAE 15.26 -> **13.37**
+  (best of all measured versions); ship4x jump95 .023 -> .001;
+  check_stairs / check_corners / test_scales all PASS.
+
+- **Built but parked (CELUP_DIP=1): the dip/line feature class.**
+  Flank-pair windows now also emit a line claim: image-space vector
+  from the pixel to the line centre (frame-free, consensus-safe),
+  observed centre depth, and TRUE half-width from a box+gauss LUT
+  inversion of the shoulder-mid span.  Pass 1.5 can then evaluate
+  the proper dip profile instead of the fat mid-shoulder contour.
+  First calibration regressed slightly (in multi-feature trough
+  zones the picked flank pair collapses the width to the point-line
+  floor), so it ships disabled; the honest follow-up is the
+  tail-calibrated sigma (two-scale LS) which both the anchored
+  removal and this class need to reach their design accuracy.
+
 ## v4.9.5: accumulate-mass depth (colours are reconcentrated, never invented) + dip-core tent
 
 User's report on v4.9.4: colour restore visibly better, **but** "miya
