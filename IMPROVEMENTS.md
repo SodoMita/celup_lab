@@ -45,3 +45,12 @@
   out-of-source-range pixels); hourglass HG lower than lanczos3 on
   checker2/crosshatch/rings/diag; diagline staircase gate 2x jump95 .040
   and 4x .159 (both PASS).  Fixed build.sh to compile xbr/xbrz sources.
+
+## Comparison sheets for the four real test images
+
+- New `make_user_comparison_sheets.py` builds stacked mode-comparison sheets
+  (nearest/bilinear/cubic/mitchell/lanczos3/jinc2_bilateral/superxbr/
+  adaptive/autodeblur/sdf) for miya face (miya_normal crop 320x300, x2),
+  smiley (poor smiley x4), cat (x2) and pikachu (x2).  Outputs lossless WebP
+  (or PNG when a sheet exceeds WebP's 16383px limit) into comparison_sheets/,
+  plus a combined `sheet_all_four` panel.
