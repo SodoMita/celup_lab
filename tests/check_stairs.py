@@ -49,8 +49,10 @@ SHIP2 = ["--mode", "autodeblur", "--max-mib", "1048", "-c", "linear",
          "-k", "bspline", "-r", "6", "-s", "100", "-g", "64", "-D", "remap"]
 SHIP4 = ["--mode", "autodeblur", "--max-mib", "1048", "-c", "linear",
          "-k", "bspline", "-r", "2.3", "-s", "100", "-g", "16", "-D", "remap"]
-PROBE = ["--mode", "autodeblur", "--max-mib", "1048", "-c", "linear",
-         "-k", "bspline", "-r", "0.5", "-s", "100", "-g", "64", "-D", "remap"]
+# v5: with wider kernel floors and looser caps even the crisp autodeblur
+# is now smooth (0.002 jump95); to keep detector non-toothless, probe uses
+# nearest (guaranteed staircase, jump95 ~3) as the known-bad case.
+PROBE = ["--mode", "nearest", "--max-mib", "1048"]
 
 TREADRUN_MAX = 3      # output rows pinned to one crossing position
 JUMP95_MAX = 0.45     # output px adjacent-row residual step (p95)
