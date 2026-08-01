@@ -4313,11 +4313,29 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
             }
             float a = zaa * scale;
             float mmu = mu < 0.f ? -mu : mu;
-            /* outside the corridor: value-space erf-gain map of the
-               rendered colour (orientation-free: m is measured along
-               the hull diagonal, so the pass-1 u-reversal cannot
-               flip it) */
-            float mm = phi1(zg * probit01(m));
+            /* v4.9.9 deblur completion.  The value map
+               mm = Phi(zg*Phi^-1(m)) has an unbreakable fixpoint at
+               m = .5: one washed mid column per contour always
+               survives (the residual "sharper halo").  A POSITIONAL
+               tie-break via the consensus step offset mu does not
+               work either: between a thin stroke's two flanks the
+               nearest-lobe step assignment flips per pixel, and
+               rendering that with a sub-pixel transition width is
+               salt-and-pepper (measured catastrophe v4.9.9a: the eye
+               ring doubled and hashed).  The stable tie-break is the
+               pixel's own COLOUR side: m is smooth (it is the
+               finished colour projected on the hull diagonal), so a
+               large-but-finite gain in m-space places the threshold
+               crossing on a smooth curve -- on quantized (step-class)
+               sources boost the value gain zg by ZBOOST (default 4x
+               => effective 12): everything with m < .47 snaps to its
+               own dark plateau, m > .53 to the bright one, and the
+               gray band shrinks to the sub-pixel strip where the
+               colour itself is truly mid.  Same construction, same
+               proof: monotone map, range (0,1), proven endpoints --
+               no overshoot is possible, only geometry decided by the
+               colour itself. */
+            float qq = ss01((adb_qconf - .60f) * (1.f / .30f));
             /* huge local hull span = a true step lives here, not a
                smooth-gradient fragment (skin/hair shading spans far
                less): extend the endpoints toward the source-global
@@ -4329,41 +4347,96 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                demonstrably straddles a global-extremes step. */
             float rmp = ss01((alh - .35f * calh) * (1.f / .6f)) *
                         ss01((adb_qconf - .5f) * (1.f / .3f));
-            /* the extension gate must be SPATIALLY CONSISTENT along
-               the contour (an on/off flicker renders as treads): on
-               quantized sources alh stays near calh along the whole
-               feature, so this fires uniformly; photos never reach
-               here at all (qconf ~ 0) -- the purple|green red-range
-               injection class stays locked out. */
-            float rcp = rmp;
-            /* weight: fit trust x real step span x corridor exit
-               (inside the true-AA corridor the rendered value stays:
-               it encodes the feature's exact sub-pixel width, which
-               no positional law can reproduce). */
-            float wz = ss01((w - .5f) * (1.f / .3f)) *
+            /* v4.9.9 washed-core full extension ("remove the highest
+               caps"): the model claims this pixel sits DEEP on a
+               plateau (|z0| > 2.2) yet the finished colour still
+               floats > .18 away from the claimed level -- the local
+               window never saw the true level (a washed stroke core),
+               so on quantized sources extend to the source-global
+               extremes outright.  Spatially coherent (the |z0|
+               saturation zone is contiguous along the feature), and
+               photos never enter: qq = 0 there, the global-injection
+               fringe class stays locked out. */
+            float fullsat =
+                qq * ss01((fabsf(z0) - 2.2f) * (1.f / .8f)) *
+                ss01((fabsf(m - ufit0) - .18f) * (1.f / .15f));
+            float rcp = rmp > fullsat ? rmp : fullsat;
+            /* evidence: fit trust w, or flank-pair proof w2v
+               DISCOUNTED by how far the colour itself sits from the
+               steepened model's verdict (frame-flipped camps have nu
+               saturated against m; those keep the bare w). */
+#ifndef CELUP_EVW2V
+#define CELUP_EVW2V 1
+#endif
+#if CELUP_EVW2V
+            float agr = 1.f - fabsf(nu - m);
+            float evz = fmaxf(w, w2v * ss01((agr - .50f) * (1.f / .35f)));
+#else
+            float evz = fmaxf(w, w2v);
+#endif
+            /* weight: real step span x corridor exit x evidence. */
+            float wz = ss01((evz - .10f) * (1.f / .4f)) *
                        ss01((alh - .30f) * (1.f / .25f)) *
                        ss01((mmu - a) * (1.f / .7f));
+            float elo3[3], ehi3[3];
+            for (int c = 0; c < 3; c++) {
+              elo3[c] = vblo[c] + rcp * (adb_srclo[c] - vblo[c]);
+              ehi3[c] = vbhi[c] + rcp * (adb_srchi[c] - vbhi[c]);
+            }
+            /* v4.9.9 evidence broadening: inside deep wash the erf
+               trust w is ~0 BY CONSTRUCTION (the wash is what the erf
+               cannot fit), so gating the deblur's own payment by w
+               alone starves exactly the stroke cores it exists for.
+               The flank-pair restoration evidence w2v, which is
+               proven there instead, is equally binding -- take the
+               max.  Geometry still comes from the proven hulls, so
+               the payment remains bounded by proven colours. */
+            /* outside the corridor: value-space erf-gain map of the
+               rendered colour (orientation-free: m is measured along
+               the hull diagonal, so the pass-1 u-reversal cannot
+               flip it); on quantized sources the gain is boosted to
+               an effectively hard (but smooth) threshold. */
+#ifndef CELUP_ZBOOST_DEF
+#define CELUP_ZBOOST_DEF 4.f
+#endif
+            float zge = zg;
+            {
+              static float zb_env = -1.f;
+              if (zb_env < 0.f) {
+                const char *e = getenv("CELUP_ZBOOST");
+                zb_env = e && *e ? (float)atof(e) : 0.f;
+              }
+              zge *= 1.f + qq * ((zb_env > 1.f ? zb_env
+                                                : CELUP_ZBOOST_DEF) -
+                                 1.f);
+            }
+            float mm = phi1(zge * probit01(m));
             zm_dbg = m;
             zmm_dbg = mm;
             zal_dbg = alh;
             wz_dbg = wz;
             zmw = zno ? 0.f : wz;
-            zrmp = rmp;
-            if (!zno && wz > 1e-3f)
+            zrmp = rcp;
+            if (!zno && wz > 1e-3f) {
+              /* cap removal: a strongly-firing gate pays in full --
+                 the partial lerp used to leave 30-50% of the proven
+                 deblur behind on exactly the washed pixels it exists
+                 for. */
+              float wz2 =
+                  wz > .55f ? 1.f : ss01((wz - .20f) * (1.f / .35f));
               for (int c = 0; c < 3; c++) {
                 /* target = mm-fraction across the channel's own HULL
                    span (hull amplitude is proven; the LSQ d2
                    amplitude is not -- a washed flank under-reads it
                    ~2x), oriented per channel by the d2 sign (the
                    pass-1 u-reversal flips the axis: never index
-                   plateaus as dark/bright).  Channels the step does
-                   not move (|d2| tiny against the hull span) are left
-                   alone. */
-                float elo = vblo[c] + rcp * (adb_srclo[c] - vblo[c]);
-                float ehi = vbhi[c] + rcp * (adb_srchi[c] - vbhi[c]);
-                float tgt = elo + mm * (ehi - elo);
-                vv[c] = clampf(vv[c] + wz * (tgt - vv[c]), elo, ehi);
+                   plateaus as dark/bright). */
+                float tgt = elo3[c] + mm * (ehi3[c] - elo3[c]);
+                vv[c] =
+                    clampf(vv[c] + wz2 * (tgt - vv[c]), elo3[c],
+                           ehi3[c]);
               }
+            }
           }
         }
         for (int c = 0; c < 4; c++)
