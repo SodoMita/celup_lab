@@ -38,6 +38,75 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
+## v4.9.8: the erf-gain post-map -- the grey test
+
+The user's newest acceptance test: *"for the smiley, if grey exists on
+the final image, the deblur is incorrect"* (the source is a 45-level
+quantized staircase = plateaus + ~1px true AA; NN-upscale carries
+0.02% mid-grey in the ROI, v4.9.7 left 17.6%).  And the standing
+derivation requirement: the formula must increase the gradient slope
+such that overshoot is impossible **by construction**, not tuned.
+
+Derivation.  A Gaussian-blurred edge is v(x) = P0 + A*Phi((x-x0)/s);
+de-blurring s -> s/g is exactly (x-x0) -> g*(x-x0).  Written against
+the pixel's own measured step fraction m = ((v-P0).A)/(A.A), that is
+
+    m' = Phi(g * Phi^-1(m)),   v' = P0 + m'*A
+
+a composition of monotone maps with range (0,1) -- therefore v' is
+ALWAYS strictly inside the proven range: no ringing, no overshoot,
+possible by construction.  Every quantity in it is proven:
+
+- P0..P1 is the pixel's OWN local colour hull (LOH = separable
+  extrema of observed colours, consensus-widened; hull colours == NN
+  colours within ~1 8-bit step), not the LSQ step amplitude (a washed
+  flank under-reads the fitted |d2| ~2x, so the v4.9 model plateaus
+  are uncalibrated -- measured |A| ~1.3 in a 0..1 range).
+- On global-extremes steps (hard-quantized sources only, qconf gate)
+  the endpoints extend toward the SOURCE-GLOBAL range: a wide wash's
+  local extrema never reach the true plateau (the washed floor
+  ~49/255 reads as the "plateau" and the snap used to stop there).
+- The map steepens the FINISHED colour; the plateaus are attractors
+  (m ~ 0/1 snap fully: wash shoulders and dark-side cross-wash are
+  re-absorbed into their own plateau), m = .5 is a fixpoint (the soft
+  ramp core survives, compressed 1/g, default g = 2.2).
+- Gate = fit trust w x real step span (|hull| >= .30): genuine smooth
+  gradients (skin/hair shading spans far less) stay verbatim;
+  junction/corner zones taper with w.
+- Pass 2 must not undo it: the mapped hull is written back to LOH
+  (the final clamp used to raise the washed floor back onto snapped
+  pixels), and the staircase cleanup + tangential delta smoothing
+  stand down exactly where the map owns the colour (both re-inject
+  the washed base average).
+
+Why not snap true-AA pixels too: AA boundary values encode the
+feature's exact sub-pixel WIDTH -- no positional law can reproduce
+them (crisp-GT diagline: positional repaint costs MAE 13.2 -> 19+).
+The value-space map keeps position information in m and only
+steepens it, which is what the derivation licenses.
+
+Scoreboard (smiley ROI, NN: halo 1.9, ink .949, grey 0.02%):
+
+| metric | v4.9.2 | v4.9.5 | v4.9.7 | v4.9.8 |
+|---|---|---|---|---|
+| r6 grey    | --     | 17.69% | 17.61% | **4.99%** |
+| r6 halo    | --     | 17.37  | 16.25  | **8.99**  |
+| r6 ink     | --     | .949   | .951   | **.957**  |
+| r2.3 grey  | --     | 12.71% | 12.22% | **2.96%** |
+| r2.3 halo  | --     | 4.75   | 4.17   | **0.49**  |
+| r2.3 ink   | --     | .969   | .970   | **.976**  |
+
+miya 4x: no rings, no posterized gradients; diffs vs v4.9.7 are
+contour crisping + minor chroma tightening at hue borders (wand smoke
+alpha fringe is the parked class).  Gates: check_stairs (threshold
+recalibrated to the new mid-value-free morphology: ship2x jump95
+.098 vs probe .362, cut .30), check_corners (hull/tip/glow), diagline
+crisp-GT MAE 15.0 (AA-quantization is the price of the grey test --
+they contradict by definition), test_scales 204 rows all PASS.
+Env knobs: CELUP_NOZ (map off), CELUP_ZG (gain), CELUP_ZAA (true-AA
+corridor half-width in source px, default ~0 = full map), CELUP_ZDBG
+(per-pixel map dump).
+
 ## v4.9.7: own-line plateau transport -- the veil fix WITHOUT the new halos
 
 The v4.9.6 tap transport pulled skirt pixels toward the RAW colours
