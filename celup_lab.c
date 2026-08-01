@@ -1138,8 +1138,8 @@ static int build_class_map(const uint8_t *in, int sw, int sh, class_map_t *cm) {
         float flip_conf = ramp01(flip_ratio, .40f, .80f);
 
         float line_conf = 1.f - ramp01(residual, .012f, .07f);
-        float plane_conf = 1.f - ramp01(plane_mse, .010f, .045f);
-        float plane_r2_conf = ramp01(plane_r2, .55f, .85f);
+        float plane_conf = 1.f - ramp01(plane_mse, .020f, .085f);
+        float plane_r2_conf = ramp01(plane_r2, .25f, .70f);
         float parity_dom = ramp01(checker_r2 - plane_r2, .03f, .20f);
         float endpoint_conf = ramp01(endpoint, .48f, .78f);
         float range_conf = ramp01(tmax - tmin, .35f, .75f);
@@ -3400,11 +3400,10 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
       float inv = 1.f / iw;
       for (int c = 0; c < 10; c++)
         f[c] *= inv;
-      f[10] *= ramp01(iw, .15f, .5f);
     }
   }
   free(accw);
-  /* Straighten + coherence-gate: one [1,2,1]^2 pass relaxes residual stair
+  /* Straighten + coherence-gate: four [1,2,1]^2 passes relax residual stair
      wobble to the chord, then |grad d| is estimated from the smoothed
      field. */
   {
@@ -3441,7 +3440,7 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
           float gy = (d0[(size_t)clampi(y + 1, 0, sh - 1) * sw + x] -
                       d0[(size_t)clampi(y - 1, 0, sh - 1) * sw + x]) *
                      .5f;
-          fld[11 * k + 10] *= ramp01(sqrtf(gx * gx + gy * gy), .15f, .5f);
+          fld[11 * k + 10] *= ramp01(sqrtf(gx * gx + gy * gy), .05f, .20f);
         }
     }
     free(d0);
