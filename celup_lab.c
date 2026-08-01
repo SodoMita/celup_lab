@@ -3547,7 +3547,6 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
               float z0 = (0.f - (float)mu) / s;
               float ufit0 = phi1(z0), nu;
               if (method == 3) {
-                ufit0 = clampf(0.5f + 0.39894228f * z0, 0.f, 1.f);
                 float K = deblur_steepness > 0.f ? deblur_steepness : (k > 1.0001f ? 1.f + 3.6f / (k - 1.f) : 1e6f);
                 if (K < 1.f) K = 1.f;
                 if (K <= 1.0001f) {
@@ -3933,7 +3932,6 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
            without this the offset paints a neon band +-1.5 flanks
            wide around narrow lines. */
         if (method == 3) {
-          ufit0 = clampf(0.5f + 0.39894228f * z0, 0.f, 1.f);
           float K = deblur_steepness > 0.f ? deblur_steepness : (k > 1.0001f ? 1.f + 3.6f / (k - 1.f) : 1e6f);
           if (K < 1.f) K = 1.f;
           if (K <= 1.0001f) {
@@ -4279,6 +4277,11 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           float t0 = off0e[c], t1 = off1e[c], tc = 0.f;
           if (t0 * t1 > 0.f)
             tc = fabsf(t0) < fabsf(t1) ? t0 : t1;
+          if (method == 3) {
+            vr = 0.f;
+            uft = 0.f;
+            wpeel = 0.f;
+          }
           float v = clampf(o[c] + w * ((nu - ufit0) * d2[c]) +
                                vr * (uf0 * (1.f - nu) * off0e[c] +
                                      uf1 * nu * off1e[c]) +
@@ -4407,6 +4410,9 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
             float wz = ss01((evz - .10f) * (1.f / .4f)) *
                        ss01((alh - .30f) * (1.f / .25f)) *
                        ss01((mmu - a) * (1.f / .7f));
+            if (method == 3) {
+              wz = 0.f;
+            }
             float elo3[3], ehi3[3];
             for (int c = 0; c < 3; c++) {
               elo3[c] = vblo[c] + rcp * (adb_srclo[c] - vblo[c]);
