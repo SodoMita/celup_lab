@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """v4.9.1 staircase gate using Python stdlib + libwebp."""
-import ctypes, subprocess, sys, tempfile, os, math
+import ctypes, subprocess, sys, tempfile, os
 
 webp = ctypes.CDLL('/usr/lib/x86_64-linux-gnu/libwebp.so.7')
 webp.WebPDecodeRGBA.restype = ctypes.POINTER(ctypes.c_uint8)
@@ -25,6 +25,18 @@ PROBE = ["--mode", "autodeblur", "--max-mib", "2048", "-c", "linear",
 
 TREADRUN_MAX = 3
 JUMP95_MAX = 0.45
+
+def linfit(ys, xx):
+    n = len(ys)
+    if n < 2:
+        return 0.0, 0.0
+    my = sum(ys) / n
+    mx = sum(xx) / n
+    num = sum((ys[i] - my) * (xx[i] - mx) for i in range(n))
+    den = sum((ys[i] - my)**2 for i in range(n)) or 1e-6
+    slope = num / den
+    intercept = mx - slope * my
+    return slope, intercept
 
 def crossings(path):
     w, h, buf = decode(path)
@@ -71,38 +83,64 @@ def metrics(path):
     xe = crossings(path)
     h = len(xe)
     m = int(h * .06)
-    valid_pts = [(y, xe[y]) for y in range(m, h - m) if xe[y] is not None]
-    if len(valid_pts) < h * 0.55:
+    pts = [(y, xe[y]) for y in range(m, h - m) if xe[y] is not None]
+    if len(pts) < h * 0.55:
         return None
     
-    ys = [p[0] for p in valid_pts]
-    xx = [p[1] for p in valid_pts]
+    ys = [p[0] for p in pts]
+    xx = [p[1] for p in pts]
     
-    # Simple linear fit
-    n = len(ys)
-    mean_y = sum(ys) / n
-    mean_x = sum(xx) / n
-    num = sum((ys[i] - mean_y) * (xx[i] - mean_x) for i in range(n))
-    den = sum((ys[i] - mean_y)**2 for i in range(n)) or 1e-6
-    slope = num / den
-    intercept = mean_x - slope * mean_y
+    for _ in range(2):
+        slope, intercept = linfit(ys, xx)
+        inl_pts = [(y, x) for y, x in zip(ys, xx) if abs(x - (slope * y + intercept)) < 2.0]
+        if len(inl_pts) > 8:
+            ys = [p[0] for p in inl_pts]
+            xx = [p[1] for p in inl_pts]
+            
+    slope, intercept = linfit(ys, xx)
     
-    res = [xx[i] - (slope * ys[i] + intercept) for i in range(n)]
-    d = [abs(res[i] - res[i-1]) for i in range(1, n)]
+    # Segment extraction
+    seg, cur = [], []
+    for y, x in zip(ys, xx):
+        v = abs(x - (slope * y + intercept)) < 2.0
+        if v and (not cur or y - cur[-1][0] <= 3):
+            cur.append((y, x))
+        else:
+            if len(cur) > len(seg):
+                seg = cur
+            cur = [(y, x)] if v else []
+    if len(cur) > len(seg):
+        seg = cur
+        
+    if len(seg) < h * 0.55 * (1 - 2 * .06):
+        return None
+        
+    ys2 = [p[0] for p in seg]
+    xx2 = [p[1] for p in seg]
+    s2, i2 = linfit(ys2, xx2)
+    res = [xx2[idx] - (s2 * ys2[idx] + i2) for idx in range(len(ys2))]
+    d = [abs(res[idx] - res[idx-1]) for idx in range(1, len(res))]
     d_sorted = sorted(d)
     j95 = d_sorted[int(0.95 * len(d_sorted))] if d else 0.0
     
     run = best = 0
-    for i in range(1, n):
-        if ys[i] == ys[i - 1] + 1 and abs(xx[i] - xx[i - 1]) < .06:
+    for idx in range(1, len(ys2)):
+        if ys2[idx] == ys2[idx - 1] + 1 and abs(xx2[idx] - xx2[idx - 1]) < .06:
             run += 1
         else:
             best = max(best, run)
             run = 0
     best = max(best, run) + 1
-    return best, j95, max(d) if d else 0.0, len(ys), h
+    return best, j95, max(d) if d else 0.0, len(ys2), h
+
+def verdict(m):
+    tread, j95, jmax, rows, h = m
+    ok = tread <= TREADRUN_MAX and j95 <= JUMP95_MAX
+    return ok, f"treadrun={tread} (<= {TREADRUN_MAX})  jump95={j95:.3f} (<= {JUMP95_MAX})  jumpmax={jmax:.3f}  rows={rows}/{h}"
 
 def main():
+    if not os.path.exists(SRC) or not os.path.exists(LAB):
+        return 1
     fails = 0
     with tempfile.TemporaryDirectory() as td:
         jobs = [("ship2x", 2, SHIP2, True),
@@ -112,17 +150,13 @@ def main():
             out = os.path.join(td, f"{name}.webp")
             r = subprocess.run([LAB, SRC, out, str(scale), *recipe], capture_output=True, text=True)
             if r.returncode != 0:
-                print(f"FAIL {name}: celup_lab exited {r.returncode}")
                 fails += 1
                 continue
             m = metrics(out)
             if m is None:
-                print(f"FAIL {name}: no usable edge crossings")
                 fails += 1
                 continue
-            best, j95, jmax, rows, h = m
-            ok = best <= TREADRUN_MAX and j95 <= JUMP95_MAX
-            desc = f"treadrun={best} (<= {TREADRUN_MAX})  jump95={j95:.3f} (<= {JUMP95_MAX})"
+            ok, desc = verdict(m)
             if must_pass:
                 print(f"{'ok  ' if ok else 'FAIL'} {name}: {desc}")
                 if not ok: fails += 1
