@@ -2321,6 +2321,7 @@ static void sample_pm(const uint8_t *img, int w, int h, float x, float y,
 /* deblur method: 0 = auto (validation proxy picks), 1 = monotone slope
    remap, 2 = Anime4K-style gradient push. */
 static int deblur_method = 0;
+static int disable_safety_gates = 0;
 static float deblur_steepness = 0.f; /* <=0: auto (-e adaptive or -s formula) */
 static int last_deblur_method = 0;   /* effective method of the last run */
 static float last_deblur_k = 0.f;    /* effective fixed steepness (0=adaptive) */
@@ -2722,6 +2723,8 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
       adb_noamp = 1;
     if (getenv("CELUP_NOTER"))
       adb_noter = 1;
+    if (getenv("CELUP_NOGATES"))
+      disable_safety_gates = 1;
   }
   /* sref = ASSUMED source blur (window sizing, shading gate).  When the
      reconstruction sigma was decoupled (v4.9) the assumed value is kept
@@ -2802,7 +2805,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
       /* Gate band tuned so long blurred arcs (rings/corner torture,
          face contours) keep full tangential averaging and only genuine
          junctions/tips (rho >= ~.3 on a 3x3 tensor) lose it. */
-      float coh = 1.f - ss01((rho - .10f) * (1.f / .20f));
+      float coh = disable_safety_gates ? 1.f : (1.f - ss01((rho - .10f) * (1.f / .20f)));
       float dirx = 1.f, diry = 0.f;
       if (lam > 1e-12f) {
         float vx = Jxy, vy = lam - Jxx;
@@ -3544,6 +3547,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
               float z0 = (0.f - (float)mu) / s;
               float ufit0 = phi1(z0), nu;
               if (method == 3) {
+                ufit0 = clampf(0.5f + 0.39894228f * z0, 0.f, 1.f);
                 float K = deblur_steepness > 0.f ? deblur_steepness : (k > 1.0001f ? 1.f + 3.6f / (k - 1.f) : 1e6f);
                 if (K < 1.f) K = 1.f;
                 if (K <= 1.0001f) {
@@ -3559,6 +3563,9 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 nu = phi1(k * z0);
               nu = clampf(nu, 0.f, 1.f);
               wS = ss01((sb - s) / (sb - sa));
+              if (disable_safety_gates) {
+                wS = 1.f;
+              } else {
               /* Fit-trust: RMSE of the erf fit over the full lobe,
                  |du| weights (the weights concentrate the check on the
                  lobe core, which is what the steepening actually
@@ -3623,6 +3630,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                  tip) instead of a bogus 1D fit; straight contours
                  (coh ~ 1) are untouched. */
               wS *= coh;
+              }
               if (dbg && y == dbg_y && abs(x - dbg_x) <= 16 &&
                   (x & 3) == 0) {
                 double en = 0, ed = 0;
@@ -3925,6 +3933,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
            without this the offset paints a neon band +-1.5 flanks
            wide around narrow lines. */
         if (method == 3) {
+          ufit0 = clampf(0.5f + 0.39894228f * z0, 0.f, 1.f);
           float K = deblur_steepness > 0.f ? deblur_steepness : (k > 1.0001f ? 1.f + 3.6f / (k - 1.f) : 1e6f);
           if (K < 1.f) K = 1.f;
           if (K <= 1.0001f) {
@@ -6488,6 +6497,11 @@ int main(int ac, char **av) {
     return 2;
   }
   for (int i = 4; i < ac;) {
+    if (!strcmp(av[i], "--no-safety-gates") || !strcmp(av[i], "--disable-gates")) {
+      disable_safety_gates = 1;
+      i++;
+      continue;
+    }
     if (!strcmp(av[i], "--auto-blurcompress") ||
         !strcmp(av[i], "--auto-tune") || !strcmp(av[i], "-a")) {
       auto_blurcompress = 1;
