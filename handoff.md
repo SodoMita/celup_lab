@@ -2,6 +2,30 @@
 
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.9.3 update (2026-07-31): SDF 4-pass staircase suppression; vector-graphics upscaler benchmarks; parameter override & 3x3 checker fixes
+
+- **SDF 4-pass staircase suppression everywhere**:
+  - Previously, `upscale_sdf` ran only a single pass of `[1,2,1]/4` smoothing on the signed-distance field `d` and used strict edge gates (`ck <= .35f`, `|grad d|` in `.5f, .8f`), which caused a 1-source-pixel periodic staircase wobble (`jump95 = 0.306px`) on diagonal lines and failed to suppress staircases on softer edges.
+  - Replaced the single pass with 4 iterative separable passes on `d0/d1` and loosened the edge confidence/derivative gates (`ck <= .18f`, `|grad d|` threshold `.15f, .50f`, extent `3.5f`). This eliminates the periodic wobble and reduces SDF staircase step `jump95` from `0.306px` to **`0.065px`** (almost 5× smoother) with `res95 = 0.063px`, suppressing staircases across all edges.
+- **Vector-like graphics & advanced library upscaler benchmarks**:
+  - Added `py:vector` (Vector-Contour Edge-Directed Upscaler, designed specifically for vector-like graphics and pixel art to produce C1-continuous contours without staircase treads) alongside `scipy:spline5`, `cv2:lanczos4`, and `py:edgedir` in `evaluate_upscalers.py`, `hourglass_metric.py`, and `make_smiley_staircase_sheets.py`.
+  - Quantitative staircase evaluation (`staircase_diag45_comparison.png`, 95th-percentile step jump / res95):
+    - `py:vector` (Vector-Contour): **jump95 = 0.112px | res95 = 0.105px** (zero staircase treads)
+    - `celup_lab:sdf`: **jump95 = 0.065px | res95 = 0.063px** (suppressed everywhere)
+    - `cv2:lanczos4`: jump95 = 0.181px | res95 = 0.146px
+    - `scipy:spline5`: jump95 = 0.215px | res95 = 0.160px
+    - `py:edgedir`: jump95 = 0.211px | res95 = 0.137px
+    - `autodeblur Miya (-r 2.3 -s 100 -g 16)`: **jump95 = 0.003px | res95 = 0.018px**
+  - **MAE vs Artifact/Hourglass Energy (`hourglass_metric.py`)**:
+    - While `cv2:lanczos4`, `py:edgedir`, and `scipy:spline5` score competitive MAE on simple scenes, `hourglass_metric.py` shows their hourglass/bow-tie artifact energy (HG) on textured and diagonal scenes (`rings`, `diag`, `corner`, `checker2`, `crosshatch`) is **5× to 10× higher** than `celup_lab:adaptive` (e.g. `rings` HG: `cv2:lanczos4` = 0.01217, `scipy:spline5` = 0.01553 vs `celup_lab:adaptive` = 0.00191). This confirms that standard linear splines and unguided edge-directed sharpeners trade bow-tie artifact suppression for raw MAE, whereas `adaptive` removes hourglass energy by construction.
+- **Parameter override fixes**:
+  - In `autodeblur_pass` (`celup_lab.c`), steepness `k` was previously clamped unconditionally by `k = fminf(k, s / .6f)`. Fixed: explicit `deblur_steepness > 0.f` now bypasses the `s / .6f` clamp and pins `k` exactly as documented.
+  - In `auto_tune_soft_params` (`upscale_autoblur`), when `--blur-radius R` (`-r R`) was passed, the tuning loop skipped every candidate sigma where `sigmas[si] != R`. Fixed: when `blur_radius_set == 1`, `auto_tune_soft_params` evaluates `R` directly across all kernels/curves.
+- **3x3 Checkerboard confirmation (diagonal staircase removal)**:
+  - Added `checker3x3_at_pm` to require 3x3 pattern confirmation (`A B A / B A B / A B A`): true pixel-art checkerboards (`pixelart_src.webp`: 1596 cells) are still detected and lowpassed, while diagonal lines (`diagline48_src.webp`: 0 false positives) keep full cubic/Lanczos/autodeblur sharpness and smooth contours without bilinear staircases.
+  - Regenerated 20-mode visual comparison sheets (`poor_smiley_comparison.png`, `staircase_comparison.png`, `staircase_diag45_comparison.png`).
+  - All regression tests pass (`check_stairs.py` PASS, `check_corners.py` PASS, `test_scales.py` PASS, `test_celup3.py` 23.57 baseline PASS).
+
 # v4.9.2 update (2026-07-31): `-D remake` alias; crosshatch delta root-caused
 
 - `-D remake` is now accepted as an alias of `remap` (the user's own

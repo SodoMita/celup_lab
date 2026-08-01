@@ -3336,7 +3336,7 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
       float ck = cm.w_edge[k] * (1.f - cm.w_checker[k]);
       float gx = cm.edge_gx[k], gy = cm.edge_gy[k];
       float g2 = gx * gx + gy * gy;
-      if (ck <= .35f || g2 < .12f * .12f || g2 > 1.4f * 1.4f)
+      if (ck <= .18f || g2 < .08f * .08f || g2 > 1.8f * 1.8f)
         continue;
       float g = sqrtf(g2);
       /* De-dilute the ramp width.  The classifier's t-plane gradient comes
@@ -3371,7 +3371,7 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
           float d = (t - .5f) * invg;
           /* Trust the plane only near its own ramp: a short segment's fit
              must not ghost-extend its contour across empty space. */
-          if (fabsf(d) > 2.6f)
+          if (fabsf(d) > 3.5f)
             continue;
           float Kw = ck * expf(-r2 / (2.f * 1.5f * 1.5f));
           size_t kp = (size_t)py * sw + px;
@@ -3411,32 +3411,36 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
     if (d0 && d1) {
       for (size_t k = 0; k < n; k++)
         d0[k] = fld[11 * k];
+      for (int iter = 0; iter < 4; iter++) {
+        for (int y = 0; y < sh; y++)
+          for (int x = 0; x < sw; x++) {
+            size_t k = (size_t)y * sw + x;
+            d1[k] = (d0[(size_t)y * sw + clampi(x - 1, 0, sw - 1)] +
+                     2.f * d0[k] +
+                     d0[(size_t)y * sw + clampi(x + 1, 0, sw - 1)]) *
+                    .25f;
+          }
+        for (int y = 0; y < sh; y++)
+          for (int x = 0; x < sw; x++) {
+            size_t k = (size_t)y * sw + x;
+            d0[k] =
+                (d1[(size_t)clampi(y - 1, 0, sh - 1) * sw + x] + 2.f * d1[k] +
+                 d1[(size_t)clampi(y + 1, 0, sh - 1) * sw + x]) *
+                .25f;
+          }
+      }
+      for (size_t k = 0; k < n; k++)
+        fld[11 * k] = d0[k];
       for (int y = 0; y < sh; y++)
         for (int x = 0; x < sw; x++) {
           size_t k = (size_t)y * sw + x;
-          d1[k] = (d0[(size_t)y * sw + clampi(x - 1, 0, sw - 1)] +
-                   2.f * d0[k] +
-                   d0[(size_t)y * sw + clampi(x + 1, 0, sw - 1)]) *
-                  .25f;
-        }
-      for (int y = 0; y < sh; y++)
-        for (int x = 0; x < sw; x++) {
-          size_t k = (size_t)y * sw + x;
-          fld[11 * k] =
-              (d1[(size_t)clampi(y - 1, 0, sh - 1) * sw + x] + 2.f * d1[k] +
-               d1[(size_t)clampi(y + 1, 0, sh - 1) * sw + x]) *
-              .25f;
-        }
-      for (int y = 0; y < sh; y++)
-        for (int x = 0; x < sw; x++) {
-          size_t k = (size_t)y * sw + x;
-          float gx = (d1[(size_t)y * sw + clampi(x + 1, 0, sw - 1)] -
-                      d1[(size_t)y * sw + clampi(x - 1, 0, sw - 1)]) *
+          float gx = (d0[(size_t)y * sw + clampi(x + 1, 0, sw - 1)] -
+                      d0[(size_t)y * sw + clampi(x - 1, 0, sw - 1)]) *
                      .5f;
-          float gy = (d1[(size_t)clampi(y + 1, 0, sh - 1) * sw + x] -
-                      d1[(size_t)clampi(y - 1, 0, sh - 1) * sw + x]) *
+          float gy = (d0[(size_t)clampi(y + 1, 0, sh - 1) * sw + x] -
+                      d0[(size_t)clampi(y - 1, 0, sh - 1) * sw + x]) *
                      .5f;
-          fld[11 * k + 10] *= ramp01(sqrtf(gx * gx + gy * gy), .5f, .8f);
+          fld[11 * k + 10] *= ramp01(sqrtf(gx * gx + gy * gy), .15f, .5f);
         }
     }
     free(d0);
