@@ -38,13 +38,13 @@ SCALES = (1.5, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24)   # includes >20x
 FACE_SCALES = (2, 4, 8, 16, 22)
 MODES = ('nearest', 'bilinear', 'triangle', 'cubic', 'mitchell',
          'lanczos3', 'adaptive', 'sdf', 'autoblur', 'autodeblur',
-         'deblurcompress', 'hourglasscompress')
+         'deblurcompress', 'hourglasscompress', 'jinc2_bilateral')
 STAIRS_OK = ('nearest', 'scale2x')          # hard staircase by design
 MAX_STEP = {                                # AA-band adjacent-step budget
     'nearest': 1.01, 'bilinear': .45, 'triangle': .45, 'cubic': .55,
     'mitchell': .65, 'lanczos3': .75, 'adaptive': .75, 'sdf': .85,
     'autoblur': .45, 'autodeblur': .65, 'deblurcompress': .85,
-    'hourglasscompress': .85}
+    'hourglasscompress': .85, 'jinc2_bilateral': .75}
 
 
 def lin(x):

@@ -27,3 +27,21 @@
 - xBRZ rotation logic needs testing on complex patterns
 - Could add multi-pass refinement for autodeblur
 - Consider adding xBRZ as a pre-processing step before autodeblur
+
+## v4.9.10 (2026-08-01): Jinc2-Bilateral xBR mode restored
+
+- New `--mode jinc2_bilateral`: faithful CPU port of Hyllian's
+  jinc2-bilateral-xbr.slang (windowed-jinc 2-lobe space weights with
+  WA=0.5, WB=0.88, a bilateral range term I(p00,c)=lanczos(luma|p00-c|*STR,2)
+  guided by a bilinear pm-linear reconstruction, and an anti-ringing clamp
+  to the central 2x2 source cell).  Works at any scale 1..32.
+- `superxbr` (previously accepted by the validator but dispatched to
+  uninitialized memory) now routes to the same jinc2-bilateral pass.
+- Tunables via env: CELUP_J2B_STR (bilateral strength), CELUP_J2B_AR
+  (anti-ringing amount); -s gently raises STR.
+- Added to tests/test_scales.py (AA-circle sweep 1.5x..24x all step 0.000).
+- Measurements at 4x: evaluate_upscalers MAE ~= lanczos3 (better on
+  axis/shallow/parallel, best MAE on the grey-on-grey scene with zero
+  out-of-source-range pixels); hourglass HG lower than lanczos3 on
+  checker2/crosshatch/rings/diag; diagline staircase gate 2x jump95 .040
+  and 4x .159 (both PASS).  Fixed build.sh to compile xbr/xbrz sources.
