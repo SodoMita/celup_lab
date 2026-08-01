@@ -1,0 +1,268 @@
+The user reports new observations from running v4.6 (probably with the wide-blur recipe or their command):
+
+"it doesn't reduce steepness, it creates bright line in middle of gradient and negates colors" — halo/inversion along the ramp center. "negates colors" — hue inversion?? "bright line in middle of gradient" — a ridge artifact.
+
+"there are separate color, alpha gradients instead of 4 channel vectors 1 gradient" — they guess RGB and alpha get separate gradient treatment rather than one consistent gradient direction. Currently: gradient field gm/gnx/gny is computed on tone t = mean of rgb (premultiplied channels), NOT including alpha. The remap is per-channel (channel-independent lo/hi and u), push uses dominant channel cstar for u. So a 4-channel vector treatment could fix color inconsistency: per-pixel displacement along ONE gradient direction but sampling/anchoring ALL 4 channels by the SAME scalar parameter. The remap currently: for each channel independently computes u = (v−lo)/(hi−lo) and remaps — that can invert hue relationships when channels have opposite gradient directions (one channel rising, another falling across the edge): each channel independently pushed toward its own extremes = around mid-ramp, channels move inconsistently → color shift/negation. THAT's very likely the "negates colors" mechanism!
+
+Consider a purple→skin edge: R rises, B falls (say). Per-channel remap with k=8: R channel u_R remapped toward hi/lo of R window; G,B likewise. At ramp center each u≈.5 → inert... but off-center where u_R=.7 (clamp→1) and u_B=.3 (clamp→0): R snaps to window max while B snaps to window min → locally hyper-saturated "negated" hue band along the ramp — a bright/weird line in the middle of the gradient region. Yes! Window lo/hi are per-channel over ±R; at an edge, R window's hi is on the skin side... the snapped colors exist in the window (range-clamped per channel), so they're "local colors" but the combination (R=max side, B=min side) may not be any actual neighboring color — the range clamp is per-channel independent, so the clamped combination can be a color not present in the window (box corners of the 4D range box!). THAT'S the hue inversion: per-channel box clamp allows corner colors = combination of opposite sides of the edge.
+
+Fix: treat the 4 channels as one vector with ONE gradient and ONE scalar displacement parameter: compute u from the dominant-gradient axis (project pixel onto local gradient line: u = ((v − lo_pt)·ĝ)/||hi_pt − lo_pt||... i.e., parametrize the local segment ends as 4D points (the window-extreme points ALONG the gradient direction), let u ∈ [0,1] be the position of the current color projected onto that segment, remap u, then reconstruct the color as a 4D point ON THE SEGMENT: col = P0 + u'·(P1−P0). This guarantees: (a) all channels move consistently (no hue inversion — output color is an interpolation of two actual nearby colors or an extrapolation within the segment), (b) alpha gets the same treatment (coupled) — premultiplied invariant automatic if P0,P1 are valid premultiplied colors (convex combos keep rgb≤a; extrapolation u'>1 breaks it → keep clamp u'∈[0,1]).
+
+How to get P0,P1 robustly: currently we have per-channel lo[c],hi[c] over the window. P0 = (lo0,lo1,lo2,lo3), P1 = (hi0..hi3) is exactly the box corner problem — those corners need not be real colors. Better: find the window min/max along the gradient: project all window samples onto ĝ (computed from tone+alpha? include alpha in gradient computation — user said "4 channel vectors 1 gradient"), find tmin,tmax and take ACTUAL sample colors at those extremes (or mean of samples in the bottom/top decile of projection). Then u = (proj(color) − tmin)/(tmax−tmin), u' = clamp(.5+k(u−.5)), new color = P0 + u'(P1−P0)? No wait — remap should preserve v + w(nv−v) blending... we keep the same structure: nv = P0 + u'·(P1−P0), res = v + w·(nv−v), u' clamped [0,1] → nv is a convex combo of two real window colors → NO out-of-gamut hue → no negation, no halo. Also for push: u computed the same way (consistent), displacement along ĝ, then sampled color... push samples the image itself (sample_pm) so hue consistent by construction, but the range clamp to per-channel box reintroduces corner colors! When sampled color is clamped per-channel to [lo,hi] box: corners possible. Replace with clamping u to [0,1] along the segment: compute u_s of the sampled color's projection, clamp, reconstruct from segment. Same vectorization.
+
+Also the bright line in the middle: could be that + mismatch between RGB gradient and alpha gradient on partially transparent edges: t = mean(rgb) computed on PREMULTIPLIED values... wait is it? raw_pm returns premultiplied floats — comment says pm. On transparent edges rgb→0 as alpha→0, so tone edges align with alpha mostly. "Bright line in middle of gradient" — more likely the per-channel snap described above, or the flat-flatten mean pull? Or push leapfrog? The user's guess "separate color, alpha gradients" matches: on an RGBA edge (e.g., dark hair against transparency expanding into skin), tone gradient direction may differ from alpha gradient direction; rgb pm values rise while alpha rises too...
+
+"I guess there is still box windows like 5x5 because there are stepladder artifacts" — stepladders in the output. The remap/push output is built from per-pixel moving windows; the RANGE (lo/hi) and gradient come from fixed square windows → as pixel moves, window membership jumps produce small spatial quantization → at big k the snapped values can form stair steps along edges (bands perpendicular to the gradient = "stepladder"). Also R changes with scale... The analytic proposal: "constructing a function of gradient that fits original then changing slopes on that function, then sampling pixels" — i.e., fit a smooth 1D profile along the gradient (e.g., monotone cubic/erf fit through window samples), steepen ITS slope analytically, and evaluate at the pixel — no per-channel ops, no box clamps, continuous in space → no stepladder bands.
+Design the analytic pass (v4.7):
+
+For each pixel:
+
+Compute vector gradient g (4D) — or 3D tone + alpha weighting... simplest: compute gradient on each channel and use the dominant-energy direction: g = Σ_c ∇c·w... Standard: structure tensor of the 4-vector field: J = Σ_c ∇c ∇c^T over window gaussian — get principal direction = "1 gradient for 4 channels" exactly like the user asked. Keep cheap: per-channel Sobel gx_c, gy_c; direction θ from Σ (gx_c²−gy_c²), Σ gx_c gy_c averaged over channels (structure tensor orientation). Magnitude for gate: use |∇| of the dominant-channel projection? Or norm of projected gradient.
+
+Sample N points along the normal (gradient direction) through the pixel: t_j from −R..R step 1px, colors C_j = sample_pm(x + t·ĝx...) (bilinear pm sample — exists as sample_pm).
+
+Fit monotone profile: project each sample onto ĝ in color space: u_j = ((C_j − C_-)·d̂) / |C_hi − C_lo| where d̂ = (C_top − C_bot) normalized... Define segment endpoints from extreme samples along the line: C_lo = color at t_min side, C_hi at t_max side? No — use robust: sort projections, take quantile colors (e.g., mean of lowest/highest 2 samples). d = P1 − P0 (4D vector). u_j = proj onto [0,1] of each C_j along segment (P0 + u d).
+
+Fit smooth S-curve through (t_j, u_j): constrained monotone — the natural choice: cumulative gaussian (erf) fit: u(t) = Φ((t−μ)/s)/... fit μ,s by least squares (2 params — fast: grid over s, linear μ? or closed-form approx via moments: μ = weighted mean of t weighted by du/dt, σ from second moment of du/dt distribution!). Even simpler analytic: treat the SAMPLES along the line as a 1D signal u(t); the "gradient function" the user describes: g(t) = du/dt = the 1D edge profile; steepen = compress the profile support: u'(t) = u_eval... Actually "increase slope of the fit" = evaluate the FITTED sigmoid at t' = μ + (t−μ)/k... no wait — steepening slope by k: u_new(t) = u_fit(μ + (t−μ)·k)?? Evaluating the same function with compressed argument: u_new(t) = u_fit(μ + (t−μ)k)? That has slope k·u'fit at μ ✓ and reaches plateaus sooner ✓ narrows the ramp by k. Discrete enough: new value at pixel (t=0) = u_fit(μ·(1−k))... only t=0 matters per pixel! u_new = u_fit(μ + (0−μ)k) = u_fit(μ(1−k)). Hmm but pixel may sit off-center of the LOCAL fit; this evaluates fine. Monotone erf fit via moment matching: weights ω_j = max(0, u{j+1}−u_{j-1}) (discrete derivative, nonneg if monotone-ish; enforce by cumulative-max pava? keep simple: ω_j = |central diff|), μ = Σω_j t_j/Σω_j, s² = Σω_j(t_j−μ)²/Σω_j → s = stddev of the transition distribution. Then u_fit(t) = Φ((t−μ)/s). Slope at center = φ(0)/s = 0.3989/s. New u with steepening k... but careful: moment-fit erf of a STEP convolved with gaussian σ_b gives s ≈ σ_b → slope 0.4/σ_b — matches reality. Steepen: s' = s/k (clamp s' ≥ ~0.35px to avoid aliasing steps! "no sawtooth" requires final transitions ≥ ~1.2-1.5px at output resolution = the 30%-width goal machinery... reuse edge_goal semantics: minimum width clamp s' ≥ max(s/k, s_min·(goal relation))). New pixel value: u_new = Φ((0 − μ)/ (s) * ... hmm defining: original local coord: pixel at t=0 on the normal line. Fitted profile u_fit(t) = Φ((t−μ)/s). Steepened profile v(t) = Φ((t−μ)/(s/k)) = Φ(k(t−μ)/s). Pixel's new u = v(0) = Φ(−kμ/s). New COLOR vector: C_new = P0 + u_new·(P1−P0)? But that pins the color to the segment between P0,P1 (two REAL local colors from the extremes of the line) → hue-consistent ✓, and alpha treated identically (4D vector ✓ — "4 channel vectors 1 gradient" ✓).
+
+This is a per-pixel 1D analytic deconvolution-lite: NO box window value snapping (segment endpoints are real colors along the line), profile smooth in t (no spatial quantization / stepladder), monotone, convex (u_new∈[0,1] automatically since Φ∈(0,1)) → hue-safe, alpha-safe, pm-invariant safe. And "changing slopes on that function then sampling pixels" = literally what we do.
+
+Blend/gate: keep w concept — gate on measured width s (in src px or scaled σ) vs fitted_sigma...: full when s ≥ threshold (wider than goal!), i.e., now "reduce steepness" semantics: we want OUTPUT slopes similar to a NATURAL edge at target resolution. With -e goal: s'_target = max(s/k, goal_width_px·0.4·scale...). Actually k then becomes DERIVED: k = s/s_target with s_target = max(0.35px?, edge_goal·scale·0.4). -g K fixes k directly as now.
+
+Where do P0,P1 come from robustly: P0 = color at t = μ−λs? or actual min-projection sample; robust: P0 = weighted mean of samples with u ≤ .15, P1 of u ≥ .85 — local averaging kills noise. Segment must be the 4D difference of real colors ✓.
+
+Plateau/line handling: for a thin LINE (dark line on skin, ramp down-up), the profile is a pulse not a step! erf step fit on a pulse: moment method over the WINDOW: if window R ≥ line half-width, du/dt has +peak and −peak; stddev s spans the line width, Φ step fit would map the line onto a single sigmoid → BAD (would smear line into depth gradient?). u values at pixel inside line: Φ(−kμ/s)... For centered pixel on the line (u≈0 at center, sides 1): moment μ≈0, big s; v(0) = Φ(0) = .5 → C_new = midpoint color of skin↔line → line pixel becomes blended?! That BREAKS lines (v4.3 remap handled lines fine: u small → snaps to lo = line color stays). Need pulse detection: if extreme-u... u(±R) < .7 → both sides don't reach plateau → it's a pulse/line → different handling: steepen around each side? Simplest: if the line profile is a pulse (P0≈P1 on both sides i.e., endpoints similar, middle deviates), fall back to the per... fall back to current remap behavior? Or handle pulse analytically: fit TWO opposing erf steps (left flank center μ1, right flank μ2), steepen each, C_new = Pbase + (Pline−Pbase)·q where q = Φ(k(t−μ1)/s1) − Φ(k(t−μ2)/s2)... beauty! q is the steepened pulse. Pbase = mean of window-end colors (real colors), Pline = color at the profile extremum sample (the line's own color). Monotone-ish safe, hue-safe (convex combo of two real colors, q clamped [0,1]).
+
+That's a clean analytic model: classify window line-profile as STEP (monotone) or PULSE (returns near base at both ends), fit erf(s) via moments, steepen slope by k (or toward goal width), evaluate at t=0, blend by gate w, reconstruct color as convex combo of REAL endpoint colors.
+
+Alpha: include alpha in gradient computation and in the color vector → single 4D treatment as user asked. Gradient for direction: structure tensor over 4 channels; magnitude for gates: sqrt of max eigenvalue? Simpler: gm = magnitude of gradient of the 4D field = sqrt(Σc (∇c)²)? Use Frobenius norm of per-channel Sobel gradients. Should behave fine.
+
+Gradient direction continuity: ĝ sign flips 180° arbitrarily; for STEP classification use oriented projections consistently: direction chosen so that u increases from t<0 to t>0 (orient ĝ by sign of correlation between t_j and u_j).
+
+Complexity: per pixel: 2M+1 line samples (M = R ≈ up to 1.25σ_s... reuse R), structure tensor from existing Sobel fields, O(M) moment sums. Similar cost to current window loop. For PULSE fit: detect via endpoints: u at both t=±R (uL,uR): STEP if uL<.2 & uR>.8 (or vice versa); PULSE if both uL,uR extent... define base = (C(−R)+C(+R))/2 if uL,uR close (|uL−uR| < .25 after orienting by max-deviation?) hmm simpler: STEP when monotonicity holds: proj range covered and (uR−uL) > .6·(global u range); else PULSE with peak at argmax|u−ubase|.
+
+Noise flats: if range of projection tiny → skip (flat-flatten stays).*_
+
+Implementation plan in autodeblur_pass (v4.7): replace the per-channel remap AND sampled push with the analytic model for BOTH methods? Methods: remap = step/pulse erf steepening (analytic). push = keep? The analytic approach subsumes push: "changing slopes then sampling pixels". Maybe: remap → analytic step; push → analytic with displacement (steepen by evaluating FIT at shifted t: v(t) = Φ(k(t−μ)/s) is exactly that). So unify: keep -D auto choice measuring proxy; implement method 1 = analytic sigmoid-slope (remap slot), method 2 = analytic push variant (sample along fitted profile: nv = profile(t shift)) — distinction becomes small. Simpler: keep two methods mapped onto the same profile fit: (1) "slope": v = Φ(k(t−μ)/s) (2) "shift": displace along normal by off then evaluate ORIGINAL profile at t+off (Anime4K-ish: move sample point into the plateau). Both range-safe via convex P0/P1 reconstruction.
+
+For PULSE: both methods use the two-step q.
+
+Gate w: for STEP: measured s vs goal(sref...) — full when s > 1.25·s_target... define s_target_px (in OUTPUT px): default s_target = 1.6·scale·min(1.0?...) hmm. Currently k formula: kfix or -g or -e. Keep: k = -g if set; else -e: k = clamp(s_px/(goal·scale·0.4), 1, 3) (s_px in out px; a gaussian ramp of "width W src px" per 30% metric ≈ 2.5σ → σ = W·scale/2.5 px; s = that; so s/(goal·scale/2.5)); else -s formula. Clamp s'/target floor: s' = s/k ≥ 0.6px (don't go sub-pixel → prevents sawtooth from the deblur itself!). Also keep flat-flatten.
+
+Per-channel pm invariant: C_new = P0 + u'·d, convex → invariant holds automatically ✓ (P0,P1 valid pm colors). No post-clamp needed. Bright-line: impossible since u'∈(0,1) strictly → no overshoot → no new extrema → hue preserved EXACTLY along the local edge axis (color stays on the local segment = mixture of two REAL neighbor colors!).
+
+"Stepladder from box windows": profile is continuous in t; adjacent pixels' fits vary continuously IF the samples do. Displacement evaluation at each pixel along its own normal → edges render as smooth sigmoid contours ✓ no box quantization of VALUES (only sampling).
+
+Now what about the existing narrow branch (defaults ≤4, bit-identical requirement)? The whole point of v4.6 was preserving that those stay identical. v4.7 will CHANGE autodeblur everywhere (new core). All previous identity promises break — acceptable (new version, better results) but must re-validate: tests, HG metrics, miya look, badge. The user is explicitly unhappy with the old behavior now ("bright line", "negates colors", "stepladders"), so replacing the core is sanctioned for the whole range. But careful to keep gates from destroying the good v4.3/4.6 look... The HG numbers should be measured again; MAE on 9 scenes; miya visual; badge corner.
+
+That's a lot of implementation. Let me scope it tightly:
+
+Data per pixel (premultiplied 4-float):
+
+Sobel per channel: gx[c], gy[c] (reuse Sobel on alpha too). Memory: t field currently single channel; need 4 channels × gx,gy = 8 fields + t... simplify: compute per-channel gradient fields gx0..3? memory 8·n floats + n = 9n floats ≈ still OK for typical (n up to ~2M px → 72MB×4 = 288MB? too much for 4×46MP...). Budget: current pass allocates t,gm,gnx,gny = 4n floats. New: keep gx_sum/gy_sum approach WITHOUT per-channel fields: structure tensor accumulated per channel on the fly from the tone+alpha... no — need direction per pixel: Jxx = Σ_c gx_c², Jyy = Σ_c gy_c², Jxy = Σ_c gx_c gy_c. Can compute WITHOUT storing per-channel fields: get the 4-channel pixel matrix via raw_pm into ring buffers... Actually simpler: store per-channel tone? We need sample_pm anyway for line sampling. Compute per-channel Sobel into 3 accumulator fields Jxx,Jxy,Jyy (3n floats) + gm (1n). Direction from tensor: θ = .5·atan2(2Jxy, Jxx−Jyy); magnitude = λmax = (Jxx+Jyy)/2 + sqrt(((Jxx−Jyy)/2)²+Jxy²) → gm = sqrt(λmax)·scale-factoring... Sobel on pm channels directly (not tone). Then orientation coherence for gates?? We had direction gate v4.2 elsewhere — keep behavior simple.
+
+Line sampling: M = R (window radius in px, same formula as now wide-aware: R = clamp(1.25·scale·sref, 2, 12)? cap 64 wide... line samples = 2R+1 sample_pm calls of 4 channels (bilinear) — cheaper than window loop (2R+1)² ! Actually current window loop is (2R+1)² raw_pm reads ~961 at R=15; line = 31 sample_pm — 30× cheaper.
+
+Steps per pixel:
+
+fields: Jxx,Jxy,Jyy via Sobel over each channel (ring buffer over rows? simplest: precompute per-channel Sobel into... 8n floats again). Alternative: compute Sobel pm-channel gradients on the fly per pixel is 4×6 taps each with raw_pm unpacking = heavy. Precompute 4 tone channels? memory n·4 floats (pm channels as float array A = 4n floats) then gradients computed per pixel from A (6 taps per channel with cached rows... just index arithmetic — fine): A (4n) + Jxx,Jxy,Jyy or directly gm,gnx,gny (3n) = 7n floats ≈ before 4n. OK. Precompute A by unpacking out (needed anyway as sample source for sample_pm? sample_pm reads the uint8 image directly). Keep A for channel Sobel taps. gradient fields: gm, dirx, diry from structure tensor (orientation continuous!, sign chooses u-ascending).
+
+per pixel:
+
+sample line C_j at t_j = −R..R (step 1px, float offsets along dir), 4 floats each, via sample_pm on the ORIGINAL out image (before modification — process into a new buffer! current pass modifies in place → order-dependence/stepladder risk! WRITE TO SEPARATE OUTPUT BUFFER then swap — also fixes scan-order artifacts = another stepladder cause!).
+project: need segment: first compute u_j coarsely: directional derivative approach: du in color space along dir: use dominant axis: d_vec = C(last)−C(first)? Robust: compute mean color of first ~max(2,R/3) samples C_A and last ones C_B; d = C_B − C_A; L² = d·d; if L² < eps → flat (flat-flatten path w/ mean over line samples). u_j = clamp(((C_j − C_A)·d)/L², 0, 1) per line sample.
+classify: u_mid-half... STEP: u(r side)−u(l side) coverage: ū_right (mean of top third u) − ū_left (bottom third) > .55 → STEP with P0 = C_A... P0 = mean color of samples with u<.25, P1 = mean of samples with u>.75 (fallbacks to C_A/C_B), d' = P1−P0, recompute u_j against d'? (segment refinement). moments from u_j over t_j: ω_j = max(u_{j+1}−u_{j−1},0)+eps? For step: ω_j = |u_{j+1}−u_{j−1}|. μ = Σωt/Σω, s = sqrt(Σω(t−μ)²/Σω). Clamp s ∈ [0.25, R]. PULSE: peak j* = argmax(u) (or min — pulse could be dark line: use deviation from base): base_mix = (u at both ends ~ low?) hmm handle dark-line-on-light AND light-line-on-dark: define q_j = deviation from base color: if ends similar (||C(−R)−C(R)||² < .1L²?): pulse: q_j = projection of C_j onto segment P_base↔P_peak... Let me define PULSE when STEP condition fails AND global u-range > .35: base color B0 = (C_A + C_B)/2? (ends similar assumed), peak color Pk = C_j* at j* = argmax ||C_j − B0||. q_j = proj of (C_j − B0) onto (Pk − B0). Then flank moments: left half t<t*: ω over rising, μ1,s1; right half μ2,s2 (or single symmetric take: just steepen each flank with its own erf? implement: treat left half as a step from 0→1, right as 1→0). Evaluate: STEP: u_pixel (from own projection u_px = clamp(((C_px−P0)·d')/L'²)): new u = Φ(k(t=0−μ)/s)?? wait consistency: use u_px not t-based? The pixel's own t=0: new u = Φ(−kμ/s) uses fit; but safer: blend fit approach: new_u = clamp(u_px_scaled): where the erf map transforms measured u → new u via composing Φ⁻¹... SIMPLEST robust: new_u = clamp(Φ(k·Φ⁻¹(u_px)·?...). Hmm Φ(k(t−μ)/s) with t = −μ... no: pixel t=0 → new_u = Φ(k(0−μ)/s) = Φ(−kμ/s). At k=1 → Φ(−μ/s) = u_fit(0) = fitted u of center pixel ≈ u_px if pixel is on profile. This replaces the pixel's measured value by the FIT's value — the "construct function then sample" — inherently denoising (fit smooths salt!). new_u = Φ(−kμ/s) ∈ (0,1) ✓ convex ✓. But if the pixel is NOT at the profile location (e.g., staircase of content inside R?), fit is local-ish. Fine. Blend with gate: res_u = u_px + w·(new_u − u_px), color = P0 + res_u·d'. Since P0,P1 real colors and res_u∈[0,1] — hue-safe. Also cap k so s/k ≥ 0.55·scale·min... k_max = s/(s_min) with s_min = max(0.5px?, .35·scale·edge_goal?): with -e: k = clamp(s/(goal·scale/2.5), 1, 8?) — goal in src px width W ↔ σ = W·scale/2.5 px → s_target = W·scale/2.5; k = s/s_target (if s>s_target). -g: k=g but clamp k ≤ s/0.6 (sub-pixel guard → no sawtooth from deblur!). -s formula k ≤3 as before + same guard.
+PULSE: q_new = Φ(−kLμL/sL)·Φ(+kRμR/sR)?? For pixel at t=0: on left flank: qL = Φ(k(0−μL)/sL); right: qR = Φ(k(μR−0)/sR)... need care combining: pulse profile q(t) = Φ((t−μL)/sL) − Φ((t−μR)/sR) (rising left − rising right ≈ pulse). Steepen: q'(0) = Φ(−kμL/sL) − Φ(−kμR/sR) with μL<μR. If pixel closer to left flank, dominant term first. new_q = clamp(that,0,1) hmm both terms: at center t between flanks: Φ↑(k(t−μL)/sL) ≈ 1 if t≫μL... At t=0 BETWEEN flanks (line interior): first ≈1, second Φ(+kμR/sR)≈0 → q≈1 ✓ line interior preserved (depth untouched — important!). At t on a flank: steepens that flank ✓. new color = B0 + q'·(Pk−B0) with blend by w.
+gate w for both: based on measured s vs sref thresholds: STEP: w = ss over [s_open, s_full]?? For WIDE-blur semantics: we want to steepen what's wider than target. w = clamp((s/ s_target − .8)/.5, 0..1) when k from -e... For -g fixed: apply at full measured-width range? Keep simpler: w = 1 wherever range ok (analytic model self-protects: k clamped by s_min, flats by L² eps, pulse/step split). But SHADING: a broad soft gradient: step fit → s large → with -g: k=g → s/k = s/8 still large → result: slope ×8 on shading → posterize!! Need w = f(s vs shading threshold): shading when s > wclos_src·scale·... reuse: wclos = 1.05·2.5·scale·sref (fitted blur full width) → shading if s > wclos: w = ss((wclos·1.6?...). Hmm shading IS exactly "transition wider than the blur we intended" — with the analytic model, steepening any transition up to the FIT's blur width is right; beyond that = content softness to keep. w = smoothstep closing over s ∈ [wclos, 1.75·wclos].
+flats: L² < (.006)²? plus existing flat-flatten using line-sample mean.
+Sub-pixel shift preservation: μ from moments preserves edge position (no drift) ✓ important for "original" fidelity.
+
+Structure tensor smoothing: structure tensor components from single-pixel Sobels are noisy → J computed, then optionally 3×3 box-smoothed... adds passes; use direct. Direction sign: choose so u increases along +t: after computing u_j, corr = Σt_j u_j; if corr < 0 flip dir and re-sample?? resampling twice is wasteful; instead flip the t-axis analytically: flip u_j array and μ sign: q(t)→ q(−t). Implement via: if corr<0: reverse samples (u_j ← u_{N-1-j}), also reverse C arrays' projections only (colors already sampled; reversing index mapping = mirror line — valid since symmetric sampling).
+
+Premultiplied sampling: sample_pm exists (bilinear on stored uint8 pm image — quantizes floats; fine as before).
+
+Output: new buffer (malloc dw·dh·4), then memcpy back. In-place hazard gone._
+
+Method choice: -D remap → this analytic core ("slope"). -D push (method 2) → variant: instead of recentered erf eval, evaluate ORIGINAL profile at displaced t: u (or q) at t = u_px? push semantic: sample deeper into plateau: new_u = u_fit(μ + (u_px−.5)·(k−1)·dist...)? Let me define push analytically: new_u = Φ((t_eff − μ)/s) with t_eff = (u_px−.5)·(k−1)·1.6·scale·?... Hmm — simpler: push = evaluate the STEEPENED profile at pixel t=0 but with k_push = same → they'd be identical... To keep proxy auto-choice meaningful, implement push as: evaluate ORIGINAL fit at t' = t0 + off along dir where off = (u_px − .5)·(k−1)·2·s/…: off should narrow the ramp: moving sample toward plateau by amount ∝ distance-from-center: t' = (u−.5)·(k−1)·s·2.2 → new_u = Φ((t'−μ)/s)? No wait evaluating ORIGINAL profile at shifted coordinate: new_u = u_fit(0 + off) with off = (u−.5)(k−1)·1.6·scale?? scale-dependence wrong; use off in σ units: off = (u−.5)·(k−1)·s. new_u = Φ((off−μ)/s). Effect similar to slope steepening but bounded differently. Honestly -D auto will just pick whichever. Keep both formulas; measure.
+
+For PULSE under push: q at shifted t same way: new_q = q_fit(off)... q_fit(t) = Φ((t−μL)/sL) − Φ((t−μR)/sR), off = (q_px−.5)(k−1)·s̄? Pulse q sits ≈1 inside line → off big → jumps to plateaus?? For pulse use 1−peakness: line interior q≈1 should NOT shift; use off = (q−.5)... at q=1: off=.5(k−1)s → q_fit(off): Φ large ≈1 − Φ((off−μR)/sR) drops... changes line depth — BAD. For pulse, push := slope method too (skip shift) — safer.
+
+OK — implementing. Also update: gm for gates; the -e adaptive k uses measured s now (better than before). Keep flat-flatten (fw range-gated) but derive "range" from line samples (‖C_A−C_B‖ + local spread?) — define flat when L'² small: fw by range = |d'| (4D distance). flatmix toward line-sample mean.
+
+The -g/-s/-e k semantics:
+
+kfix: -g pins k (clamp final k ≤ k_guard where k_guard = s/0.6px? min slope width 0.6 output px σ ≈ 30%-width ≈ 1.5px — anti-sawtooth floor). With -e: k_e = s/s_target, s_target = max(.6f, goal·scale/2.5f)px; k = min(kfix?, k_e)?? semantics: v4.4: with -e k adaptive = clamp(width/goal,1,3). Map: k = clamp(s_px·2.5/(goal·scale), 1, 8), cap guard. -g overrides (manual). -s formula default k≤3.
+Also alpha in structure tensor + projection automatically handles RGBA edges consistently ✓ user's "4 channel vectors 1 gradient".
+
+Memory: A(4n) + gm,dirx
+Tests: rerun full suite; HG metrics; miya visual incl. the v4.6 case + default miya 3×/4× + badge corners; user's -r3 case (should now REALLY sharpen, hue-consistent, no bright midline).
+
+Naming: version v4.7 "analytic deblur". Keep old per-channel remap code? Replace autodeblur_pass entirely (method 1 & 2 both analytic). Simpler to maintain one path. -D auto proxy unchanged.
+
+Edge cases: R≥2 always; pulse flanks moments need ≥... ω sums guards. image borders: sample_pm clamps ✓. u_px when L'²≈0 → flat path.
+
+Let me write the code. I'll rewrite autodeblur_pass wholesale.
+
+Pseudo:
+
+c
+
+
+static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
+                           int method) {
+  size_t n = (size_t)dw * dh;
+  float *A = malloc(n*4*sizeof *A);      // pm channels
+  float *gm = malloc(n*sizeof *gm), *dx = malloc..., *dy = malloc...;
+  uint8_t *dst = malloc n*4 bytes);
+  if(!all){free...; return 0;}
+  for each px: raw_pm into A.
+  /* structure tensor per pixel from per-channel Sobel */
+  for y,x:
+     for c: gx_c = SobelX(A,c) (clamped borders), gy_c = SobelY
+     Jxx=Σ gx², Jxy=Σ gx gy, Jyy=Σ gy²
+     λ = (Jxx+Jyy)/2 + sqrtf(((Jxx−Jyy)/2)²+Jxy²)
+     gm = sqrtf(max(λ,0))/... Sobel already /16? use /16 consistent
+     θ = .5 atan2(2Jxy, Jxx−Jyy) -- direction of max variation: actually principal axis vector: vx = λ−Jyy, vy = Jxy (or Jxy, λ−Jxx); normalize; if deg==0 dir=(1,0).
+     
+  sref, wide, R as v4.6;  kfix/-g/-e as before (k base).
+  
+  for each px:
+     dir = (dx,dy)
+     /* line samples t=-R..R */
+     NS = 2R+1; C[NS][4];
+     for j: sample_pm(out, x+ (j-R)*dirx, y+(j-R)*diry, C[j]);
+     /* endpoints */
+     mE = max(1, R/3);  mean first mE → CA, last mE → CB
+     d = CB−CA (4vec); L2 = d·d
+     /* global u range gate / flat detect */
+     if (L2 < (.006f)^2) → maybe flat-flatten & continue
+     /* project */
+     for j: u[j] = clamp(((C[j]−CA)·d)/L2, 0,1)
+     /* orientation: corr = Σ (j−R)·u[j]; if <0: reverse u and C (mirror) — mirror t */
+     /* step vs pulse */
+     third means ul = mean u[0..mE), ur = mean u[NS−mE..NS)
+     if (ur − ul > .55f) STEP:
+        P0 = mean C where u<.25 (fallback CA), P1 = u>.75 (fallback CB); d'=P1−P0; L'²; u_px from center pixel own color (C[R]); if u_px... 
+        moments ω_j = |u[j+1]−u[j-1]| finite-diff interior (borders one-sided)... μ, s over ω; s clamp [0.3f, R]
+        u_px = clamp(((C[R]−P0)·d')/L'²,0,1) -- recompute consistency (use d')
+        /* steepen */
+        k = ...(-g / -e / -s) with e: k=clamp(s/(goal*scale/2.5),1,8)
+        k = min(k, s/(.6f)) guard → no sub-.6px ramps (≈1.5 out px at 30% width)
+        new_u = normal_cdf(−k*μ/s)  /* v(0) */
+        w gate (shading): s vs wclos: w = ss((wclos?))  & overall blend wb = w*(method:1)...
+        res_u = u_px + w(new_u − u_px)
+        push variant (method 2 && k>1): off = (u_px−.5f)*(k−1.f)*s; new_u = cdf((off−μ)/s); res same blend
+        col = P0 + res_u·d'
+        mix towards col: res[c] = ... write dst
+     else PULSE:
+        ends: BE = (CA+CB)/2; find peak j* = argmax ||C[j]−BE||; qvec = C[j*]−BE; qL2 = qvec·qvec
+        q_j = clamp(((C[j]−BE)·qvec)/qL2)
+        q_px at center
+        flanks: left j ≤ R: ω over rising q → μL,sL (t from −R..0): moments with q baseline 0... approximate: treat q on left half as step 0→1: μL from moments of |Δq| over j≤peak? just restrict to j in [0..R]: μL over ω=|Δq| there. right half similar μR.
+        hmm simpler: compute |Δq| moments over whole line: |Δq| has TWO bumps; split at j* (peak index): left [0..j*], right [j*..NS): μL=Σωt/Σω over left, sL; μR = Σωt/Σω over right with weights |Δq|, but wait for right the q DECREASES: |Δ| handles.
+        new_q: leftPart = cdf(k(0−μL)/sL); rightPart = cdf(-k(0−μR)/sR)?? For t=0 between: Φ(−kμL/sL)→Φ(positive if μL<0)... define pulse steepened q'(t) = Φ((t−μL)k/sL) − Φ((t−μR)k/sR); q'(0) = Φ(−kμL/sL) − Φ(−kμR/sR); clamp [0,1].
+        guard k ≤ min(sL,sR)/.6f
+        if pixel closer to a flank, fit one-sided error possible; blend small w2... keep w same shading gate via min flank s.
+        col = BE + q'·qvec ; blend: res = q_px + w·(q'−q_px) then col=BE+res·qvec
+     flat case: fw pull to line mean (weighted center-weighted?) keep flatmix .25 gated by range<.025 per old (.025 threshold on ‖d‖? old used per-channel range max; use L (sqrt L2)): 
+     
+  copy dst→out; free.
+  last_deblur_k logging...
+}
+normal CDF approximation needed: use erff? C99 math has erff in libm ✓ (C99 includes erf). Φ(z) = .5f*(1.f + erff(z0.70710678f)).
+
+The structure tensor direction: double-angle: v = (Jxx−Jyy, 2Jxy): θ doubled; principal dir angle = ½atan2(2Jxy, Jxx−Jyy). dirx=cos,diry=sin. At deg Jxx≈Jyy≈Jxy≈0 → dir (0,0)→ normalize guard → flat skip (gm≈0 → flat path via gm<eps: treat as flats: pull-to-mean? previously w=0 & fw possibly. keep: if gm<1e-6 && L small → flat else with gm~0 but L big (contrast without coherent direction: corner/noise) → fallback: keep original (safe).
+Gate w shading: w = ss over s: from s_full = .53·wfull? mapping: steepen fully when s ≤ s_open vs close when s > s_clos... WIDE ramps = big s! Careful INVERSION vs v4.6's width gate: there width big → closed (measured LOCAL slope width); NOW s = actual ramp σ: BIG s = blurred edge (target!), small s = already sharp. Direction of gate v4.7: steepen when s is in actionable range [s_min_action, s_action_max] where s_action_max ≈ shading threshold = 1.05·2.5·scale·sref·? Blur σ=3: ramps s≈σ_o=12 ✓ ≤ 31.5 ✓ open. Shading 60px: s≈24?? borderline — accept (with k capped by -e/-g, mild). Set s_open_cap = 1.05·wfull for CLOSE: w = ss from 1 at s≤.75·cap → 0 at cap... plus low-s guard: s very small (<.6px): nothing to do: k guard makes new≈old anyway (k≤s/.6 → k≈1). ✓natural.
+
+Wait — one more important consideration: the OLD behavior at defaults (miya 3×/4× looks user liked) — v4.7 changes everything. HG metric numbers will shift; expect same or better (analytic monotone step fits vs per-channel snap). Must re-measure & eyeball miya face default again.
+
+Also keep rgb≤alpha final clamp? Analytic colors are convex combos of real pm colors → invariant preserved ✓ NO clamp needed (rounding to uint8: floor toward... put() clamps; rgb byte ≤ a byte? real colors bytes r1≤a1,r2≤a2 → blend ≤ a ✓. rounding could give r=a... fine.)
+
+Potential pitfall: C_A/C_B endpoint means & P0/P1: for STEP on cluttered windows (multiple crossings), moments smear; acceptable local fit.
+
+Sampling cost: NS=2R+1 ≤ 129 at R=64 — sample_pm per sample (bilinear 4 px reads ×4ch) — fine.
+
+Write to code as upscaled analytic module replacing both branches of the old remap/push pass. autodeblur_pass signature keeps (out, dw, dh, scale, method); the -D auto proxy unchanged calls pass per method.
+
+Meanwhile the "bright line in the middle" in old code — is my vector+analytic fix actually addressing it? Old: per-channel snap → corner colors → hue/brightness lines along mid-ramp ✓ addressed (single 4D segment, convex combos only). "negates colors" ✓ same. "separate color, alpha gradients" ✓ structure tensor over 4 channels, one direction, alpha sampled & fitted like other channels. "stepladder + box windows" ✓ line profile along continuous direction, erf profile eval, separate output buffer, no in-place scan coupling, sub-pixel floor guard k ≤ s/.6 (never sub-pixel transitions → no new sawtooth).
+
+Now implement. Sizeable but one function. Let me write it.
+
+Also small tools: normal cdf via erff ✓ C99.
+
+k semantics final:
+float kbase;
+if (deblur_steepness > 0) kbase = deblur_steepness;
+else kbase = clampf(1.f+.25f*(compress_strength-1.f),1.f,3.f);
+per pixel:
+float k = kbase;
+if (deblur_steepness <= 0 && edge_goal > 0) {
+   float s_target = fmaxf(.6f, edge_goal*scale/2.5f);
+   k = clampf(s/(s_target), 1.f, 8.f);
+}
+k = clampf(k, 1.f, s/(.6f));  /* anti-sawtooth floor: ramp never sub-.6px sigma (≈1.5 out px 30% width) */
+-g clamp to s/.6 as well? Manual wins but sawtooth would violate core rule; -g 8 on already-sharp (s=.6) → k=1 ✓ automatic. Document: "-g is capped so the output ramp stays ≥0.6px sigma (no re-aliasing)".
+
+flat-flatten: keep fw = ss((.025−flat_range)/.017) with flat_range = max channel range over LINE samples? simplize: use sqrtf(L2) as range proxy? L2 computed from line endpoints... for flats d ~ 0 → fw by L: fw = ss((.025−L)/.017)·(1−w); res toward mean of line samples. Per 4 channels mean = m. res = c + fw·.25(m−c).
+
+gm gate for anything? no longer needed (w from s). drop gm use except debug? keep dir only.
+
+Let me also handle deg case: L2 big but J deg (e.g., isolated pixel noise): old speckle? The old pass had no speckle guard here... direction gate? Risk: single-pixel salt (diffusion noise): sampling a salt dot: profile = narrow pulse → PULSE branch q steepens the dot sharper (k·s guard: s small → k≈1) ✓ dots unchanged mostly. fine.
+
+Write the new autodeblur_pass replacing old one entirely. Also keep helper note in comments referencing anime4k etc.
+
+k guard: also cap final ramp not BELOW source-px anti-alias lower bound? skip.
+
+One more thing — previously the flatmix was applied in res formula combined with remap; replicate structure: final newcolor computed; res[c] = clampf(cbase + w·(newc[c]−cbase) + fw·flatmix·(mean−cbase), 0, 1) hmm w≥0, fw has (1−w). Write like before:
+
+res[c] = clampf(o[c] + w*(nv[c]-o[c]) + fwflatmix(mean[c]-o[c]), 0,1); with nv = analytic color; mean = line mean (per channel), fw = ss((.025−L)/.017)*(1−w)*flatWeight gate? old fw used range and (1−w). replicate-ish:
+
+float fw = clampf((.025f - L) * (1.f/.017f), 0,1); smoothstep; *(1−w).
+
+OK code time. Also update -D auto proxy in upscale_autodeblur: unchanged calls with method 1/2 ✓ shared signature.
+
+Also the forward decl & last_deblur_k semantics: k now per-pixel adaptive even without -e (guard). last_deblur_k: keep = -g if set else (edge_goal? 0 : kbase).
+
+Write it.
+Precise guesses, all three confirmed in the code: the remap is per-channel (each channel snaps independently to its window lo/hi → box-corner colors that exist on opposite sides of an edge → hue inversion band mid-ramp), alpha has its own separate trajectory, and the box-window lo/hi quantizes values spatially → stepladder bands. Let me verify the artifacts first on your case, then replace the pass with the analytic profile-fit you describe.
+Now I can see the artifacts clearly at 3× nearest:
+
+base: smooth wide ramp hair/skin.
+v4.6 push (top-right): the ramp is narrowed, but there's a visible light/bright band running along the middle of the edge (a lighter line parallel to the edge on the skin side, plus a darker band near the hair) — classic per-channel snap "ridge+line" pair.
+v4.6 remap (bottom-left): at the bent corner region the edge shows cyan/white fringing and magenta-ish negated tones — hue inversion artifacts, plus visible stepping/banding along the contour (stepladder-ish bands instead of a continuous ramp). The bright whitish line along the band on the skin side is visible.
+User's report fully confirmed visually. Now implement the analytic v4.7 pass.
+
+Plan recap (from my earlier thinking):
+
+Per-pixel: 4D structure tensor from per-channel Sobel (one gradient direction for RGBA vector).
+Sample a 1D line of colors along ±gradient direction (via sample_pm).
+Project onto the local color segment (P0,P1 from robust extremes — real colors).
+Classify STEP vs PULSE (line).
+Fit erf profile via moments (μ, s). Steepen s→s/k (k from -g/-e/-s, capped so final sigma ≥ 0.6 output px → anti-sawtooth).
+Evaluate fit at pixel t=0 → res_u (STEP) or two-sided pulse fit → res_q (PULSE).
+Reconstruct: color = P0 + res·(P1−P0) (convex combo of two real colors — hue-safe; alpha handled identically).
+Method 2 (push): evaluates the ORIGINAL-fit at displaced coordinate off = (u−.5)(k−1)·s, pulse falls back to slope method.
+Gate: shading-close when s > cap (=1.05·2.5·scale·sref), flats handled by existing range-based flatten-to-mean.
+Write into a separate dst buffer (no in-place scan coupling).
+Additional details to get right:
+
+orientation: correlation sign flip.
+u_px from projection of the actual center pixel color.
+guard: if J degenerate (gm tiny) but line contrast big (corners) → still process using endpoint direction? Structure tensor handles corners fine (direction of max variance). Keep gm only for degenerate guard: if λ tiny AND L2 tiny → flat.
+flat-flatten: keep previous behavior shape (fw, mean over line samples, gated by L).
+w also gates with... previously w=0 at flats via rel gate; now: w = shading gate only; at flats s undefined → skip steepening when L2 < (.006)² → only flat-flatten applies. What threshold for L2? Old per-channel range .008–.025 flats... L = |d| in 4D... a normal-ish edge has L ~ .3+. Use L < .01 → pure flat. Noise floor: diffusion salt L over ±R line endpoints ~ .005-.02... Setting threshold too low re-admits noise sharpening; pulse with s→small → k→1 by guard ✓ safe anyway. Keep L<.008 as flat-only.
+k guard: k = min(k, s/0.6f). Note s in output px. With -e: k = clamp(s/max(.6, goal·scale/2.5), 1, 8)
+For the "steepness doesn't reduce" complaint — with -e the semantics per user v4.4 was adapt per edge; fine.
+Method-2 push: off = (u_px−.5)(k−1)·s capped... within s it's fine analytically: new_u = Φ((off−μ)/s) — evaluating original profile at shifted t means slope unchanged but position moved → narrowing since off sign pushes toward plateau? Actually evaluating at t+off: pixel takes value of a point closer to plateau → the plateau advances → ramp narrows ✓ Anime4K-ish.
+Clamp new_u ∈ [0,1] (guaranteed for STEP, clamp anyway; PULSE q' may exceed slightly → clamp).
+Blend: res = u_px + w(new−u_px); col = P0 + res·d'.
+Keep last_deblur_k semantics.
+Keep flat-flatten AFTER the branch? fold in: res_c = o[c] + w·(nv[c]−o[c]) + fw·flatmix·(mean[c]−o[c]) — nv = analytic color; note nv−o includes step from u_px→res? Let me just define nv directly: nv[c] = P0[c] + res_u·d'[c] (or BE+q'·qv). Then standard formula.
+For safety on PULSE: guard each flank fit: if ω sum tiny → fallback STEP-style? If any degenerate → keep original color (o), i.e., contribute nothing beyond flat-flatten.
+
+Implementation sequence now:
+
+Write new autodeblur_pass in C (replace whole function).
+Keep measure of gm? Remove t/gm/gnx/gny arrays; add A(4n), dirx, diry arrays (2n), λ not needed per-pixel beyond guard → compute inline from Sobel per pixel? Sobel needs neighbors of 4 channels: with A stored, compute per-pixel in the main loop directly (six taps × 4ch = fine). So fields: A(4n floats), no gm arrays at all! Structure per pixel computed on the fly. Memory same as before (4n).
+Direction tensor smoothing doesn't exist → local noise in dir; mitigate: compute tensor on 5×5? no — Sobel over A directly per pixel is standard.
+Wait, one concern: per-pixel dir from raw Sobel on BUSY texture varies wildly; the line samples then zigzag meaninglessly... but base is autoblur-smooth by construction (that's the point) — dir field smooth. OK.
