@@ -3031,9 +3031,9 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                    (line interiors move to the restored plateau) and
                    the effective step amplitude below, and the hull is
                    extended by exactly the corrected plateau. */
-                if (!adb_noamp && coh > .85f)
+                if (!adb_noamp && coh > .2f)
                   for (int side = 0; side < 2; side++) {
-                    double iM = 0.;
+                    double iM = 0., oL = 0., oN = 0.;
                     int nb = side == 0 ? li - 1 : li + 1;
                     if (nb < 0 || nb >= NL)
                       continue;
@@ -3057,7 +3057,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                          interior plateau sits inside the lobe's own
                          domain (the saturated u=0/u=1 run). */
                       iM = 0.;
-                      double oL = 0., oN = 0.;
+                      oL = oN = 0.;
                       int ni = 0, n = 0;
                       float ulo = side == 0 ? .25f : .75f;
                       for (int j = dl; j <= dr; j++)
@@ -3118,6 +3118,27 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                             iM >= rwmax - .02f))
                         continue;
                     }
+                    /* v4.9.5 tip entry: the coherence gate (> .85)
+                       disables the restoration at exactly the wedge
+                       tips and tight line ends that need it -- the
+                       bending-contour coherence is low there BY
+                       CONSTRUCTION, so the tip apex was left at the
+                       blurred base (domed/eaten tips, "rounded too
+                       much").  Below the gate, take only flank pairs
+                       whose OUTER levels agree (both arms exit to the
+                       same surround = a genuine dip or wedge tip; a
+                       T-junction arm pairs unequal outsides --
+                       stroke vs paper -- and is rejected as before,
+                       which is the cornerstar bright-channel
+                       regression guard). */
+                    if (coh <= .85f) {
+                      float dd2 =
+                          (float)(fabs(iM - oL) + fabs(iM - oN)) * .5f;
+                      if (fabs(oL - oN) >
+                              .35f * (dd2 > .1f ? dd2 : .1f) ||
+                          coh <= .25f)
+                        continue;
+                    }
                     float wsrc = fabsf(mus[li] - mus[nb]) / scale;
                     double sig = fitted_sigma > .3f ? fitted_sigma : .3;
                     double att =
@@ -3129,30 +3150,30 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                     float f = att > .20 ? (float)(1.0 / att) : 5.f;
                     if (f < 1.f)
                       f = 1.f;
-                    /* v4.9.4 accumulate-mass: recovering CONTRAST by
-                       1/att is not enough for a narrow washed feature
-                       -- the blurred deficit area observed across the
-                       flank pair spans ~(wsrc+2.83*sig), but the final
-                       k-steepened ramp repays it over only
-                       ~2.83*sig/k, so the stroke comes back short of
-                       ink by exactly that width ratio (the -r 6 smiley
-                       mouth settled ~13% under source ink = the
-                       user's "watercolor").  The mass-equal depth is
-                       ~ (k/att) * wsrc/(wsrc+2.83*sig): it boosts
-                       only genuinely narrow features (q -> 1 satura-
-                       tion for wide ones is suppressed by the att-
-                       gate: a wide flanked edge's interior is already
-                       sampled at its true colour, 1/att ~ 1 there),
-                       and it pays the deblur-phase debt back INTO the
-                       proven interior plateau (which the source-range
-                       clamp keeps inside measured colours). */
+                    /* v4.9.5 accumulate-mass depth.  Recovering
+                       CONTRAST by 1/att actually claims "the dip's
+                       true depth saturates the source colour range":
+                       fine for genuinely black line art (the clamp
+                       lands at native black) but a washed mid-tone
+                       structure (miya lip line, true depth ~130-170
+                       on a 19 skin field) was blown to pure 255-black
+                       rails -- depth was invented, not accumulated.
+                       The honest deblur ledger: blur conserves the
+                       deficit MASS, so under the box+gauss dip model
+                       observed_mass = depth * (wsrc + 2.83*sig_src)
+                       must equal rendered_mass =
+                       depth' * (wsrc + 2.83*sig_src/k), which pins
+                       the depth multiplier at
+                          f = k (wsrc + t) / (k wsrc + t), t = 2.83 sig_src
+                       -- self-limiting: a shallow wide wash gets
+                       depth~1 (keeps its own level), a point line
+                       gets ~k (full concentration), wide features
+                       are untouched (f -> 1).  Colour is only ever
+                       RECONCENTRATED from the observed wash back into
+                       the stroke, never created. */
                     {
-                      float sigq = (float)sig,
-                            attc = (float)att > .2f ? (float)att : .2f,
-                            q = wsrc / (wsrc + 2.828f * sigq);
-                      float fms = fminf(k, 8.f) / attc * q;
-                      fms = 1.f + (fms - 1.f) *
-                                  ss01((.85f - (float)att) * (1.f / .35f));
+                      float t = 2.8284271f * ((float)sig / scale);
+                      float fms = k * (wsrc + t) / (k * wsrc + t);
                       if (fms > f)
                         f = fms;
                     }
@@ -3168,7 +3189,15 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                                 2.25 left -r 6 strokes ~13% ink short
                                 (watercolor).  The source-range clamp
                                 below is still the hard guard */
-                    f = 1.f + (f - 1.f) * ss01((coh - .85f) * (1.f / .15f));
+                    /* coherence discount: full confidence above the
+                       .85 gate (v4.9.1); below it (v4.9.5 tip entry,
+                       proven symmetric flank pairs only) fade to zero
+                       toward .30 so a barely-admitted cusp gets only
+                       a gentle correction. */
+                    f = 1.f + (f - 1.f) *
+                              (coh > .85f ? 1.f
+                                          : ss01((coh - .30f) *
+                                                 (1.f / .40f)));
                     if (f <= 1.001f)
                       continue;
                   float *Pin = side == 0 ? P0 : P1, *Pout = side == 0 ? P1 : P0,
@@ -3716,8 +3745,10 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
            edge (v4.9.4 experiment: nu-based membership painted the
            washed skirt black, diagline MAE 13.7 -> 17.6).  The
            unsteepened ufit0 keeps the SIDE truth.  Gate centre
-           lowered .78 -> CELUP_UFM (default .65, scanned below): a
-           narrow -r 6 line's interior pixels stop at ufit0 ~ .6-.9
+           lowered .78 -> CELUP_UFM (default .70, scanned .55-.78 on
+           the smiley and diagline fixtures; .70 was the best joint
+           point): a narrow -r 6 line's interior pixels stop at
+           ufit0 ~ .6-.9
            (the whole stroke is ~2.9 sigma wide), and the .78 centre
            paid only the dead-centre sliver -- the proven interior
            stayed at the attenuated plateau (watercolor).  The halo
@@ -3729,6 +3760,19 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
         float uf0 = 1.f - ss01((ufit0 - (1.f - CELUP_UFM)) *
                                (1.f / .20f));
         float uf1 = ss01((ufit0 - CELUP_UFM) * (1.f / .20f));
+        /* v4.9.5 dip-core tent: when BOTH sides' flank-pair
+           restoration fired on this window (extremum-tested from
+           BOTH flanks -- the lobe is a sandwiched dip/line core; a
+           plain one-sided flank fires only one offset), the restored
+           core colour must also be paid at the dip CENTRE itself,
+           ufit ~ .5, which neither uf-side gate ever claims: a 1-2
+           px line otherwise renders as two dark rails with a bright
+           mid seam (the user's "mouth vertically doubled" on miya,
+           and the smiley r6 ring double edge).  The tent is the
+           conservative (min-magnitude, same-sign) component of the
+           two offsets, gated by shape to vanish at both plateaus so
+           it cannot add anything to one-sided edges. */
+        float uft = ss01((.5f - fabsf(ufit0 - .5f) - .2f) * (1.f / .15f));
         float *dd = DEL + 4 * idx;
         float c0blo_dbg = -1.f;
         /* v4.9.3: widen the local colour hull by the CONSENSUS
@@ -3807,9 +3851,17 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
             vr = gInn * uf0;
           if (nu > .98f && uf1 > .98f && gInn > .6f)
             vr = gInn * uf1;
+          /* dip-core tent component (v4.9.5): conservative same-sign
+             component of the two offsets, paid at the dip centre
+             where the side gates are silent; uses the ordinary
+             diluted weight (no fullfire -- shape, not depth). */
+          float t0 = off0e[c], t1 = off1e[c], tc = 0.f;
+          if (t0 * t1 > 0.f)
+            tc = fabsf(t0) < fabsf(t1) ? t0 : t1;
           float v = clampf(o[c] + w * ((nu - ufit0) * d2[c]) +
                                vr * (uf0 * (1.f - nu) * off0e[c] +
-                                     uf1 * nu * off1e[c]),
+                                     uf1 * nu * off1e[c]) +
+                               w2v * gInn * uft * tc,
                            blo, bhi);
           dd[c] += v - o[c];
         }
@@ -3823,7 +3875,13 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                   off1e[0], d2[0],
                   o[0] + w * ((nu - ufit0) * d2[0]) +
                       w2v * gInn * (uf0 * (1.f - nu) * off0e[0] +
-                                    uf1 * nu * off1e[0]),
+                                    uf1 * nu * off1e[0]) +
+                      w2v * gInn * uft *
+                          (off0e[0] * off1e[0] > 0.f
+                               ? (fabsf(off0e[0]) < fabsf(off1e[0])
+                                      ? off0e[0]
+                                      : off1e[0])
+                               : 0.f),
                   c0blo_dbg);
       }
     }
@@ -5600,7 +5658,7 @@ static uint8_t *slurp(const char *name, size_t *n) {
 static void print_help(const char *argv0) {
   printf(
       "celup_lab -- premultiplied-linear WebP upscaler (research build "
-      "v4.9.4)\n"
+      "v4.9.5)\n"
       "\n"
       "Usage: %s in.webp out.webp SCALE [options]\n"
       "  SCALE is the upsampling factor, real number in (1,32] "

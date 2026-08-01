@@ -1,5 +1,47 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
+# v4.9.5 update (2026-08-01): mass-conserving deblur depth; mouth doubling fixed; tip anatomy
+
+- User on v4.9.4: "improved color restore, but more artifacts, miya
+  mouth vertically doubled, line tips are rounded too much. So far
+  autodeblur either produced pointy snake tongue lineends, or rounded
+  linends, no deblur that would preserve shapes."
+- Mouth doubling diagnosis (out-px DBGS columns at the mouth): true
+  structure is a 2-3 src px lip band, depth 125-173 on skin 19 -- but
+  v4.9.4's saturating 1/att claim pinned it to 255-black, paid as TWO
+  rails (each flank frame pays its own claim) with a bright seam at
+  ufit~.5 where neither side gate applies.  The dip-centre seam and
+  the overclaim are one bug: depth was extrapolated from "assume the
+  dip is saturated", not from the measured ink.
+- Mass-conserving depth (the user's "accumulate colors back"
+  literalised): blur conserves deficit mass; box+gauss dip model pins
+  `f = k(wsrc+2.83 sig_src)/(k wsrc+2.83 sig_src)` (k hoisted in
+  pass 1, v4.9.4).  Replaces the v4.9.4 `min(k,8)/att*q` hack (that
+  one was saturated-depth leaning; the new rule is ink bookkeeping:
+  dip gets back exactly what the wash holds, spread over the rendered
+  width).  miya mouth 81..255 rails+seam -> single stroke peaking
+  ~163 (NN 173); smiley metrics unchanged (clamped at native black
+  anyway); ship2x staircase jump95 .263 -> .089 as a side-effect.
+- Dip-core tent: two-sided extremum-proven dips pay the centre
+  (ufit ~ .5) the min-magnitude same-sign offset component.
+- Tip entry: extremum-proven + OUTER-LEVEL-SYMMETRIC flank pairs are
+  admitted below the .85 coherence gate (fading to coh .3); unequal
+  outsides (T-junction pairing) stay rejected.  Brow/lash taper ends
+  recovered on miya.
+- **Found + documented, not solved**: sharp cusp apices read NL=1 in
+  the lobe map (profile has a single edge there; the coh.85/.55/.2
+  gate never mattered -- the DBGR instrumentation row shows NBRANGE/
+  one-lobe rejects at every apex pixel).  Cornerstar wedge apex:
+  NN tip-top row 16 vs rendered 24 (2x out px) identical with and
+  without the tip-entry relaxation.  True cusp preservation needs a
+  radial/tip feature class (its own follow-up).
+- Also observed (not chased): comb-teeth zigzag inside miya's dense
+  lower-lash zone at 4x (v4.9.2 smears it, v4.9.4+ show teeth); the
+  wand-smoke alpha-fringe chroma junk persists (pre-existing since
+  v4.9.2, present in base too); skirt halo/veil metrics flat as
+  before (17.4 r6 smiley ROI vs NN 1.9 -- still the residual-channel
+  blur tail, no gate touches it).
+
 # v4.9.4 update (2026-08-01): accumulate-mass deblur (watercolor, round 2)
 
 - User: "improve autodeblur. currently it water colors, produce halo.
