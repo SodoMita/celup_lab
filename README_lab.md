@@ -38,8 +38,16 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
-## v4.9.4: fix ARM64 / Android segfault in `suppress_speckle_pm` (out-of-bounds heap read)
+## v4.9.4: C1-continuous 3x3 consensus DSDF & ARM64 / Android segfault fix
 
+- **C1-continuous 3x3 consensus DSDF (`--mode dsdf`) across arbitrarily high upscales**:
+  - Scientific diagnosis: Previously, `upscale_dsdf` evaluated `d_geom` from only the single nearest Voronoi seed cell (`roundf(sx), roundf(sy)`). Because `build_class_map` marks a 3-pixel-wide band around edges with `w_edge > 0` and sets `t0` to the mean of the 5x5 patch around each cell, an outer neighbor cell (1 pixel outside the true edge) had its own zero-crossing line `t0 - 0.5 = 0` located 1 source pixel away from the true edge. At high upscales (e.g. 8x, 16x), every marked cell drew its own independent contour inside its Voronoi boundary, causing:
+    1. Spikes and jumps at Voronoi cell boundaries (`roundf(sx)` transitions);
+    2. Edge caps copied and pasted 1 pixel distance more away from circle/curve centers.
+  - Solution: Replaced single-cell Voronoi evaluation with a C1-continuous Gaussian-kernel consensus across the 3x3 neighborhood around any target coordinate `(sx, sy)`:
+    - Candidate cells are rejected if their zero-crossing line `t = 0.5` does not pass through or near the cell (`fabsf(t0 - .5f) > .65f * mag`).
+    - For valid edge cells in the 3x3 window, `d_geom`, endpoint colors `A, B`, and confidence `conf` are accumulated with Gaussian weights `conf * expf(-r2 * 1.5f)`.
+    - Verified across all scale factors 1.5x to 24x (`tests/test_scales.py`): circle edges render as a single monotonic C1-continuous contour with zero step overflows (`step 0.000`) and zero offset caps.
 - **ARM64 / Android segmentation fault fix for `sdf`, `msdf`, and `dsdf`**:
   - Root-caused the crash reported on ARM phones when running `--mode sdf`, `--mode msdf`, and `--mode dsdf`. All three modes call `upscale_adaptive` to build the adaptive reference image underneath. `upscale_adaptive` terminates with `suppress_speckle_pm(hr, dw, dh, ...)`.
   - In `suppress_speckle_pm`, Pass 2 (the domino pair pass) previously iterated `for (int vert = 0; vert < 2; vert++) for (int y = 1; y + 1 < dh; y++) for (int x = 1; x + 1 < dw; x++)`.

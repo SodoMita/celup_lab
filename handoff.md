@@ -1,7 +1,13 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
-# v4.9.4 update (2026-08-01): ARM64 / Android Segmentation Fault Fix for `sdf`, `msdf`, and `dsdf`
+# v4.9.4 update (2026-08-01): C1-continuous 3x3 consensus DSDF & ARM64 / Android Segmentation Fault Fix
 
+- **C1-continuous 3x3 consensus DSDF (`--mode dsdf`)**:
+  - Scientific diagnosis: Resolved the issue where `--mode dsdf` produced spikes at integer pixel boundaries and edge caps copied and pasted 1 pixel distance more away from circle/curve centers at arbitrarily high upscales. Because `build_class_map` marks a 3-pixel-wide band around edges with `w_edge > 0` and sets `t0` to the mean of the 5x5 patch around each cell, an outer neighbor cell (1 pixel outside the true edge) had its own zero-crossing line `t0 - 0.5 = 0` located 1 source pixel away from the true edge. At high upscales (e.g. 8x, 16x), single-cell Voronoi evaluation caused every marked cell to draw its own independent contour inside its Voronoi boundary.
+  - Solution: Replaced single-cell Voronoi lookup with a C1-continuous Gaussian-kernel consensus across the 3x3 neighborhood around any target coordinate `(sx, sy)`:
+    - Candidate cells are rejected if their zero-crossing line `t = 0.5` does not pass through or near the cell (`fabsf(t0 - .5f) > .65f * mag`).
+    - For valid edge cells in the 3x3 window, `d_geom`, endpoint colors `A, B`, and confidence `conf` are accumulated with Gaussian weights `conf * expf(-r2 * 1.5f)`.
+    - Verified across all scale factors 1.5x to 24x (`tests/test_scales.py`): circle edges render as a single monotonic C1-continuous contour with zero step overflows (`step 0.000`) and zero offset caps.
 - **ARM64 / Android segmentation fault fix in `suppress_speckle_pm`**:
   - Scientific diagnosis: Resolved the segmentation fault reported on ARM phones when executing `--mode sdf`, `--mode msdf`, and `--mode dsdf`. All three modes invoke `upscale_adaptive` as their base renderer underneath, which completes by running `suppress_speckle_pm(hr, dw, dh, ...)`.
   - In `suppress_speckle_pm`, Pass 2 (the domino pair pass) previously iterated `for (int vert = 0; vert < 2; vert++) for (int y = 1; y + 1 < dh; y++) for (int x = 1; x + 1 < dw; x++)`.
