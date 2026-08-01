@@ -3288,7 +3288,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           }
           iso = sum / 9.f;
         }
-        float delta = wide ? (0.20f * tang + 0.80f * iso) : tang;
+        float delta = wide ? (0.55f * tang + 0.45f * iso) : tang;
         float v = o[c] + delta;
         float blo = c < 3 ? to_linear[LOH[8 * idx + c]]
                           : LOH[8 * idx + c] * (1.f / 255.f),
