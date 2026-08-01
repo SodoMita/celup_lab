@@ -99,7 +99,49 @@ STEP D (staircase): analyze where residual staircase remains (base vs deblur),
       and if a SAFE smoothing within the deblur's tangential pass (already
       junction-aware) can reduce jump95 without losing corner sharpness.
 
-## 7. Math scratch (kept here as required)
+## 8. RESULTS of the investigation (measured, not assumed)
+
+### What was tried and what shipped
+
+| idea | mechanism | measured effect | verdict |
+|------|-----------|-----------------|---------|
+| tighten multi-crossing gate | CELUP_CROSSGATE sweep | **NO CHANGE** on torture HG (crosshatch/rings/diag/corner byte-identical across gate settings). Confirms handoff: texture HG comes from the autoblur BASE + legitimately-steepened single lines (cross=2, full trust), NOT from the gate's faded region (already wS=0). | gate already optimal -- kept as env knob, default v4.9.2 |
+| texture-residual gain (queue #1) | hull-clamped laplacian crispening in model-off windows | IMPROVES MAE on all torture scenes (checker2 .088->.082, crosshatch .150->.149); REDUCES checker2 HG (.0031->.0024); but RAISES diag/corner HG and **AMPLIFIES SALT** (rampnoise HF .00314 base -> .00390 at tg=0.20). coh gate does NOT stop it (dither-on-gradient reads as high-coh). | SHIPPED opt-in `-T`/`--texgain` (default OFF) -- for explicit clean-lattice content; unsafe as default on diffusion art |
+| wider tangential span T | CELUP_TSPAN sweep | reduces quick jump95 but ROUNDS CORNERS (tip 86.25->84.25 FAIL) -- re-litigates the v4.9 gate | default unchanged; env knob kept |
+| extra straight-contour tap | CELUP_STRTAP, coh>0.88 only | corners PASS but authoritative check_stairs ship2x 0.111->0.154 (AMBIGUOUS/worse, still passing) | default OFF; env knob kept as experimental |
+
+### Is the deblur even ADDING staircase?
+On diagline48 (45-deg line, ship2x -r 6 -g 64), staircase jump95 (quick metric):
+  nearest2x = 1.00 (pure jaggies) -> autoblur base (-r 6) = 0.318 ->
+  **autodeblur = 0.210**.  The deblur REDUCES staircase vs its own base via
+  tangential averaging. autodeblur makes diagonals SMOOTHER, not staircased.
+  The residual 0.11 (authoritative gate) is the base's lattice footprint at the
+  user's chosen -r; lowering it further rounds corners.
+
+### Default behaviour is BYTE-IDENTICAL to master v4.9.2
+All new code paths are gated by env vars (default OFF) and texgain defaults to
+0, so default autodeblur is bit-identical to master on step48/cornerstar48/
+huearc48 (verified with cmp). Gates: check_corners PASS, check_stairs PASS,
+test_scales 204/204 PASS.
+
+### Why no default core change shipped
+The autodeblur core is at a measured local optimum: every lever either (a)
+does nothing (crossgate), (b) trades MAE for salt-amplification (texgain), or
+(c) re-litigates a gate the maintainer tuned and explicitly warns against
+re-opening (T-span rounds corners; base-sigma decouple returns treads). The
+honest, safe contribution is the opt-in `-T` (queue #1, for clean lattice
+content) plus the measurement infra (regression harness, comparison sheets,
+env knobs) that makes the NEXT improvement measurable.
+
+## 9. v4.9.3 SHIPPED (this branch)
+- `-T, --texgain G` (0..1, default 0): opt-in hull-clamped lattice crispening
+  (AUTODEBLUR_NOTES queue #1). Gated to model-off + directed (coh) windows.
+- env tuning knobs (default = v4.9.2 behaviour): CELUP_CROSSGATE=off,span,
+  CELUP_TEXGAIN=g (also set by -T), CELUP_TSPAN=mult, CELUP_STRTAP=1.
+- make_example_comparison_sheets.py (inherited + hardened).
+- tests/autodeblur_regression.py + autodeblur_regression_MASTER_v492.txt ref.
+
+## 10. Math scratch (kept here as required)
 
 ### anchored evaluation identity (why gain-1 is safe)
   out = F_k(0) + (o - F(0))
