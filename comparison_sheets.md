@@ -18,7 +18,7 @@ Metric: mean absolute error in premultiplied-linear RGBA, excluding 4px border; 
 
 Generated files:
 
-- `comparison_sheets/comparison_sheet.png`
-- `comparison_sheets/example_sources.png`
-- `comparison_sheets/comparison_<case>.png`
+- `comparison_sheets/comparison_sheet.webp`
+- `comparison_sheets/example_sources.webp`
+- `comparison_sheets/comparison_<case>.webp`
 - `examples/*_source_96.webp` and matching mode outputs
