@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
-"""Comparison-sheet generator: MY autodeblur (branch arena/019fbef6, master
-v4.9.2 core) vs arena/019fba18 (v4.9.8: mass-conserving depth + erf-gain
-post-map).  Produces two labeled PNG grids so the artifact vs grey/ink
-trade-off is visible at a glance.
+"""Comparison-sheet generator: MINE (arena/019fbef6, master v4.9.2 core) vs
+arena/019fba18 (v4.9.8: mass-conserving depth + erf-gain post-map), plus the
+key finding -- the grey wash is the -r6 recipe, not the deblur.
 
-  sheet_artifacts.png : torture scenes (rings/corner/crosshatch/diag) x
-                        [bilinear | MINE | v4.9.8]  -- shows v4.9.8's added
-                        hourglass/ringing energy on edges and curves.
-  sheet_bw_art.png    : the user's BW/grey content (smiley user recipe, pure-BW
-                        test, miya user recipe) x [nearest | MINE | v4.9.8] --
-                        shows v4.9.8 recovering ink (less grey) while MINE
-                        stays cleaner.
+Writes two lossless WebP sheets to images/:
+  sheet_artifacts.webp : torture scenes [bilinear|MINE|v4.9.8] -- v4.9.8 ringing
+  sheet_bw_art.webp    : BW/grey RECIPE SWEEP [nearest|MINE default|MINE -r1.5|
+                         MINE -r6|v4.9.8 -r6] -- default/-r1.5 = clean sharp ink
 
 Usage: python3 make_vs_18_sheets.py [MY_EXE] [V18_EXE]
 """
-import os, subprocess, sys, tempfile
+import subprocess, sys, tempfile
 from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -24,7 +20,7 @@ MY = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "celup_lab"
 V18 = Path(sys.argv[2]) if len(sys.argv) > 2 else ROOT / "celup_18"
 OUT = ROOT / "images"
 OUT.mkdir(exist_ok=True)
-S, N = 4, 96  # torture: 4x, 96-cell truth
+S, N = 4, 96
 
 
 def lin(x):
@@ -81,17 +77,10 @@ def scene(name):
 
 def run(exe, src, scale, recipe):
     with tempfile.TemporaryDirectory() as td:
-        td = Path(td); out = td / "o.webp"
+        out = Path(td) / "o.webp"
         subprocess.run([str(exe), str(src), str(out), str(scale), *recipe],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return np.asarray(Image.open(out).convert("RGB"), dtype=np.uint8)
-
-
-def run_crop(exe, src, scale, recipe, crop):
-    """run then crop to (y0,y1,x0,x1) on the OUTPUT image."""
-    img = run(exe, src, scale, recipe)
-    y0, y1, x0, x1 = crop
-    return img[y0:y1, x0:x1]
 
 
 def bilinear_up(low_rgb, scale):
@@ -99,70 +88,36 @@ def bilinear_up(low_rgb, scale):
         (low_rgb.shape[1]*scale, low_rgb.shape[0]*scale), Image.BILINEAR))
 
 
-def label(img, text, sub=""):
-    w, h = img.size
-    bar = Image.new("RGB", (w, 26 + (14 if sub else 0)), (20, 20, 24))
+def fonts():
     try:
-        f = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
-        fs = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
-    except Exception:
-        f = fs = ImageFont.load_default()
-    ImageDraw.Draw(bar).text((6, 3), text, (255, 255, 255), font=f)
-    if sub:
-        ImageDraw.Draw(bar).text((6, 19), sub, (170, 200, 255), font=fs)
-    return Image.new("RGB", (w, bar.size[1] + h))
-    # (compose handled by caller)
-
-
-def stack_label(text, sub, img_arr):
-    img = Image.fromarray(img_arr)
-    w, h = img.size
-    bh = 28 + (14 if sub else 0)
-    bar = Image.new("RGB", (w, bh), (20, 20, 24))
-    try:
-        f = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
-        fs = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
-    except Exception:
-        f = fs = ImageFont.load_default()
-    ImageDraw.Draw(bar).text((6, 3), text, (255, 255, 255), font=f)
-    if sub:
-        ImageDraw.Draw(bar).text((6, 20), sub, (180, 210, 255), font=fs)
-    canvas = Image.new("RGB", (w, bh + h))
-    canvas.paste(bar, (0, 0)); canvas.paste(img, (0, bh))
-    return canvas
-
-
-def grid(title, col_labels, rows, cell=256, title_h=40):
-    ncol = len(col_labels)
-    # each row: [title, sub, [imgs...]]
-    nrow = len(rows)
-    W = ncol * cell
-    H = title_h + sum(cell + 42 for _ in rows)
-    canvas = Image.new("RGB", (W, H), (8, 8, 10))
-    try:
-        ft = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
-        fc = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 13)
+        ft = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+        fc = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
     except Exception:
         ft = fc = ImageFont.load_default()
-    ImageDraw.Draw(canvas).text((10, 8), title, (255, 255, 255), font=ft)
+    return ft, fc
+
+
+def grid(title, col_labels, rows, cell=256, title_h=44):
+    ncol = len(col_labels)
+    W = ncol * cell
+    H = title_h + sum(cell + 30 for _ in rows)
+    canvas = Image.new("RGB", (W, H), (8, 8, 10))
+    ft, fc = fonts()
+    ImageDraw.Draw(canvas).rectangle([0, 0, W, title_h], fill=(12, 12, 16))
+    ImageDraw.Draw(canvas).text((8, 4), title, (255, 255, 255), font=ft)
+    for i, c in enumerate(col_labels):
+        ImageDraw.Draw(canvas).text((i * cell + 6, 24), c, (200, 230, 255), font=fc)
     y = title_h
     for rtitle, rsub, imgs in rows:
-        cw = cell
-        # row label band across the row top
-        ImageDraw.Draw(canvas).rectangle([0, y, W, y + 28], fill=(24, 24, 30))
-        ImageDraw.Draw(canvas).text((10, y + 6), rtitle + ("   " + rsub if rsub else ""),
+        ImageDraw.Draw(canvas).rectangle([0, y, W, y + 26], fill=(24, 24, 30))
+        ImageDraw.Draw(canvas).text((8, y + 5),
+                                    rtitle + ("   " + rsub if rsub else ""),
                                     (255, 230, 180), font=fc)
-        y += 28
-        # resize each img to cell
+        y += 26
         for i, im in enumerate(imgs):
             t = Image.fromarray(im).resize((cell, cell), Image.NEAREST)
             canvas.paste(t, (i * cell, y))
-        y += cell + 14
-    # column header band
-    ImageDraw.Draw(canvas).rectangle([0, 0, W, title_h], fill=(12, 12, 16))
-    ImageDraw.Draw(canvas).text((10, 8), title, (255, 255, 255), font=ft)
-    for i, c in enumerate(col_labels):
-        ImageDraw.Draw(canvas).text((i * cell + 8, 0), c, (255, 255, 255), font=ft)
+        y += cell + 4
     return canvas
 
 
@@ -171,63 +126,56 @@ def main():
            "-k", "bspline", "-s", "100", "-D", "remap"]
     # ---- sheet 1: artifacts (torture) ----
     rows = []
-    HG = {"rings": ("MINE .0037", "v4.9.8 .0155"), "corner": ("MINE .0020", "v4.9.8 .0056"),
-          "crosshatch": ("MINE .0057", "v4.9.8 .0126"), "diag": ("MINE .0017", "v4.9.8 .0124")}
+    HG = {"rings": "MINE .0037 vs v4.9.8 .0155", "corner": "MINE .0020 vs v4.9.8 .0056",
+          "crosshatch": "MINE .0057 vs v4.9.8 .0126", "diag": "MINE .0017 vs v4.9.8 .0124"}
     for name in ("rings", "corner", "crosshatch", "diag"):
-        truth = scene(name)
-        low_rgb = (encode_pm(down(truth)).convert("RGB"))
-        low_rgb = np.asarray(low_rgb)
         with tempfile.TemporaryDirectory() as td:
-            inp = Path(td) / "s.webp"; encode_pm(down(truth)).save(inp, lossless=True)
+            inp = Path(td) / "s.webp"; encode_pm(down(scene(name))).save(inp, lossless=True)
+            low_rgb = np.asarray(encode_pm(down(scene(name))).convert("RGB"))
             bil = bilinear_up(low_rgb, S)
             mine = run(MY, inp, S, ADB + ["-r", "1.5"])
             v18 = run(V18, inp, S, ADB + ["-r", "1.5"])
-        rows.append((name, "HG " + HG[name][0] + "  vs  " + HG[name][1], [bil, mine, v18]))
-    g1 = grid("ARTIFACTS: torture scenes 4x (hourglass energy -- v4.9.8 adds severe ringing on edges/curves)",
-              ["bilinear ref", "MINE (master v4.9.2 core)", "019fba18 (v4.9.8)"], rows, cell=256)
+        rows.append((name, "HG " + HG[name], [bil, mine, v18]))
+    g1 = grid("ARTIFACTS 4x: v4.9.8 adds severe hourglass/ringing on edges & curves (HG labels)",
+              ["bilinear ref", "MINE (v4.9.2 core)", "019fba18 (v4.9.8)"], rows, cell=256)
     g1.save(OUT / "sheet_artifacts.webp", lossless=True)
     print("wrote", OUT / "sheet_artifacts.webp")
 
-    # ---- sheet 2: BW / grey test (art) ----
+    # ---- sheet 2: BW / grey RECIPE SWEEP (the finding) ----
     rows = []
-    # smiley user recipe -- FULL + a spike/mouth detail crop
     sm = ROOT / "images" / "poor smiley.webp"
     if sm.exists():
         near = run(MY, sm, 2, ["--mode", "nearest", "--max-mib", "2048"])
-        mine = run(MY, sm, 2, ADB + ["-r", "6", "-g", "64"])
-        v18 = run(V18, sm, 2, ADB + ["-r", "6", "-g", "64"])
-        rows.append(("poor smiley 2x -r6 -g64  (FULL)",
-                     "grey: MINE 30.0%  vs  v4.9.8 5.0%",
-                     [near, mine, v18]))
-        c = (60, 300, 380, 510)  # spike/mouth detail crop
+        d0 = run(MY, sm, 2, ADB)
+        d15 = run(MY, sm, 2, ADB + ["-r", "1.5", "-g", "8"])
+        d6 = run(MY, sm, 2, ADB + ["-r", "6", "-g", "64"])
+        v6 = run(V18, sm, 2, ADB + ["-r", "6", "-g", "64"])
+        rows.append(("poor smiley 2x FULL",
+                     "grey/j95: default 3.6%/.45 | -r1.5 11%/.01 | -r6 30%/.21",
+                     [near, d0, d15, d6, v6]))
+        c = (40, 320, 60, 470)
         rows.append(("smiley detail crop (spike/mouth)",
-                     "darkmean: MINE 60  vs  v4.9.8 11",
-                     [near[c[0]:c[1], c[2]:c[3]], mine[c[0]:c[1], c[2]:c[3]],
-                      v18[c[0]:c[1], c[2]:c[3]]]))
-    # pure BW test
+                     "default & -r1.5 = clean sharp ink;  -r6 = washed grey",
+                     [near[c[0]:c[1], c[2]:c[3]], d0[c[0]:c[1], c[2]:c[3]],
+                      d15[c[0]:c[1], c[2]:c[3]], d6[c[0]:c[1], c[2]:c[3]],
+                      v6[c[0]:c[1], c[2]:c[3]]]))
     W, H = 128, 128; im = Image.new("L", (W, H), 255); d = ImageDraw.Draw(im)
     d.rectangle([10, 10, 118, 118], outline=0, width=3)
     d.line([10, 10, 118, 118], fill=0, width=3); d.line([118, 10, 10, 118], fill=0, width=3)
     d.ellipse([40, 40, 88, 88], outline=0, width=3); d.line([20, 64, 108, 64], fill=0, width=2)
     bw = ROOT / "tests" / "bw_test_src.webp"
     Image.merge("RGBA", [im, im, im, Image.new("L", (W, H), 255)]).save(bw, lossless=True)
-    mine = run(MY, bw, 4, ADB + ["-r", "6", "-g", "64"])
-    v18 = run(V18, bw, 4, ADB + ["-r", "6", "-g", "64"])
     near = run(MY, bw, 4, ["--mode", "nearest", "--max-mib", "2048"])
-    rows.append(("pure BW test 4x -r6 -g64",
-                 "ink<128: MINE 0.0%  vs  v4.9.8 17.7%",
-                 [near, mine, v18]))
-    # miya user recipe -- tight FACE crop (4x output 3072x5504)
-    mi = ROOT / "images" / "miya_normal.webp"
-    if mi.exists():
-        crop = (120, 1500, 760, 1900)
-        near = run_crop(MY, mi, 4, ["--mode", "nearest", "--max-mib", "4096"], crop)
-        mine = run_crop(MY, mi, 4, ADB + ["-r", "2.3", "-g", "8", "--max-mib", "4096"], crop)
-        v18 = run_crop(V18, mi, 4, ADB + ["-r", "2.3", "-g", "8", "--max-mib", "4096"], crop)
-        rows.append(("miya 4x -r2.3 -g8  (face crop)",
-                     "", [near, mine, v18]))
-    g2 = grid("BW / GREY TEST: ink recovery vs cleanness (v4.9.8 recovers ink, MINE stays clean)",
-              ["nearest ref", "MINE (master v4.9.2 core)", "019fba18 (v4.9.8)"], rows, cell=420)
+    d0 = run(MY, bw, 4, ADB)
+    d15 = run(MY, bw, 4, ADB + ["-r", "1.5", "-g", "8"])
+    d6 = run(MY, bw, 4, ADB + ["-r", "6", "-g", "64"])
+    v6 = run(V18, bw, 4, ADB + ["-r", "6", "-g", "64"])
+    rows.append(("pure BW test 4x",
+                 "default & -r1.5 keep crisp black ink;  -r6 washes it",
+                 [near, d0, d15, d6, v6]))
+    g2 = grid("BW/GREY RECIPE SWEEP: MINE returns clean sharp ink at default/-r1.5; -r6 over-blurs; v4.9.8 -r6 recovers ink but rings",
+              ["nearest ref", "MINE default", "MINE -r1.5 -g8",
+               "MINE -r6 -g64", "v4.9.8 -r6 -g64"], rows, cell=360)
     g2.save(OUT / "sheet_bw_art.webp", lossless=True)
     print("wrote", OUT / "sheet_bw_art.webp")
 
