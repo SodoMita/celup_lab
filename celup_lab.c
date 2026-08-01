@@ -3543,7 +3543,17 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                  plateau, evaluate the ORIGINAL profile there. */
               float z0 = (0.f - (float)mu) / s;
               float ufit0 = phi1(z0), nu;
-              if (method == 2 && k > 1.f)
+              if (method == 3) {
+                float K = deblur_steepness > 0.f ? deblur_steepness : (k > 1.0001f ? 1.f + 3.6f / (k - 1.f) : 1e6f);
+                if (K < 1.f) K = 1.f;
+                if (K <= 1.0001f) {
+                  if (ufit0 < 0.5f) nu = 0.f;
+                  else if (ufit0 > 0.5f) nu = 1.f;
+                  else nu = 0.5f;
+                } else {
+                  nu = clampf((ufit0 - 0.5f) / (1.f - 1.f / K) + 0.5f, 0.f, 1.f);
+                }
+              } else if (method == 2 && k > 1.f)
                 nu = phi1(z0 + (ufit0 - .5f) * (k - 1.f) * 1.5f);
               else
                 nu = phi1(k * z0);
@@ -3914,7 +3924,17 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
            so only model-u separates the interior from the rim;
            without this the offset paints a neon band +-1.5 flanks
            wide around narrow lines. */
-        if (method == 2 && k > 1.f)
+        if (method == 3) {
+          float K = deblur_steepness > 0.f ? deblur_steepness : (k > 1.0001f ? 1.f + 3.6f / (k - 1.f) : 1e6f);
+          if (K < 1.f) K = 1.f;
+          if (K <= 1.0001f) {
+            if (ufit0 < 0.5f) nu = 0.f;
+            else if (ufit0 > 0.5f) nu = 1.f;
+            else nu = 0.5f;
+          } else {
+            nu = clampf((ufit0 - 0.5f) / (1.f - 1.f / K) + 0.5f, 0.f, 1.f);
+          }
+        } else if (method == 2 && k > 1.f)
           nu = phi1(z0 + (ufit0 - .5f) * (k - 1.f) * 1.5f);
         else
           nu = phi1(k * z0);
@@ -4652,7 +4672,7 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
   int method = deblur_method;
   if (method)
     fprintf(stderr, "autodeblur method %s (manual)\n",
-            method == 1 ? "remap" : "push");
+            method == 1 ? "remap" : (method == 2 ? "push" : "analytical"));
   if (!method) {
     /* Auto-choice over the implemented deblur methods with the same
        self-supervised 2x-downscale proxy the blur fit uses: whichever
@@ -4664,7 +4684,7 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
       uint8_t *recon = malloc((size_t)sw * sh * 4);
       double bs = 1e300;
       if (train && recon)
-        for (int m = 1; m <= 2; m++) {
+        for (int m = 1; m <= 3; m++) {
           if (!render_soft(train, tw, th, recon, sw, sh, fitted_kernel,
                            fitted_sigma, fitted_curve, fitted_cp))
             continue;
@@ -4672,7 +4692,7 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
             continue;
           double s = image_pm_mse(recon, in, sw, sh, 2);
           fprintf(stderr, "autodeblur method %s proxy MSE %.8g\n",
-                  m == 1 ? "remap" : "push", s);
+                  m == 1 ? "remap" : (m == 2 ? "push" : "analytical"), s);
           if (s < bs) {
             bs = s;
             method = m;
@@ -4681,7 +4701,7 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
       free(train);
       free(recon);
       fprintf(stderr, "autodeblur auto-selected %s\n",
-              method == 1 ? "remap" : "push");
+              method == 1 ? "remap" : (method == 2 ? "push" : "analytical"));
     }
   }
   last_deblur_method = method;
@@ -6380,14 +6400,17 @@ static void print_help(const char *argv0) {
       "                            autoblur fit toward enough blur for smooth\n"
       "                            edges, and adapts autodeblur steepness\n"
       "                            per edge\n"
-      "  -D, --deblur-method M     autodeblur method auto|remap|push\n"
+      "  -D, --deblur-method M     autodeblur method auto|remap|push|analytical\n"
       "                            (v4.9.2: 'remake' accepted as alias;\n"
       "                            default auto = 2x proxy picks per image);\n"
       "                            remap = evaluate the slope-steepened\n"
       "                            profile fit at the pixel's own position,\n"
       "                            push = evaluate the original fit at a\n"
       "                            position displaced toward the nearer\n"
-      "                            plateau (Anime4K push)\n"
+      "                            plateau (Anime4K push),\n"
+      "                            analytical = reconstruct image as linear\n"
+      "                            gradients of 4 colors pushing starts and\n"
+      "                            ends toward each other (max deblur = 1)\n"
       "  -g, --deblur-steepness K  autodeblur slope multiplier FLOAT 1..64\n"
       "                            (default 0=auto); overrides -s and -e\n"
       "                            per-edge adaptation; anchored evaluation\n"
@@ -6412,7 +6435,7 @@ static void print_help(const char *argv0) {
       "                                                 = R/min(K,8) (v4.9)\n"
       "  curve        validation-proxy fit              -c (any value but auto)\n"
       "  curve param  fit                               -p P\n"
-      "  method       2x-downscale proxy MSE            -D remap|push\n"
+      "  method       2x-downscale proxy MSE            -D remap|push|analytical\n"
       "  steepness    -s formula, or -e per edge        -g K (exact float,\n"
       "                                                 1..64)\n"
       "  Only the unpinned parameters are fitted.  Every effective value is\n"
@@ -6596,6 +6619,9 @@ int main(int ac, char **av) {
         deblur_method = 1;
       else if (!strcmp(av[i + 1], "push"))
         deblur_method = 2;
+      else if (!strcmp(av[i + 1], "analytical") ||
+               !strcmp(av[i + 1], "linear"))
+        deblur_method = 3;
       else {
         fprintf(stderr, "Unknown deblur method: %s\n", av[i + 1]);
         return 2;
@@ -6792,7 +6818,7 @@ int main(int ac, char **av) {
            kernel_name(fitted_kernel), fitted_sigma, curve_name(fitted_curve),
            fitted_cp);
     if (!strcmp(mode, "autodeblur")) {
-      printf(", method=%s", last_deblur_method == 2 ? "push" : "remap");
+      printf(", method=%s", last_deblur_method == 2 ? "push" : (last_deblur_method == 3 ? "analytical" : "remap"));
       if (last_deblur_k > 0.f) {
         printf(", steepness=%.2f%s", last_deblur_k,
                deblur_steepness > 0.f ? "(manual)" : "");
