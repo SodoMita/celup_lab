@@ -64,7 +64,7 @@ def make_sheet(images_labels, sheet_path, thumb_size=None, cols=4, label_h=36):
             img2 = img
         sheet.paste(checker_composite(img2), (x, y+label_h))
         draw.rectangle((x, y+label_h, x+tw-1, y+label_h+th-1), outline=(180,180,180))
-    sheet.save(sheet_path)
+    sheet.save(sheet_path, lossless=True)
     print(f"Wrote {sheet_path} ({W}x{H})")
 
 # ---- poor smiley sheet ----
@@ -114,7 +114,7 @@ if poor.exists():
     poor_im = Image.open(poor)
     tw = int(poor_im.width*scale)
     th = int(poor_im.height*scale)
-    make_sheet(imgs, SHEET_DIR / "poor_smiley_2x_sheet.png", thumb_size=(tw,th), cols=4, label_h=38)
+    make_sheet(imgs, SHEET_DIR / "poor_smiley_2x_sheet.webp", thumb_size=(tw,th), cols=4, label_h=38)
 
     # also 4x sheet for poor smiley with fewer modes (to keep size reasonable)
     print("Generating poor smiley sheet 4x subset")
@@ -136,7 +136,7 @@ if poor.exists():
         imgs4.append((label, Image.open(out)))
     tw = int(poor_im.width*scale)
     th = int(poor_im.height*scale)
-    make_sheet(imgs4, SHEET_DIR / "poor_smiley_4x_subset.png", thumb_size=(tw,th), cols=4, label_h=30)
+    make_sheet(imgs4, SHEET_DIR / "poor_smiley_4x_subset.webp", thumb_size=(tw,th), cols=4, label_h=30)
 
 # ---- staircase sheet ----
 diag = ROOT / "tests/diagline48_src.webp"
@@ -176,7 +176,7 @@ if diag.exists():
         except Exception as e:
             print(f"FAIL {label}: {e}")
     # thumb 64*4=256
-    make_sheet(imgs, SHEET_DIR / "staircase_45deg_sheet.png", thumb_size=(256,256), cols=4, label_h=48)
+    make_sheet(imgs, SHEET_DIR / "staircase_45deg_sheet.webp", thumb_size=(256,256), cols=4, label_h=48)
 
     # extra sheet showing param effect
     print("Generating param effect sheet on diagline")
@@ -193,6 +193,6 @@ if diag.exists():
         out = tmpdir / f"param_r{r}.webp"
         run_celup(diag, out, 4, "autodeblur", ["-k","bspline","-c","linear","-r",r,"-g","16","-D","remap"])
         param_imgs.append((f"r={r} g16", Image.open(out)))
-    make_sheet(param_imgs, SHEET_DIR / "staircase_param_effect.png", thumb_size=(256,256), cols=4, label_h=30)
+    make_sheet(param_imgs, SHEET_DIR / "staircase_param_effect.webp", thumb_size=(256,256), cols=4, label_h=30)
 
 print("Done sheets in", SHEET_DIR)
