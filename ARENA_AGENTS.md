@@ -1,0 +1,3 @@
+Build env: no apt access for libwebp-dev (network blocks deb.debian.org; pypi works). Working shim: headers in /tmp/webpshim/webp/{types,decode,encode}.h (only 3 API fns used: WebPDecodeRGBA, WebPEncodeLosslessRGBA, WebPFree) + libs copied from imagecodecs wheel into /tmp/webpshim/ (libwebp-851e303f.so.7.2.0, libsharpyuv-211cc5ea.so.0.1.2, libwebp.so symlink). Build: cc -O3 -DNDEBUG -std=c99 celup_lab.c -o /tmp/celup_lab -I/tmp/webpshim -L/tmp/webpshim -lwebp -Wl,-rpath,/tmp/webpshim -lm then cp /tmp/celup_lab celup_lab (tests use repo binary HERE.parent/"celup_lab"). Python pkgs installed: pillow numpy scipy imagecodecs.
+
+Commit, push each min because workspace reset.
