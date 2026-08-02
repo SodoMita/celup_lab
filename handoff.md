@@ -1,8 +1,87 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
-# Handoff: `celup_lab` upscale/hourglass investigation
+# Agent update (arena/019fc1ba): second deblur method `-D analytic` + consolidated tests
 
-# v4.9.2 update (2026-07-31): `-D remake` alias; crosshatch delta root-caused
+Per the user's request ("add another autodeblur that on deblur phase does
+analytical deblur ... reconstruct image as gradients of 2 4-channel colours,
+push each pair of starts and ends of gradients towards each other to increase
+steepness ... eventually quantize colours if deblur strength is high enough ...
+it must produce a full-image gradient, edit it and then sample from it; it is
+impossible to implement properly with 2x2/6x6 gates around pixels").
+
+## What shipped
+
+- **`-D analytic`** (deblur method 3) in autodeblur.  A second, opt-in deblur
+  that is deliberately NOT the per-pixel local-window erf fit + trust gates of
+  `autodeblur_pass`.  It follows the prescription literally in three phases on
+  the autoblur base render (premultiplied-linear RGBA):
+  1. **PRODUCE a full-image gradient field.** A 4D structure-tensor pass gives
+     every pixel its gradient normal and magnitude.  Each pixel's transition
+     (lobe) is then traced ALONG ITS NORMAL across its whole extent -- an
+     adaptive walk (length `3.5*scale*sref+6`, cap 64) that keeps going until
+     the colour saturates to a plateau on each side and stops there (NOT a
+     fixed 2x2/6x6 tap).  The lobe is reconstructed as a gradient between TWO
+     4-channel colours P0, P1 (the saturated plateau tails), and the pixel
+     records its blend coordinate `u` on the P0->P1 segment.
+  2. **EDIT the gradient field.** Push the two ends of every gradient toward
+     each other: a retention `alpha` narrows each transition by
+     `u' = clamp(0.5 + (u-0.5)/alpha, 0, 1)`.  Mid-ramp pixels are driven to
+     the nearer plateau -> the ramp steepens; `alpha -> 0` collapses the whole
+     lobe to one point and quantizes to P0 or P1.
+  3. **SAMPLE from the edited gradient:** `out = P0 + u'*(P1-P0)`, blended by
+     the lobe's proven contrast so flats are inert.
+- **Inverted `-g` semantics** (per the user: "1 is the maximum, higher is lower
+  deblur").  `alpha = (K-1)/K` for `K >= 1`: `K=1` -> `alpha 0` (collapse to a
+  point = quantize), `K->inf` -> `alpha 1` (identity); `K=0` = auto (driven by
+  `-s`).  This is the opposite of remap/push, where higher K = sharper; the
+  shared `-g` knob is documented accordingly in `--help`.  `-D auto` still
+  picks between remap/push only -- analytic is opt-in (its inverted semantics
+  and global nature make it a distinct tool, not an MSE proxy candidate).
+
+## Why it is safe (invariants hold by construction)
+
+The output is always a convex combination of two REAL sampled colours (P0, P1
+read off the plateau tails, u' in [0,1]), so it can never leave the P0->P1
+segment hull -- **no ringing vocabulary** (invariant #1), no hue inversion,
+premultiplied-safe.  Measured hull violations vs the source global per-channel
+range: **0** on cornerstar48/step48/huearc48 (remap scores 57 on cornerstar48
+from its local-window hull); smiley at the user recipe: 0.
+
+## Verification (reproducible)
+
+- `tests/test_analytic_deblur.py` (new): clean blurred step -- monotone
+  steepening in K (peak slope K=1:0.71 -> K=32:0.039, base 0.034), K=1
+  quantizes to a hard step (25-75 width <=2px, slope >=5x base), large K ~
+  identity, 0 hull violations, flat region preserved.  All PASS.
+- `tests/check_corners.py`, `tests/check_stairs.py`, `tests/test_scales.py`
+  (204/204) unchanged PASS -- remap/push path byte-identical.
+- `tests/autodeblur_regression.py` fingerprint byte-identical to the pre-change
+  baseline (no regression to remap/push).
+- poor smiley @ `-r 6 -D analytic`: gray-fraction falls monotonically as K->1
+  (K=1 27.1% most binary -> K=3 33.5%), i.e. the inverted knob sharpens toward
+  binary exactly as designed.
+
+## Tests taken from other agents
+
+Consolidated the genuinely useful, master-compatible test additions from the
+parallel `arena/*` branches into this branch so the new code is exercised by
+them: `tests/autodeblur_regression.py` (numeric fingerprint harness, from
+arena/019fbef6) and `tests/metrics.py` (smiley metrics helper, from
+arena/019fba18).  (The xBR-mode gradient test from arena/019fba12 and the
+ctypes-only variants from arena/019fbcda were not taken: they target modes /
+environments that do not exist in master.)
+
+## Build note (sandbox)
+
+No system libwebp-dev / pkg-config here.  Minimal ABI-compatible webp headers
+were written under `/tmp/webpshim/webp/{types,decode,encode}.h` (only the 3
+API fns used: `WebPDecodeRGBA`, `WebPEncodeLosslessRGBA`, `WebPFree`) and the
+libwebp shared objects copied from the `imagecodecs` wheel into
+`/tmp/webpshim/lib/`.  Build:
+`cc -O3 -DNDEBUG -std=c99 -Wall celup_lab.c -o celup_lab -I/tmp/webpshim -L/tmp/webpshim/lib -lwebp -Wl,-rpath,/tmp/webpshim/lib -lm`
+(pillow/numpy/scipy/imagecodecs installed via `pip --break-system-packages`).
+
+
 
 - `-D remake` is now accepted as an alias of `remap` (the user's own
   miya recipe log spells it that way; previously a hard "Unknown

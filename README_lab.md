@@ -38,6 +38,43 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
+## Agent add: second autodeblur deblur method `-D analytic`
+
+A second, opt-in deblur for `autodeblur`, selected with `-D analytic`.  It is
+deliberately *not* the per-pixel local-window erf fit + trust gates of the
+default `remap`/`push`.  Per the request it follows a different prescription
+on the autoblur base: **produce a full-image gradient field, edit it, then
+sample from it** (no 2x2/6x6 gates around pixels).
+
+1. Produce: a 4D structure-tensor pass gives every pixel its gradient normal;
+   each pixel's transition is traced along that normal across its whole
+   extent (adaptive walk until the colour saturates to a plateau) and
+   reconstructed as a gradient between two 4-channel colours P0, P1.
+2. Edit: push the two ends of every gradient toward each other -- a retention
+   `alpha` narrows each transition by `u' = clamp(0.5 + (u-0.5)/alpha, 0, 1)`.
+   At `alpha -> 0` the lobe collapses to one point and the colour quantizes
+   to P0 or P1.
+3. Sample: `out = P0 + u'*(P1-P0)` -- a convex combination of two real
+   sampled colours, so it can never leave the P0->P1 hull (no ringing, no
+   hue inversion, premultiplied-safe). 0 hull violations measured on all
+   fixtures (remap scores 57 on cornerstar48).
+
+**Inverted `-g` semantics** (per request): with `-D analytic`, `1` is the
+maximum deblur (collapse to a point = quantize), larger `K` is *less* deblur
+(`alpha = (K-1)/K`), infinity = identity; `0` = auto (driven by `-s`).  This
+is the opposite of `remap`/`push` (where higher K = sharper).  `-D auto` still
+picks remap/push; analytic is opt-in.
+
+```sh
+# narrow transitions by half (alpha = 0.5); push to a near-hard step at K=1
+./celup_lab in.webp out.webp 4 -m autodeblur -D analytic -g 2 -c linear -k bspline
+./celup_lab in.webp out.webp 4 -m autodeblur -D analytic -g 1 -r 2.3 -s 100   # quantize
+```
+
+Gated by `tests/test_analytic_deblur.py` (monotone steepening, quantize at
+K=1, identity at large K, 0 hull violations, flats preserved).  `remap`/`push`
+and all other gates are byte-identical (no regression).
+
 ## v4.9.2 (micro): `-D remake` = `remap` alias; crosshatch analysis
 
 The user's miya recipe spells the method `-D remake`, which v4.9.1
