@@ -36,7 +36,7 @@ static int blur_radius_set = 0;
 /* If set, tune blurcompress parameters from the input image itself. */
 static int auto_blurcompress = 0;
 /* Conservative peak-RSS guard; overridden by --max-mib. */
-static float max_mib = 2048.f;
+static float max_mib = 512.f;
 /* Reconstruction policy for checker/Nyquist-ambiguous cells in the adaptive
    mode.  LOWPASS is the natural-image default; SCALE2X is the crisp pixel-art
    option; AUTO picks between those two from global image statistics. */
@@ -259,24 +259,6 @@ static float dist4_pm(const float a[4], const float b[4]) {
   return d;
 }
 
-static float checker3x3_at_pm(const uint8_t *in, int sw, int sh, int cx, int cy) {
-  float p[9][4];
-  for (int dy = -1; dy <= 1; dy++)
-    for (int dx = -1; dx <= 1; dx++)
-      raw_pm(in, sw, sh, cx + dx, cy + dy, p[(dy + 1) * 3 + (dx + 1)]);
-  float d_corn = fmaxf(fmaxf(dist4_pm(p[0], p[2]), dist4_pm(p[0], p[6])),
-                       fmaxf(dist4_pm(p[0], p[8]), dist4_pm(p[0], p[4])));
-  float d_edge = fmaxf(fmaxf(dist4_pm(p[1], p[3]), dist4_pm(p[1], p[5])),
-                       dist4_pm(p[1], p[7]));
-  float d_cross = dist4_pm(p[4], p[1]);
-  if (d_cross < 1e-8f)
-    return 0.f;
-  float ratio = fmaxf(d_corn, d_edge) / d_cross;
-  float contrast_conf = ramp01(d_cross, 4e-4f, 3e-2f);
-  float pattern_conf = ramp01(ratio, .75f, .20f);
-  return clampf(contrast_conf * pattern_conf, 0.f, 1.f);
-}
-
 static float checker2x2_confidence_pm(float p[4][4]) {
   /* Detect A/B/B/A or B/A/A/B: diagonals match, cross pairs differ. */
   float d03 = dist4_pm(p[0], p[3]), d12 = dist4_pm(p[1], p[2]);
@@ -303,6 +285,24 @@ static void bilinear_sample_pm(const uint8_t *in, int sw, int sh, float sx,
       for (int c = 0; c < 4; c++)
         q[c] += ww * cell[k][c];
     }
+}
+
+static float checker3x3_at_pm(const uint8_t *in, int sw, int sh, int cx, int cy) {
+  float p[9][4];
+  for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++)
+      raw_pm(in, sw, sh, cx + dx, cy + dy, p[(dy + 1) * 3 + (dx + 1)]);
+  float d_corn = fmaxf(fmaxf(dist4_pm(p[0], p[2]), dist4_pm(p[0], p[6])),
+                       fmaxf(dist4_pm(p[0], p[8]), dist4_pm(p[0], p[4])));
+  float d_edge = fmaxf(fmaxf(dist4_pm(p[1], p[3]), dist4_pm(p[1], p[5])),
+                       dist4_pm(p[1], p[7]));
+  float d_cross = dist4_pm(p[4], p[1]);
+  if (d_cross < 1e-8f)
+    return 0.f;
+  float ratio = fmaxf(d_corn, d_edge) / d_cross;
+  float contrast_conf = ramp01(d_cross, 4e-4f, 3e-2f);
+  float pattern_conf = ramp01(ratio, .75f, .20f);
+  return clampf(contrast_conf * pattern_conf, 0.f, 1.f);
 }
 
 static int upscale_kernel(const uint8_t *in, int sw, int sh, uint8_t *out,
@@ -905,6 +905,7 @@ static int alloc_class_map(class_map_t *cm, int sw, int sh) {
 }
 
 /* 2x2 checker confidence over the four cells that touch pixel (cx,cy). */
+
 static float checker2x2_near(const uint8_t *in, int sw, int sh, int cx,
                              int cy) {
   float best = 0.f;
@@ -1163,8 +1164,8 @@ static int build_class_map(const uint8_t *in, int sw, int sh, class_map_t *cm) {
         float flip_conf = ramp01(flip_ratio, .40f, .80f);
 
         float line_conf = 1.f - ramp01(residual, .012f, .07f);
-        float plane_conf = 1.f - ramp01(plane_mse, .020f, .085f);
-        float plane_r2_conf = ramp01(plane_r2, .25f, .70f);
+        float plane_conf = 1.f - ramp01(plane_mse, .010f, .045f);
+        float plane_r2_conf = ramp01(plane_r2, .55f, .85f);
         float parity_dom = ramp01(checker_r2 - plane_r2, .03f, .20f);
         float endpoint_conf = ramp01(endpoint, .48f, .78f);
         float range_conf = ramp01(tmax - tmin, .35f, .75f);
@@ -1180,7 +1181,7 @@ static int build_class_map(const uint8_t *in, int sw, int sh, class_map_t *cm) {
         if (chk2 > checker_ev)
           checker_ev = chk2;
         checker_conf = contrast_conf * checker_ev;
-        junction_conf = contrast_conf * (1.f - fmaxf(line_conf, plane_conf)) *
+        junction_conf = contrast_conf * (1.f - line_conf * plane_conf) *
                         (1.f - checker_ev);
         float plane_q =
             plane_conf > plane_r2_conf ? plane_conf : plane_r2_conf;
@@ -1431,10 +1432,7 @@ static void mitchell_bounded_sample(const uint8_t *in, int sw, int sh,
    only non-inventing choice is to remove the aliased band outright. */
 static float *alloc_lowpass_pm(const uint8_t *in, int sw, int sh,
                                float sigma) {
-  /* v4.9.3: cap raised from 8 to 32 so large user-pinned sigmas (e.g.
-     -r 6) get their full kernel support instead of a hard truncated
-     Gaussian that re-quantizes the source lattice into staircase. */
-  int r = clampi((int)ceilf(3.f * sigma), 1, 32);
+  int r = clampi((int)ceilf(3.f * sigma), 1, 32); /* v4.9.3: raised 8->32 */
   size_t n = (size_t)sw * sh;
   float *tmp = malloc(n * 4 * sizeof *tmp), *dst = malloc(n * 4 * sizeof *dst);
   float *ker = malloc((size_t)(2 * r + 1) * sizeof *ker);
@@ -2063,16 +2061,11 @@ static float kernel_profile_1d(int kind, float sigma, float x) {
   }
 }
 
-/* v4.9.3: cap raised 8 -> 32.  The old cap truncated the Gaussian/B-spline
-   tails whenever sigma > ~2.7 (Gaussian: 3*2.7=8), producing a hard-edged
-   effective kernel that re-quantized the source lattice into visible
-   staircase on diagonal contours.  At sigma=6 the old cap captured ~82% of
-   the Gaussian mass; the new cap captures ~100%. */
 static int kernel_support_1d(int kind, float sigma) {
   switch (kind) {
   case BK_BOX: {
     float h = 1.5f * sigma;
-    return clampi((int)ceilf(h < 1.f ? 1.f : h), 1, 8);
+    return clampi((int)ceilf(h < 1.f ? 1.f : h), 1, 32);
   }
   case BK_TRIANGLE: {
     float s = 1.1f * sigma + .5f;
@@ -2082,11 +2075,11 @@ static int kernel_support_1d(int kind, float sigma) {
     float s = .9f * sigma + .25f;
     if (s < 1.05f)
       s = 1.05f;
-    return clampi((int)ceilf(2.f * s), 1, 8);
+    return clampi((int)ceilf(2.f * s), 1, 32);
   }
   default: {
     float s = sigma < .7f ? .7f : sigma;
-    return clampi((int)ceilf(3.f * s), 1, 8);
+    return clampi((int)ceilf(3.f * s), 1, 32);
   }
   }
 }
@@ -2256,8 +2249,12 @@ static float measure_edge_width30(const uint8_t *img, int w, int h,
 static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
                                  float *sigma, int *ck, float *cp) {
   int tw = sw / 2, th = sh / 2;
-  if (tw < 8 || th < 8)
+  if (tw < 4 || th < 4) {
+    /* Too small for the 2x validation proxy: keep defaults. */
+    *kk = *kk == BK_AUTO ? BK_GAUSSIAN : *kk;
+    *ck = *ck == CK_AUTO ? CK_LINEAR : *ck;
     return 1;
+  }
   uint8_t *train = downsample_pm_box(in, sw, sh, tw, th);
   uint8_t *recon = malloc((size_t)sw * sh * 4);
   if (!train || !recon) {
@@ -2266,20 +2263,7 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
     return 0;
   }
   static const int kernels[] = {BK_BOX, BK_TRIANGLE, BK_GAUSSIAN, BK_BSPLINE};
-  /* When the user pins -r, that value is the ONLY sigma candidate (the
-     fixed grid below would skip every entry if the pinned value is not in
-     it, leaving kernel/curve fitting entirely bypassed). */
-  float pinned_sigma[1] = { *sigma };
-  const float *sigmas;
-  size_t n_sigmas;
-  static const float sigma_grid[] = {.15f, .30f, .50f, .75f, 1.10f, 1.60f};
-  if (blur_radius_set) {
-    sigmas = pinned_sigma;
-    n_sigmas = 1;
-  } else {
-    sigmas = sigma_grid;
-    n_sigmas = sizeof sigma_grid / sizeof sigma_grid[0];
-  }
+  static const float sigmas[] = {.15f, .30f, .50f, .75f, 1.10f, 1.60f};
   static const struct {
     int kind;
     float param;
@@ -2292,24 +2276,29 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
   int best_c = *ck == CK_AUTO ? CK_LINEAR : *ck;
   double best = 1e300;
 
-  int n_sig = blur_radius_set ? 1 : (int)(sizeof sigmas / sizeof sigmas[0]);
+  /* Stage 1: kernel + sigma with a linear gradient curve.  Record every
+     candidate score, then apply the smoothness prior: among candidates
+     within 3% of the raw best (statistical ties -- the MSE-vs-sharp-target
+     criterion cannot see blockiness) pick the largest sigma and then the
+     smoothest kernel family. */
   double s1[4 * 6];
   for (size_t i = 0; i < sizeof s1 / sizeof s1[0]; i++)
     s1[i] = -1.0;
   for (size_t ki = 0; ki < sizeof kernels / sizeof kernels[0]; ki++) {
     if (*kk != BK_AUTO && kernels[ki] != *kk)
       continue;
-    for (int si = 0; si < n_sig; si++) {
-      float sig_cand = blur_radius_set ? *sigma : sigmas[si];
-      if (!render_soft(train, tw, th, recon, sw, sh, kernels[ki], sig_cand,
+    for (size_t si = 0; si < sizeof sigmas / sizeof sigmas[0]; si++) {
+      if (blur_radius_set && fabsf(sigmas[si] - *sigma) > 1e-6f)
+        continue;
+      if (!render_soft(train, tw, th, recon, sw, sh, kernels[ki], sigmas[si],
                        CK_LINEAR, 0.f))
         continue;
       double score = image_pm_mse(recon, in, sw, sh, 2);
-      s1[ki * n_sigmas + si] = score;
+      s1[ki * 6 + si] = score;
       if (score < best) {
         best = score;
         best_k = kernels[ki];
-        best_s = sig_cand;
+        best_s = sigmas[si];
       }
     }
   }
@@ -2319,21 +2308,25 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
     for (size_t ki = 0; ki < sizeof kernels / sizeof kernels[0]; ki++) {
       if (*kk != BK_AUTO && kernels[ki] != *kk)
         continue;
-      for (int si = 0; si < n_sig; si++) {
-        float sig_cand = blur_radius_set ? *sigma : sigmas[si];
+      for (size_t si = 0; si < sizeof sigmas / sizeof sigmas[0]; si++) {
+        if (blur_radius_set && fabsf(sigmas[si] - *sigma) > 1e-6f)
+          continue;
         double score = s1[ki * 6 + si];
         if (score <= 0 || score > thr)
           continue;
         int rank = kernel_smooth_rank(kernels[ki]);
-        if (sig_cand > best_s + 1e-6f ||
-            (fabsf(sig_cand - best_s) <= 1e-6f && rank > brank)) {
-          best_s = sig_cand;
+        if (sigmas[si] > best_s + 1e-6f ||
+            (fabsf(sigmas[si] - best_s) <= 1e-6f && rank > brank)) {
+          best_s = sigmas[si];
           best_k = kernels[ki];
           brank = rank;
         }
       }
     }
   }
+  /* Stage 2: gradient curve family + parameter.  Same near-tie policy:
+     `nearest` (hard step) must win outright by >3%, otherwise the smoothest
+     tied family is kept. */
   if (*ck != CK_AUTO || best == 1e300) {
     best_c = *ck == CK_AUTO ? best_c : *ck;
   } else {
@@ -2349,6 +2342,11 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
       if (!render_soft(train, tw, th, recon, sw, sh, best_k, best_s,
                        curves[ci].kind, curves[ci].param))
         continue;
+      /* Validation MSE is blind to blockiness/sawtooth at large scales:
+         steep curves + a floored kernel track the source staircase at any
+         scale and score equally well.  Penalize the warp's maximum slope,
+         so a steep curve must *truly* fit better (pixel art, where the MSE
+         gap is huge), and smooth content always renders smooth. */
       float steep = 0.f;
       for (int g = 0; g < 64; g++) {
         float u0 = (float)g / 64.f, u1 = (float)(g + 1) / 64.f;
@@ -2509,2650 +2507,19 @@ static void sample_pm(const uint8_t *img, int w, int h, float x, float y,
    (inverted steepness semantics: 1=max deblur, higher=less deblur;
    whole-image consistent filter, no case-specific safety gates). */
 static int deblur_method = 0;
-static int disable_safety_gates = 0;
 static float deblur_steepness = 0.f; /* <=0: auto (-e adaptive or -s formula) */
-/* v4.9.3 texture-residual gain (AUTODEBLUR_NOTES queue #1): opt-in hull-
-   clamped crispening of lattice detail in model-off, directed windows.
-   Default 0 (off) -- on diffusion art the deblur's job is to CLEAN salt, and
-   a crispening amplifies it; this flag is for explicit clean-lattice content
-   (pixel art upscaled through autoblur, crosshatch, vector lattices) where
-   the user WANTS the lattice crispness back.  Also settable via CELUP_TEXGAIN
-   (CLI value wins). */
-static float deblur_texgain = 0.f;
 static int last_deblur_method = 0;   /* effective method of the last run */
 static float last_deblur_k = 0.f;    /* effective fixed steepness (0=adaptive) */
-static int autodeblur_is_photo = 0; /* set in upscale_autodeblur from class map */
-/* v4.9.3: effective (post-cap) steepness statistics over the actually
-   steepened pixels, so the report cannot claim a k the ramp-width cap
-   overrode. */
+/* v4.9.3: effective (post-cap) steepness statistics */
 static double adb_keff_sum = 0.0, adb_keff_w = 0.0;
 static float adb_keff_max = 0.f;
-static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
-                              int dw, int dh);
-/* Quantization staircase control (v4.9.3): hard pixelated sources
-   (the smiley class) carry ~45-90 quantization levels; heavy base blur
-   turns each level into a soft terrace, and ramp steepening re-crisp
-   the terrace edges into visible bands ("staircase of not fully
-   smoothed pixels").  qconf measures how quantized the source is
-   (0 = natural continuous, 1 = hard few-level pixel art) and gates a
-   normal-direction profile smoothing inside trusted ramp windows:
-   terraces are monotone-ramp noise, texture zones have no ramp fit
-   and stay untouched. */
 static float adb_qconf = 0.f;
 static int adb_noamp = 0, adb_noter = 0;
-/* Source premultiplied-linear channel range: restored plateaus may
-   never extrapolate past colours the source itself proves. */
+static float deblur_texgain = 0.f; /* -T texgain */
 static float adb_srclo[3] = {0.f, 0.f, 0.f}, adb_srchi[3] = {1.f, 1.f, 1.f};
-static float estimate_qconf(const uint8_t *in, int sw, int sh) {
-  uint8_t seen[3][256];
-  memset(seen, 0, sizeof seen);
-  long step = (long)sw * sh / 200000 + 1;
-  for (long k = 0; k < (long)sw * sh; k += step) {
-    const uint8_t *p = in + 4 * k;
-    for (int c = 0; c < 3; c++)
-      seen[c][p[c]] = 1;
-  }
-  int levels = 0;
-  for (int c = 0; c < 3; c++) {
-    int n = 0;
-    for (int v = 0; v < 256; v++)
-      n += seen[c][v];
-    if (n > levels)
-      levels = n;
-  }
-  /* >=160 distinct levels per channel: continuous content, no gate.
-     <=64: hard-quantized (45-level dithered art reads ~45-90 after
-     lossy round-trips). */
-  return ramp01((160.f - (float)levels) * (1.f / 96.f), 0.f, 1.f);
-}
-/* Standard-normal CDF (libm erff). */
-static float phi1(float z) { return .5f * (1.f + erff(z * 0.70710678f)); }
-/* v4.9.8: inverse normal CDF Phi^-1(p), p in (0,1) -- Acklam's
-   rational approximation (max abs error ~3e-9 in z, far below the
-   1/255 output quantum).  Used by the erf-gain post-map. */
-static float probit01(float p) {
-  static const float a[6] = {-3.969683028665376e+01f,
-                             2.209460984245205e+02f,
-                             -2.759285104469687e+02f,
-                             1.383577518672690e+02f,
-                             -3.066479806614716e+01f,
-                             2.506628277459239e+00f};
-  static const float b[5] = {-5.447609879822406e+01f,
-                             1.615858368580409e+02f,
-                             -1.556989798598866e+02f,
-                             6.680131188771972e+01f,
-                             -1.328068155288572e+01f};
-  static const float c[6] = {-7.784894002430293e-03f,
-                             -3.223964580411365e-01f,
-                             -2.400758277161838e+00f,
-                             -2.549732539343734e+00f,
-                             4.374664141464968e+00f,
-                             2.938163982698783e+00f};
-  static const float d[4] = {7.784695709041462e-03f,
-                             3.224671290700398e-01f,
-                             2.445134137142996e+00f,
-                             3.754408661907416e+00f};
-  const float plow = .02425f, phigh = 1.f - .02425f;
-  if (p <= 1e-6f)
-    return -4.7534f; /* phi1(-4.7534) ~ 1e-6 */
-  if (p >= 1.f - 1e-6f)
-    return 4.7534f;
-  if (p < plow) {
-    float q = sqrtf(-2.f * logf(p));
-    return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) *
-                q +
-            c[5]) /
-           ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.f);
-  }
-  if (p <= phigh) {
-    float q = p - .5f, r = q * q;
-    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) *
-                r +
-            a[5]) *
-           q /
-           (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) *
-                r +
-            1.f);
-  }
-  {
-    float q = sqrtf(-2.f * logf(1.f - p));
-    return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) *
-                 q +
-             c[5]) /
-            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.f);
-  }
-}
+static int autodeblur_is_photo = 0; /* set in upscale_autodeblur from class map */
 
-/* v4.9.6 dip/line-profile helper: the box(h)-gauss(sig) dip shape,
-   normalized to 1 at the centre (p = |position - line centre|). */
-static float dipnorm(float p, float h, float sig) {
-  if (p < 0.f)
-    p = -p;
-  if (h < 0.f)
-    h = 0.f;
-  if (sig < .05f)
-    sig = .05f;
-  float den = 2.f * phi1(h / sig) - 1.f;
-  if (den < 1e-3f) { /* h << sig: gaussian-limit bump */
-    float z = p / sig;
-    return expf(-.5f * z * z);
-  }
-  return (phi1((p + h) / sig) - phi1((p - h) / sig)) / den;
-}
-
-/* Half-width calibration: the |du|-weighted flank centroids of a
-   blurred line sit at the half-depth points of the box-gauss dip,
-   z*(r) sigma from centre, with r = true half-width / sigma.  For
-   r << 1 z* -> 1.177 (gaussian half-max); for r >> 1 z* -> r.  LUT
-   maps the observed half-span q (= z*) back to r. */
-#define ZSTAR_N 1024
-static float zstar_r[ZSTAR_N], zstar_z[ZSTAR_N];
-static int zstar_ready = 0;
-static void zstar_init(void) {
-  if (zstar_ready)
-    return;
-  for (int i = 0; i < ZSTAR_N; i++) {
-    float r = .02f * powf(400.f, (float)i / (float)(ZSTAR_N - 1));
-    float target = phi1(r) - .5f; /* dip(0)/2 */
-    float lo = 0.f, hi = r + 5.f;
-    if (target < 1e-4f) {
-      zstar_z[i] = 1.17741f;
-    } else {
-      for (int it = 0; it < 60; it++) {
-        float z = .5f * (lo + hi);
-        float du = phi1(z + r) - phi1(z - r);
-        if (du > target)
-          lo = z;
-        else
-          hi = z;
-      }
-      zstar_z[i] = .5f * (lo + hi);
-    }
-    zstar_r[i] = r;
-  }
-  zstar_ready = 1;
-}
-static float r_from_zstar(float q) {
-  zstar_init();
-  if (q <= zstar_z[0])
-    return zstar_r[0];
-  int lo = 0, hi = ZSTAR_N - 1;
-  while (hi - lo > 1) {
-    int mid = (lo + hi) / 2;
-    if (zstar_z[mid] <= q)
-      lo = mid;
-    else
-      hi = mid;
-  }
-  float t = (q - zstar_z[lo]) / (zstar_z[hi] - zstar_z[lo] + 1e-9f);
-  return zstar_r[lo] + clampf(t, 0.f, 1.f) * (zstar_r[hi] - zstar_r[lo]);
-}
-/* v6: trust gate further widened .04/.30 (was .03/.10 then .04/.22);
-   narrow gate zeroed many wide-blur fits (r=6) -> parameter ignoring.
-   Wide blur needs higher hi to keep fits. */
-static float trust_lo = .04f, trust_hi = .30f; /* debug override: CDG=lo,hi */
-static float ss01(float z) {
-  z = clampf(z, 0.f, 1.f);
-  return z * z * (3.f - 2.f * z);
-}
-/* 3-parameter weighted profile fit on a projection line:
-   y = *A + *C*z + *B*phi(z), z = (j - R - mu)/s, weights wj over
-   [dl..dr].  Linear baseline = shading content; phi = the step to
-   deblur.  Degenerate pivot falls back to the 2-param amplitude fit. */
-static void lsq_profile(const float *raw, const float *wj, int dl, int dr,
-                        double mu, float s, int R, float *A, float *C,
-                        float *B) {
-  double sw = 0, sz = 0, szz = 0, sp = 0, spp = 0, szp = 0, sy = 0,
-         szy = 0, spy = 0;
-  float a = 0.f, b = 1.f, c = 0.f;
-  for (int j = dl; j <= dr; j++) {
-    if (wj[j] <= 1e-9f)
-      continue;
-    double z = (j - R - mu) / s, p = phi1((float)z), yv = raw[j],
-           w2 = wj[j];
-    sw += w2;
-    sz += w2 * z;
-    szz += w2 * z * z;
-    sp += w2 * p;
-    spp += w2 * p * p;
-    szp += w2 * z * p;
-    sy += w2 * yv;
-    szy += w2 * z * yv;
-    spy += w2 * p * yv;
-  }
-  /* v4.9.3: the plateau bound must follow the DATA, not a fixed
-     [-1,2]: line interiors attenuated by the base blur can sit far
-     outside those units (smiley mouth windows read raw [-1.6..1.1]),
-     and a clamped-short plateau inflates the fit rmse exactly on the
-     pixels the plateau-restoration path most needs evidence from --
-     they fell out of the trust gate and rendered as barcode teeth.
-     Bounds = observed window range plus a quarter-margin each side
-     (the fit may still extrapolate model tails, never wildly). */
-  float rmin = 1e30f, rmax = -1e30f;
-  for (int j = dl; j <= dr; j++) {
-    if (wj[j] <= 1e-9f)
-      continue;
-    if (raw[j] < rmin)
-      rmin = raw[j];
-    if (raw[j] > rmax)
-      rmax = raw[j];
-  }
-  float alo = rmin - .25f * (rmax - rmin), ahi = rmax + .25f * (rmax - rmin);
-  if (ahi - alo < .1f) {
-    ahi = rmax + .05f;
-    alo = rmin - .05f;
-  }
-  double m00 = sw, m01 = sz, m02 = sp, m11 = szz, m12 = szp, m22 = spp,
-         c00 = m11 * m22 - m12 * m12, c01 = m02 * m12 - m01 * m22,
-         c02 = m01 * m12 - m02 * m11, c11 = m00 * m22 - m02 * m02,
-         c12 = m01 * m02 - m00 * m12, c22 = m00 * m11 - m01 * m01,
-         det = m00 * c00 + m01 * c01 + m02 * c02;
-  if (fabs(det) > 1e-9 * sw * sw * sw && sw > 1e-9) {
-    a = (float)((sy * c00 + szy * c01 + spy * c02) / det);
-    c = clampf((float)((sy * c01 + szy * c11 + spy * c12) / det), -.3f,
-               .3f);
-    b = clampf((float)((sy * c02 + szy * c12 + spy * c22) / det), .25f,
-               4.f);
-    a = clampf(a, alo, ahi);
-  } else if (sw * m22 - sp * sp > 1e-12 && sw > 1e-9) {
-    double d2p = sw * m22 - sp * sp;
-    a = clampf((float)((sy * m22 - sp * spy) / d2p), alo, ahi);
-    b = clampf((float)((sw * spy - sp * sy) / d2p), .25f, 4.f);
-  }
-  *A = a;
-  *C = c;
-  *B = b;
-}
-
-/* autodeblur core pass (v4.8: ANCHORED single-lobe profile steepening).
-
-   The v4.3..v4.6 pass steepened each channel independently toward
-   per-channel box-window extremes (hue inversion, boxy halos);
-   v4.7 introduced the 4D single-gradient sampling and the analytic
-   erf/pulse fit, but evaluated the steepened curve by inverting the
-   pixel's COLOUR: nu = phi(k * phi^-1(u_px)).  Review forensics:
-   - d(nu)/du = k at the ramp centre, so any pixel sitting epsilon off
-     the fitted curve rendered k*epsilon off -> outstanding pixels at
-     gradient centres;
-   - near plateaus phi^-1 explodes, turning flat noise into a colour
-     halo that starts at a line's centre and dies near its edge;
-   - one window-wide fit spanning a thin line mixed BOTH flanks and
-     BOTH backgrounds into one phantom step centred mid-line ("2
-     gradients surrounding the edge combined instead of not going
-     further than each other") -> snake-tongue forks at line caps;
-   - every output was snapped onto the fit's 1D colour segment,
-     discarding the orthogonal colour component -> "watered away
-     colors".
-
-   v4.8 keeps the v4.7 sampling (ONE gradient direction per pixel for
-   the whole premultiplied RGBA vector; tangentially averaged line
-   samples) but changes fit domain and evaluation:
-   - LOBE MAP: |du| along the normal is segmented into transition
-     lobes.  Each pixel is assigned its nearest lobe; plateau colours,
-     centre mu and width s come from THAT lobe alone with one-sided
-     margins clipped at neighbouring lobes -- two flanks and two
-     backgrounds never enter one fit.
-   - ANCHORED EVALUATION: the steepened fit is evaluated at the
-     pixel's GEOMETRIC position on the normal (t = 0), and the pixel's
-     own residual to the unsteepened fit is re-added with GAIN 1:
-     out = F_k(0) + (o - F(0)).  On-curve pixels steepen exactly by k;
-     off-curve deviations (texture, hue arcs, dither, alpha) pass
-     through unamplified; line interiors and plateaus evaluate to
-     plateau + residual = identity, so misassignment is never an
-     artifact.  Consequence: float steepness is now safe far beyond 8
-     (-g accepts 1..64), still capped so output ramps keep >= .6 px
-     sigma (no re-aliased sawtooth).
-   - MULTI-CROSSING trust replaces the beta2 gate: per-lobe fits are
-     all locally good inside dense texture, so suppression counts
-     hysteresis mid-level crossings over the whole window (step = 1,
-     one line = 2: full trust; 4+: crosshatch/hair-clump/text fades to
-     zero), beside the erf-RMSE-over-domain trust gate.
-   -D method 1 (remap): evaluate the slope-steepened fit at t = 0.
-   -D method 2 (push):  evaluate the ORIGINAL fit at a position
-     displaced toward the nearer plateau by (ufit-.5)(k-1)*s*1.5/s --
-     the Anime4K heightmap push in analytic form.
-
-   v4.9 review forensics (smiley test: rounded corners + smooth "neon"
-   glow around lines):
-   - CORNER ROUNDING: both tangential mechanisms (line-sample averaging
-     and pass-2 delta smoothing) assume the contour is translation-
-     invariant along its tangent.  At corners/tips that premise fails:
-     taps run AROUND the corner, the radial fit is diluted and the
-     sharpened edge is dissolved into an arc.  Fix: junction measure
-     rho = lambda2/lambda1 from the SAME structure tensor scales the
-     tangent span and the pass-2 tap weights -- a corner keeps its own
-     radial fit and stays sharp; straight contours are untouched.
-   - NEON GLOW (v4.9.1 redo): v4.9 "fixed" the skirt by rendering the
-     base at sigma r/min(K,8); the user rejected that instantly: the
-     crisp base brought the lattice staircase (-r 6 exists exactly to
-     blur it away), per-tread speckle and forked caps back.  The real
-     mechanism of the dark pre-edge band: the clamped projection kills
-     ramp tails whenever the window is narrower than the blur, and a
-     pure erf cannot represent step-on-linear-shading, so the fit
-     dragged whole shading gradients to a flat plateau colour.  v4.9.1
-     keeps the base at sigma R and fixes the FIT: raw (unclamped)
-     projection restores the tails, a linear+erf LS keeps shading in
-     the gain-1 residual, the drag amplitude is the locally proven
-     one-sided plateau span (robust against LS phi/linear degeneracy
-     BOTH ways), and a step-evidence coverage gate mutes fits where
-     the window does not contain the modelled transition.
-   - CONTOUR CONSENSUS: raw per-pixel fits misplaced mu by 1-2 out px
-     near wedge apexes (cornerstar48); anchored evaluation amplified
-     that ~k into +-0.25 colour deltas with alternating sign, and
-     delta transport pushed pixels outside the locally observed
-     colours.  Fix: pass 1.5 integrates the wS-weighted fit parameters
-     along the (junction-aware) tangent and re-derives z/k/nu from the
-     consensus; plus a convex-hull output clamp (deblur has no ringing
-     vocabulary), quantized in DISPLAY space. */
-/* Bilinear sampler for float4 fields (used for the tangential
-   anti-jitter smoothing of the model delta below). */
-static void sample_f4(const float *img, int w, int h, float x, float y,
-                      float q[4]) {
-  int ix = (int)floorf(x), iy = (int)floorf(y);
-  float fx = x - (float)ix, fy = y - (float)iy;
-  q[0] = q[1] = q[2] = q[3] = 0.f;
-  for (int j = 0; j < 2; j++)
-    for (int i = 0; i < 2; i++) {
-      float ww = (i ? fx : 1.f - fx) * (j ? fy : 1.f - fy);
-      const float *p =
-          img + 4 * ((size_t)clampi(iy + j, 0, h - 1) * w +
-                     clampi(ix + i, 0, w - 1));
-      for (int c = 0; c < 4; c++)
-        q[c] += ww * p[c];
-    }
-}
-
-/* Bilinear sampler for interleaved nc-channel float fields (the v4.9
-   fit-parameter field). */
-static void sample_fn(const float *img, int w, int h, int nc, float x,
-                      float y, float *q) {
-  int ix = (int)floorf(x), iy = (int)floorf(y);
-  float fx = x - (float)ix, fy = y - (float)iy;
-  for (int c = 0; c < nc; c++)
-    q[c] = 0.f;
-  for (int j = 0; j < 2; j++)
-    for (int i = 0; i < 2; i++) {
-      float ww = (i ? fx : 1.f - fx) * (j ? fy : 1.f - fy);
-      const float *p =
-          img + (size_t)nc * ((size_t)clampi(iy + j, 0, h - 1) * w +
-                              clampi(ix + i, 0, w - 1));
-      for (int c = 0; c < nc; c++)
-        q[c] += ww * p[c];
-    }
-}
-static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
-                           int method, const uint8_t *in, int sw, int sh) {
-  size_t n = (size_t)dw * dh;
-  float *A = malloc(n * 4 * sizeof *A);
-  float *DEL = malloc(n * 4 * sizeof *DEL);  /* flat + model colour delta */
-  /* v4.9 fit-parameter field, wS-weighted: [wS, wS*mu, wS*s, wS*d2x4,
-     coh, tanx, tany, wS*off0x4, wS*off1x4] (18 floats/px; off0/off1 are
-     the v4.9.3 narrow-feature plateau-restoration deltas).  Pass 1.5
-     integrates it ALONG THE CONTOUR so each pixel is rendered from a
-     contour-consensus fit instead of its own jittering 1D fit
-     (near-apex windows misplace mu by 1-2 out px and raw per-pixel
-     deltas swung +-0.25 with alternating sign). */
-  float *PF = malloc(n * 25 * sizeof *PF);
-  uint8_t *LOH = malloc(n * 8);              /* local hull, u8/chan    */
-  uint8_t *dst = malloc(n * 4);
-  float *ZM = calloc(n, sizeof *ZM); /* v4.9.8 erf-gain map weight/px */
-  if (!A || !DEL || !PF || !LOH || !dst || !ZM) {
-    free(A);
-    free(DEL);
-    free(PF);
-    free(LOH);
-    free(dst);
-    free(ZM);
-    return 0;
-  }
-  for (int y = 0; y < dh; y++)
-    for (int x = 0; x < dw; x++) {
-      float q[4];
-      raw_pm(out, dw, dh, x, y, q);
-      for (int c = 0; c < 4; c++)
-        A[4 * ((size_t)y * dw + x) + c] = q[c];
-    }
-  {
-    const char *cdg = getenv("CDG");
-    if (cdg)
-      sscanf(cdg, "%f,%f", &trust_lo, &trust_hi);
-    /* forensics isolation knobs: CELUP_NOAMP=1 disables narrow-
-       feature amplitude restoration, CELUP_NOTER=1 disables the
-       terrace cleanup. */
-    if (getenv("CELUP_NOAMP"))
-      adb_noamp = 1;
-    if (getenv("CELUP_NOTER"))
-      adb_noter = 1;
-    if (getenv("CELUP_NOGATES"))
-      disable_safety_gates = 1;
-  }
-  /* sref = ASSUMED source blur (window sizing, shading gate).  When the
-     reconstruction sigma was decoupled (v4.9) the assumed value is kept
-     separately: fitted_sigma is then the (smaller) base-render sigma. */
-  float sref0 = adb_assumed_sigma > 0.f ? adb_assumed_sigma : fitted_sigma;
-  float sref = sref0 > 1.f ? sref0 : 1.f;
-  int wide = scale * sref > 4.001f;
-  int R = wide ? clampi((int)(1.25f * scale * sref + .5f), 2, 64)
-               : clampi((int)(1.25f * scale + .5f), 2, 12);
-  int NS = 2 * R + 1; /* R <= 64 -> NS <= 129 */
-  /* v6: k from -s up to 16 (was 3 then 8) so -s 100 keeps effect;
-     manual -g still wins but cap looser. */
-  float kbase = deblur_steepness > 0.f
-                    ? deblur_steepness
-                    : clampf(1.f + .25f * (compress_strength - 1.f), 1.f, 16.f);
-  if (autodeblur_is_photo) {
-    /* for photos, don't quantize gradients into plateaus: cap k to 2.2 (was up to 16) */
-    kbase = fminf(kbase, 2.2f);
-  }
-  last_deblur_k = deblur_steepness > 0.f   ? deblur_steepness
-                  : edge_goal > 0.f        ? 0.f
-                                           : kbase;
-  adb_keff_sum = adb_keff_w = 0.0;
-  adb_keff_max = 0.f;
-  /* Shading close-gate on the fitted ramp sigma s (output px):
-     transitions far wider than a fitted-blur ramp are content softness.
-     Smooth LINEAR shading is inert regardless -- its fitted mu is ~0
-     and u_px ~.5, so the fit reproduces it unchanged. */
-  float sa = 1.3f * scale * sref, sb = 2.4f * scale * sref;
-  float flatmix = .25f; /* diffusion-noise flattening in gate-zero zones */
-  /* v6: T max 8 (was 6) to keep tangential averaging effective at wide r=6 */
-  int T = clampi((int)(scale * .75f + .35f * sref + .5f), 1, 8);
-  {
-    const char *e = getenv("CELUP_TSPAN");
-    if (e) {
-      float tm = strtof(e, 0);
-      if (tm > 0.f)
-        T = clampi((int)((float)T * tm + .5f), 1, 8);
-    }
-  }
-  /* per-fit diagnostic dump: CELUP_DBG=x,y prints the fit internals for
-     pixels near (x,y) (step 4 px) */
-  int dbg = 0, dbg_x = 96, dbg_y = 96;
-  {
-    const char *e = getenv("CELUP_DBG");
-    if (e) {
-      dbg = 1;
-      sscanf(e, "%d,%d", &dbg_x, &dbg_y);
-    }
-  }
-  /* EXPERIMENTAL KNOBS (env-overridable; defaults match v4.9.2).  Used to
-     tune the multi-crossing trust gate without recompiling, then pinned. */
-  float cross_off = 2.25f, cross_span = 2.5f;
-  {
-    const char *e = getenv("CELUP_CROSSGATE");
-    if (e)
-      sscanf(e, "%f,%f", &cross_off, &cross_span);
-  }
-  /* v4.9.3 texture-residual gain (AUTODEBLUR_NOTES queue #1).  In windows
-     where the 1D step model is OFF (wS ~ 0 -- dense multi-crossing texture,
-     crosshatch, hair, text), the pixel currently keeps the autoblur base,
-     which the fitted sigma softened.  A small hull-clamped crispening of the
-     BASE's own local detail recovers that lattice texture LEGALLY: it never
-     amplifies the model residual (invariant #2 holds -- it is a separate,
-     model-off channel), it is clamped to the local window hull (invariant
-     #1: no ringing vocabulary), and it only fires where the deblur step
-     model itself abstained (clean edges, shaded ramps, flats are untouched).
-     CELUP_TEXGAIN = gain (0 disables; ~0.20 recovers crosshatch). */
-  float capfloor = 0.6f;
-  { const char *e = getenv("CELUP_CAPFLOOR");
-    if (e) capfloor = strtof(e, 0); }
-  float texgain = deblur_texgain;
-  {
-    const char *e = getenv("CELUP_TEXGAIN");
-    if (e)
-      texgain = strtof(e, 0);
-  }
-  for (int y = 0; y < dh; y++)
-    for (int x = 0; x < dw; x++) {
-      size_t idx = (size_t)y * dw + x;
-      float o[4];
-      for (int c = 0; c < 4; c++)
-        o[c] = A[4 * idx + c];
-      /* 4D structure tensor from per-channel Sobel taps on A. */
-      int xl = x > 0 ? x - 1 : 0, xr = x + 1 < dw ? x + 1 : dw - 1,
-          yu = y > 0 ? y - 1 : 0, yd = y + 1 < dh ? y + 1 : dh - 1;
-      float Jxx = 0.f, Jxy = 0.f, Jyy = 0.f;
-      for (int c = 0; c < 4; c++) {
-        float gx = A[4 * ((size_t)yu * dw + xr) + c] +
-                   2 * A[4 * ((size_t)y * dw + xr) + c] +
-                   A[4 * ((size_t)yd * dw + xr) + c] -
-                   A[4 * ((size_t)yu * dw + xl) + c] -
-                   2 * A[4 * ((size_t)y * dw + xl) + c] -
-                   A[4 * ((size_t)yd * dw + xl) + c],
-              gy = A[4 * ((size_t)yd * dw + xl) + c] +
-                   2 * A[4 * ((size_t)yd * dw + x) + c] +
-                   A[4 * ((size_t)yd * dw + xr) + c] -
-                   A[4 * ((size_t)yu * dw + xl) + c] -
-                   2 * A[4 * ((size_t)yu * dw + x) + c] -
-                   A[4 * ((size_t)yu * dw + xr) + c];
-        gx *= 1.f / 16.f;
-        gy *= 1.f / 16.f;
-        Jxx += gx * gx;
-        Jxy += gx * gy;
-        Jyy += gy * gy;
-      }
-      float trh = .5f * (Jxx - Jyy),
-            root = sqrtf(trh * trh + Jxy * Jxy),
-            lam = .5f * (Jxx + Jyy) + root;
-      /* v4.9 junction measure rho = lambda2/lambda1: ~0 on a straight
-         contour (translation-invariant ALONG it -- the premise of both
-         tangential line-sample averaging and pass-2 delta smoothing),
-         ->1 at corners/junctions where that premise fails.  coh scales
-         the tangent span and the pass-2 tap weights, so a corner keeps
-         its own radial fit (sharp tip) instead of being dissolved into
-         an arc by taps running around it; straight edges keep the full
-         anti-wobble averaging unchanged. */
-      float lam2 = .5f * (Jxx + Jyy) - root;
-      float rho = lam > 1e-12f ? lam2 / lam : 0.f;
-      /* Gate band tuned so long blurred arcs (rings/corner torture,
-         face contours) keep full tangential averaging and only genuine
-         junctions/tips (rho >= ~.3 on a 3x3 tensor) lose it. */
-      float coh = (disable_safety_gates || method == 3) ? 1.f : (1.f - ss01((rho - .10f) * (1.f / .20f)));
-      float dirx = 1.f, diry = 0.f;
-      if (lam > 1e-12f) {
-        float vx = Jxy, vy = lam - Jxx;
-        if (vx * vx + vy * vy < 1e-18f) {
-          vx = lam - Jyy;
-          vy = Jxy;
-        }
-        float vl = vx * vx + vy * vy;
-        if (vl > 1e-18f) {
-          float inv = 1.f / sqrtf(vl);
-          dirx = vx * inv;
-          diry = vy * inv;
-        }
-      }
-      /* Line samples along the normal, TANGENTIALLY AVERAGED over a
-         small neighborhood perpendicular to it (v4.7 corner-scallop
-         fix): steepening an edge whose source staircase survived the
-         fit would otherwise amplify the source lattice into visible
-         S-wobbles along the contour.  Genuine edges are translation-
-         invariant along their contour, so averaging a few offset
-         normals keeps the profile while erasing the grid-periodic
-         jitter (period ~1 src px). */
-      float tanx = -diry, tany = dirx;
-      /* Coherence-scaled tangent span (v4.9): full T on straight
-         contours, 0 at junctions/corners/tips. */
-      int Teff = (int)((float)T * coh + .5f);
-      /* v4.9.3 EXPERIMENTAL (default OFF): an extra tap of tangential
-         averaging ONLY on genuinely straight contours (coh very high).
-         On long straight diagonals one more tap can erase residual
-         source-lattice staircase; it is gated to coh>0.88 so tips (moderate
-         coh) are not rounded.  Measured AMBIGUOUS on the authoritative
-         check_stairs metric (ship2x 0.111->0.154, still passing) so it
-         stays opt-in via CELUP_STRTAP=1 until a clearer win is shown. */
-      {
-        const char *e = getenv("CELUP_STRTAP");
-        if (e && strtof(e, 0) != 0.f && coh > 0.88f && Teff < 6)
-          Teff += 1;
-      }
-      float C[129][4], u[129], raw[129],
-            lo[4] = {1e30f, 1e30f, 1e30f, 1e30f},
-            hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f},
-            mean[4] = {0, 0, 0, 0};
-      for (int j = 0; j < NS; j++) {
-        float t = (float)(j - R), acc[4] = {0, 0, 0, 0}, wsum = 0.f;
-        /* v4.9.5: Gaussian tangential weights instead of uniform box.
-           Box filter creates hard edges at the tangent span boundary,
-           which can leave mild staircase residues on long diagonals.
-           Gaussian (sigma = Teff*0.6) tapers smoothly, giving center
-           samples more weight and producing cleaner contour averages. */
-        float tsigma = fmaxf((float)Teff * 0.6f, 0.5f);
-        float tinv2 = 1.f / (2.f * tsigma * tsigma);
-        for (int to = -Teff; to <= Teff; to++) {
-          float q[4];
-          sample_pm(out, dw, dh, (float)x + t * dirx + (float)to * tanx,
-                    (float)y + t * diry + (float)to * tany, q);
-          float wt = expf(-(float)(to * to) * tinv2);
-          for (int c = 0; c < 4; c++)
-            acc[c] += wt * q[c];
-          wsum += wt;
-        }
-        float inv = wsum > 1e-20f ? 1.f / wsum : 0.f;
-        for (int c = 0; c < 4; c++) {
-          C[j][c] = acc[c] * inv;
-          mean[c] += C[j][c];
-          if (C[j][c] < lo[c])
-            lo[c] = C[j][c];
-          if (C[j][c] > hi[c])
-            hi[c] = C[j][c];
-        }
-      }
-      float rng = 0.f;
-      for (int c = 0; c < 3; c++)
-        if (hi[c] - lo[c] > rng)
-          rng = hi[c] - lo[c];
-      for (int c = 0; c < 4; c++)
-        mean[c] *= 1.f / NS;
-      /* Endpoint segment (both endpoints are REAL local colours). */
-      int mE = R / 3;
-      if (mE < 1)
-        mE = 1;
-      float CA[4] = {0, 0, 0, 0}, CB[4] = {0, 0, 0, 0}, d[4], L2;
-      for (int j = 0; j < mE; j++)
-        for (int c = 0; c < 4; c++) {
-          CA[c] += C[j][c];
-          CB[c] += C[NS - 1 - j][c];
-        }
-      L2 = 0.f;
-      for (int c = 0; c < 4; c++) {
-        CA[c] /= mE;
-        CB[c] /= mE;
-        d[c] = CB[c] - CA[c];
-        L2 += d[c] * d[c];
-      }
-      /* v4.9: the pixel-level fit parameters (consensus-evaluated in
-         pass 1.5); zero when no fit was made.  offv0/offv1: v4.9.3
-         narrow-feature plateau restoration (channel space). */
-      float wS = 0.f, wS2 = 0.f, frel = 0.f, fmu = 0.f, fs = 0.f,
-            fd2[4] = {0, 0, 0, 0}, offv0[4] = {0, 0, 0, 0},
-            offv1[4] = {0, 0, 0, 0}, Pc0[4] = {0, 0, 0, 0},
-            Pc1[4] = {0, 0, 0, 0};
-      /* v4.9.6 dip/line-class claim (pass 1.5 renders the feature
-         from the shared dip model instead of the fat washed shoulder
-         mid-contour): lW = fire flag, lVX/lVY = image-space vector
-         from the pixel to the line centre (frame-free, so the
-         consensus may average it), lDw = observed dip depth at the
-         centre against this window's own fit, lH = calibrated true
-         half-width in out px. */
-      float lW = 0.f, lVX = 0.f, lVY = 0.f, lDw = 0.f, lH = 0.f;
-      int uflip = 0;
-      if (L2 >= 6.4e-5f) { /* |d| >= .008: not a flat */
-        for (int j = 0; j < NS; j++) {
-          float uu = 0.f;
-          for (int c = 0; c < 4; c++)
-            uu += (C[j][c] - CA[c]) * d[c];
-          raw[j] = uu / L2; /* unclamped: ramp TAILS live here         */
-          u[j] = clampf(raw[j], 0.f, 1.f);
-        }
-        float corr = 0.f;
-        for (int j = 0; j < NS; j++)
-          corr += (float)(j - R) * u[j];
-        if (corr < 0.f) { /* orient u increasing along +t */
-          uflip = 1;
-          for (int j = 0; j < NS / 2; j++) {
-            for (int c = 0; c < 4; c++) {
-              float tmp = C[j][c];
-              C[j][c] = C[NS - 1 - j][c];
-              C[NS - 1 - j][c] = tmp;
-            }
-            float tu = u[j];
-            u[j] = u[NS - 1 - j];
-            u[NS - 1 - j] = tu;
-          }
-          float swp[4];
-          memcpy(swp, CA, sizeof swp);
-          memcpy(CA, CB, sizeof swp);
-          memcpy(CB, swp, sizeof swp);
-          for (int c = 0; c < 4; c++)
-            d[c] = -d[c];
-        }
-        float ul = 0.f, ur = 0.f;
-        for (int j = 0; j < mE; j++) {
-          ul += u[j];
-          ur += u[NS - 1 - j];
-        }
-        ul /= mE;
-        ur /= mE;
-        {
-          /* -------- v4.8: unified single-lobe erf profile fit ------ */
-          /* Lobe map: |du| along the normal is segmented into
-             transition lobes (runs above a relative floor, single-
-             sample dips bridged).  The pixel is assigned its NEAREST
-             lobe; the erf profile is fit on that lobe only, with
-             plateau colours taken one-sided from just outside it and
-             the domain clipped at neighbouring lobes -- a thin line's
-             two flanks and its two backgrounds ("2 gradients
-             surrounding edge") never combine into one phantom step,
-             and shading slopes on the plateaus never dilute the
-             moments.  Misassignment degrades to identity: far from the
-             lobe centre both nu and ufit saturate, so the output is
-             plateau + residual = the original pixel. */
-          float wj[129], wmax = 0.f, th;
-          int jl[16], jr[16], NL = 0;
-          wj[0] = wj[NS - 1] = 0.f;
-          for (int j = 1; j < NS - 1; j++) {
-            wj[j] = fabsf(raw[j + 1] - raw[j - 1]);
-            if (wj[j] > wmax)
-              wmax = wj[j];
-          }
-          th = wmax * .06f;
-          if (th < .004f)
-            th = .004f;
-          for (int j = 1; j < NS - 2 && NL < 16;) {
-            if (wj[j] < th) {
-              j++;
-              continue;
-            }
-            int a = j;
-            /* Run, bridging single-sample dips -- but a SATURATED flat
-               plateau (u pinned at 0/1 while |du| dies) is a hard
-               break: it is the interior of a thin line/tip, and the
-               raw (unclamped) wj keeps sloping there so without this
-               the two flanks merge into one phantom step exactly like
-               the pre-lobe-map days.  A saturated but still-sloping
-               ramp (neck skirt: u pinned, raw still falling) does NOT
-               break -- that tail belongs to the lobe.
-               v4.9.3: an UNSATURATED extremum is a hard break too --
-               where the raw slope reverses with |du| >= th on BOTH
-               sides (a smooth dip/hill bottom, e.g. a line core
-               widened past its plateau by a large -r): a single erf
-               cannot fit rise-then-fall, the rmse trust gate read the
-               victim windows as misfits (.2-.8) and zeroed wS there,
-               which was the -r 6 washout of thin dark lines (the
-               smiley's mouth/eye lines faded to half contrast and
-               steepness knobs went dead on exactly those pixels).
-               Noise reversals never satisfy both-sides-above-th. */
-            while (j + 1 < NS - 1 &&
-                   (wj[j + 1] >= th || (j + 2 < NS - 1 && wj[j + 2] >= th)) &&
-                   !((u[j + 1] <= .002f || u[j + 1] >= .998f) &&
-                     wj[j + 1] < th) &&
-                   !(j + 2 < NS - 1 &&
-                     (raw[j + 2] - raw[j + 1]) * (raw[j] - raw[j - 1]) < 0.f &&
-                     fabsf(raw[j + 2] - raw[j + 1]) >= .10f * wmax &&
-                     fabsf(raw[j] - raw[j - 1]) >= .10f * wmax))
-              j++;
-            jl[NL] = a;
-            jr[NL] = j;
-            NL++;
-            j++;
-          }
-          if (dbg && y == dbg_y && abs(x - dbg_x) <= 8 && (x & 1) == 0) {
-            fprintf(stderr, "DBGP %d,%d NL=%d th=%.4f wmax=%.4f prof:",
-                    x, y, NL, th, wmax);
-            for (int j = R - 6; j <= R + 6; j++)
-              fprintf(stderr, " %d:r%.3f/w%.3f/u%.2f", j - R, raw[j],
-                      wj[j], u[j]);
-            fprintf(stderr, "\n");
-          }
-          if (NL > 0) {
-            /* v4.9.3: per-lobe |du| centroids for ALL lobes (the dip/
-               hill geometry measures need neighbouring flank
-               positions). */
-            float mus[16];
-            for (int q = 0; q < NL; q++) {
-              double Wq = 0., Mq = 0.;
-              for (int j = jl[q]; j <= jr[q]; j++) {
-                Wq += wj[j];
-                Mq += wj[j] * (j - R);
-              }
-              mus[q] = Wq > 1e-9 ? (float)(Mq / Wq) : 0.f;
-            }
-            int li = 0, lbest = INT_MAX;
-            for (int q = 0; q < NL; q++) {
-              int dist = R < jl[q] ? jl[q] - R : R > jr[q] ? R - jr[q] : 0;
-              if (dist < lbest) {
-                lbest = dist;
-                li = q;
-              }
-            }
-            /* Fit domain: lobe + one-sided plateau margins, clipped at
-               neighbouring lobes and window ends. */
-            int dl = jl[li] - mE, dr = jr[li] + mE;
-            if (li > 0 && dl <= jr[li - 1])
-              dl = jr[li - 1] + 1;
-            if (li + 1 < NL && dr >= jl[li + 1])
-              dr = jl[li + 1] - 1;
-            if (dl < 0)
-              dl = 0;
-            if (dr > NS - 1)
-              dr = NS - 1;
-            float P0[4], P1[4], d2[4], Ld2 = 0.f;
-            int n0 = 0, n1 = 0;
-            for (int c = 0; c < 4; c++) {
-              P0[c] = 0.f;
-              P1[c] = 0.f;
-            }
-            for (int j = dl; j <= dr; j++)
-              if (u[j] < .25f) {
-                n0++;
-                for (int c = 0; c < 4; c++)
-                  P0[c] += C[j][c];
-              } else if (u[j] > .75f) {
-                n1++;
-                for (int c = 0; c < 4; c++)
-                  P1[c] += C[j][c];
-              }
-            for (int c = 0; c < 4; c++) {
-              P0[c] = n0 ? P0[c] / n0 : C[jl[li]][c];
-              P1[c] = n1 ? P1[c] / n1 : C[jr[li]][c];
-              d2[c] = P1[c] - P0[c];
-              Ld2 += d2[c] * d2[c];
-            }
-            /* Full-lobe moments (v4.8): |du| centroid and second moment
-               over the whole lobe.  Windowed-moment refinements were
-               tried and rejected: a core-trimmed centroid halves the
-               tail lever arm but starves the width (sigma 6 reads as
-               2.5 -- the fit-trust gate then rejects every clean wide
-               ramp), and the Gaussian truncation inversion is exact
-               only for perfect Gaussians and flaps the gate per pixel.
-               The residual jitter of plain moments shows up only as
-               +/-1 LSB random dither on noisy synthetic ramps and is
-               suppressed where it is coherent: pass-2 tangential
-               smoothing. */
-            double W = 0, mu = 0, sq = 0;
-            for (int j = jl[li]; j <= jr[li]; j++) {
-              W += wj[j];
-              mu += wj[j] * (j - R);
-            }
-            if (Ld2 > 6.4e-5f && W > 1e-9) {
-              mu /= W;
-              for (int j = jl[li]; j <= jr[li]; j++) {
-                double t = j - R - mu;
-                sq += wj[j] * t * t;
-              }
-              float s = (float)sqrt(sq / W), lwm = .5f * (jr[li] - jl[li] + 1);
-              if (s < .3f)
-                s = .3f;
-              if (s > lwm)
-                s = lwm;
-              fmu = (float)mu;
-              fs = s;
-              /* Profile fit (v4.9.1): linear baseline + erf step on the
-                 RAW projection, y = a + c*z + b*phi(z).  The clamped u
-                 destroys ramp TAILS whenever the window is narrower
-                 than the blur (-r 6), and an erf alone cannot represent
-                 step-on-linear-shading: the explicit linear term takes
-                 the baked-in shading so phi only models the step.  The
-                 baseline cancels in v = o + b*(phi(kz)-phi(z))*d, so
-                 shading passes through the residual channel untouched.
-                 (A two-round centroid refinement on the step component
-                 was tried and REMOVED: re-centring mu on y-raw-c*z at
-                 tips/corners moved the fit grid ~.3 px and rounded
-                 them, and the plain single LS already produces a
-                 healthy b once the raw projection restores the ramp
-                 tails to the lobe map.) */
-              float ab_a, ab_b, ab_c;
-              lsq_profile(raw, wj, dl, dr, mu, s, R, &ab_a, &ab_c,
-                          &ab_b);
-              /* Drag amplitude = the one-sided PLATEAU SPAN (v4.8
-                 estimator, robust, shading-free), not the LS b.  On a
-                 soft wide ramp (decouple-reverted base) the 3-param LS
-                 systematically shifts contrast between phi and the
-                 near-parallel linear term, so ab_b reads low (~.7*sp)
-                 at tips and corners -> the render under-drags and
-                 rounds them; and on shaded skirts (-r 6) it can spike
-                 ABOVE the span -> flat-top dark "neon" band.  sp is
-                 the contrast the window itself PROVES between its two
-                 plateaus -- exactly the v4.8/v4.9 fd2 = d2 semantics.
-                 Bounds: nothing when b degenerates, 1.2x span when the
-                 fit spikes. */
-              /* Steepness, decided BEFORE the amplitude restoration
-                 (v4.9.4): the mass-correct restore depth needs the k
-                 the contour will actually be rendered with.  Same
-                 rules as the former inline block: -g pins k exactly
-                 (float, up to 64); -e adapts per edge; -s formula
-                 otherwise; always capped so the OUTPUT ramp never
-                 falls below .6 px sigma (~1.5 px 30% width): no
-                 re-aliased sawtooth, and already-crisp content is
-                 left alone (k -> 1).  A MANUAL -g buys a sharper
-                 floor (.45 px instead of .6): the user explicitly
-                 takes responsibility for the ramp width; auto
-                 steepness stays at the proven alias-free .6.  Either
-                 way the EFFECTIVE k is reported (it was the "ignoring
-                 parameters" lie: summary echoed 64 while the cap
-                 silently rendered ~7). */
-              float k = kbase;
-              if (deblur_steepness <= 0.f && edge_goal > 0.f) {
-                float st = fmaxf(.6f, edge_goal * scale / 2.5f);
-                k = clampf(s / st, 1.f, 16.f);
-              }
-              k = fminf(k, s / .32f);
-              float sp_dbg = -1.f, off0r = 0.f, off1r = 0.f,
-                    bstep = ab_b;
-              for (int c = 0; c < 4; c++) {
-                Pc0[c] = P0[c];
-                Pc1[c] = P1[c];
-              }
-              if (n0 > 0 && n1 > 0) {
-                float sp = 0.f;
-                for (int c = 0; c < 4; c++)
-                  sp += (P1[c] - P0[c]) * d[c];
-                sp /= L2;
-                sp_dbg = sp;
-                /* v4.9.3 narrow-feature amplitude restoration.  The
-                   base blur at sigma ~R attenuates any feature whose
-                   width is not >> sigma: a 4-6 px line at -r 6 keeps
-                   only ~1/erf(w/2.4R) of its contrast, and anchored
-                   steepening (which preserves plateaus) renders the
-                   washout faithfully -- the smiley's mouth faded to
-                   half contrast exactly this way.  Here the window
-                   itself PROVES the geometry: the assigned flank and
-                   its neighbouring flank lobe sit mu_li..mu_nb apart,
-                   so the box-feature attenuation of the base render is
-                   att = erf((w/scale)/(2sqrt2*sigma_b)) and the inner
-                   plateau is corrected toward the outer one by
-                   1/att (capped 1.75x and to [0,1]; without a
-                   neighbouring flank att = 1 = the old behaviour, so
-                   plain edges and unattended texture are untouched).
-                   The correction enters BOTH the saturation zones
-                   (line interiors move to the restored plateau) and
-                   the effective step amplitude below, and the hull is
-                   extended by exactly the corrected plateau. */
-                if (!adb_noamp && coh > .2f)
-                  for (int side = 0; side < 2; side++) {
-                    double iM = 0., oL = 0., oN = 0.;
-                    int nb = side == 0 ? li - 1 : li + 1;
-                    if (nb < 0 || nb >= NL)
-                      continue;
-                    if ((side == 0 ? n0 : n1) < 2)
-                      continue; /* plateau mean from 1 sample: too
-                                   noisy to extrapolate */
-                    /* Flank-pair test: the two lobes must be the TWO
-                       FLANKS OF ONE FEATURE -- the profile between
-                       them then forms an extremum (line interior /
-                       ridge) that is MORE EXTREME than both outer
-                       levels.  Wedge arms and T-junction strokes are
-                       unrelated edges: the gap between them stays
-                       monotone between the outer plateaus and such
-                       pairs are rejected (cornerstar hull regression:
-                       the bright wedge channel was extrapolated to
-                       pure black). */
-                    {
-                      /* Inner level = the plateau samples on the
-                         INNER side (u extreme toward the neighbour);
-                         the lobes often touch (empty gap) while the
-                         interior plateau sits inside the lobe's own
-                         domain (the saturated u=0/u=1 run). */
-                      iM = 0.;
-                      oL = oN = 0.;
-                      int ni = 0, n = 0;
-                      float ulo = side == 0 ? .25f : .75f;
-                      for (int j = dl; j <= dr; j++)
-                        if (side == 0 ? u[j] < ulo : u[j] > ulo) {
-                          iM += raw[j];
-                          ni++;
-                        }
-                      if (ni < 2)
-                        continue;
-                      iM /= ni;
-                      int eA = jr[li] + 1,
-                          eB = jr[li] + mE < NS ? jr[li] + mE : NS - 1,
-                          eC, eD;
-                      eA = jr[li] + 1;
-                      eB = jr[li] + mE < NS ? jr[li] + mE : NS - 1;
-                      if (side == 1) {
-                        int t = jl[li] - mE > 0 ? jl[li] - mE : 0;
-                        eA = t;
-                        eB = jl[li] - 1;
-                      }
-                      for (int j = eA; j <= eB; j++) {
-                        oL += raw[j];
-                        n++;
-                      }
-                      if (n)
-                        oL /= n;
-                      if (side == 0) {
-                        int t = jl[nb] - mE > 0 ? jl[nb] - mE : 0;
-                        eC = t;
-                        eD = jl[nb] - 1;
-                      } else {
-                        eC = jr[nb] + 1;
-                        eD = jr[nb] + mE < NS ? jr[nb] + mE : NS - 1;
-                      }
-                      n = 0;
-                      for (int j = eC; j <= eD; j++) {
-                        oN += raw[j];
-                        n++;
-                      }
-                      if (n)
-                        oN /= n;
-                      /* Saturated interiors: a broad flat at the
-                         window's raw extreme IS the extremum (it is
-                         by construction deeper/higher than everything
-                         else) -- the margin test cannot grade it
-                         because the saturation spills into the
-                         margins themselves. */
-                      float rwmin = 1e30f, rwmax = -1e30f;
-                      for (int j = 0; j < NS; j++) {
-                        if (raw[j] < rwmin)
-                          rwmin = raw[j];
-                        if (raw[j] > rwmax)
-                          rwmax = raw[j];
-                      }
-                      if (!((iM < oL - .02 && iM < oN - .02) ||
-                            (iM > oL + .02 && iM > oN + .02) ||
-                            iM <= rwmin + .02f ||
-                            iM >= rwmax - .02f))
-                        continue;
-                    }
-                    /* v4.9.5 tip entry: the coherence gate (> .85)
-                       disables the restoration at exactly the wedge
-                       tips and tight line ends that need it -- the
-                       bending-contour coherence is low there BY
-                       CONSTRUCTION, so the tip apex was left at the
-                       blurred base (domed/eaten tips, "rounded too
-                       much").  Below the gate, take only flank pairs
-                       whose OUTER levels agree (both arms exit to the
-                       same surround = a genuine dip or wedge tip; a
-                       T-junction arm pairs unequal outsides --
-                       stroke vs paper -- and is rejected as before,
-                       which is the cornerstar bright-channel
-                       regression guard). */
-                    if (coh <= .85f) {
-                      float dd2 =
-                          (float)(fabs(iM - oL) + fabs(iM - oN)) * .5f;
-                      if (fabs(oL - oN) >
-                              .35f * (dd2 > .1f ? dd2 : .1f) ||
-                          coh <= .25f)
-                        continue;
-                    }
-                    float wsrc = fabsf(mus[li] - mus[nb]) / scale;
-                    double sig = fitted_sigma > .3f ? fitted_sigma : .3;
-                    double att =
-                        erf((double)wsrc / (2.8284271 * sig));
-                    /* junction/tip windows misread the flank geometry,
-                       so coherence gates the extrapolation; the cap
-                       keeps the correction strictly inside the source
-                       colour range (cornerstar hull gate). */
-                    float f = att > .20 ? (float)(1.0 / att) : 5.f;
-                    if (f < 1.f)
-                      f = 1.f;
-                    /* v4.9.5 accumulate-mass depth.  Recovering
-                       CONTRAST by 1/att actually claims "the dip's
-                       true depth saturates the source colour range":
-                       fine for genuinely black line art (the clamp
-                       lands at native black) but a washed mid-tone
-                       structure (miya lip line, true depth ~130-170
-                       on a 19 skin field) was blown to pure 255-black
-                       rails -- depth was invented, not accumulated.
-                       The honest deblur ledger: blur conserves the
-                       deficit MASS, so under the box+gauss dip model
-                       observed_mass = depth * (wsrc + 2.83*sig_src)
-                       must equal rendered_mass =
-                       depth' * (wsrc + 2.83*sig_src/k), which pins
-                       the depth multiplier at
-                          f = k (wsrc + t) / (k wsrc + t), t = 2.83 sig_src
-                       -- self-limiting: a shallow wide wash gets
-                       depth~1 (keeps its own level), a point line
-                       gets ~k (full concentration), wide features
-                       are untouched (f -> 1).  Colour is only ever
-                       RECONCENTRATED from the observed wash back into
-                       the stroke, never created. */
-                    {
-                      float t = 2.8284271f * ((float)sig / scale);
-                      float fms = k * (wsrc + t) / (k * wsrc + t);
-                      if (fms > f)
-                        f = fms;
-                    }
-                    if (f > 4.f)
-                      f = 4.f; /* the gates (coherence, extremum +
-                                direction consistency, base-model
-                                saturation membership uf0/uf1 and
-                                value-membership gInn) proved this is
-                                the feature's interior, so the full
-                                1/att depth is safe to CLAIM; the
-                                missing ink on blurred line art is
-                                proportional to 1/att, and capping at
-                                2.25 left -r 6 strokes ~13% ink short
-                                (watercolor).  The source-range clamp
-                                below is still the hard guard */
-                    /* coherence discount: full confidence above the
-                       .85 gate (v4.9.1); below it (v4.9.5 tip entry,
-                       proven symmetric flank pairs only) fade to zero
-                       toward .30 so a barely-admitted cusp gets only
-                       a gentle correction. */
-                    f = 1.f + (f - 1.f) *
-                              (coh > .85f ? 1.f
-                                          : ss01((coh - .30f) *
-                                                 (1.f / .40f)));
-                    if (f <= 1.001f)
-                      continue;
-                  float *Pin = side == 0 ? P0 : P1, *Pout = side == 0 ? P1 : P0,
-                        *Pc = side == 0 ? Pc0 : Pc1, *offv = side == 0 ? offv0 : offv1;
-                  /* Direction-consistency (v4.9.3): f overshoots Pin
-                     along (Pin - Pout); that is only the truth when
-                     the OBSERVED inner samples sit past the fit's own
-                     plateau on exactly that ray.  Degenerate windows
-                     can land an inverted step on the core (fit rises
-                     +2.2 over a dark interior) and f then extrapolates
-                     OUTWARD -- a bright offset inside a dark line
-                     renders as inverted barcode teeth. */
-                  {
-                    float pin_p = 0.f, pout_p = 0.f;
-                    for (int c = 0; c < 4; c++) {
-                      pin_p += Pin[c] * d[c];
-                      pout_p += Pout[c] * d[c];
-                    }
-                    pin_p /= L2;
-                    pout_p /= L2;
-                    if ((pin_p - pout_p) * ((float)iM - pin_p) <= 1e-4f)
-                      continue;
-                  }
-                  for (int c = 0; c < 4; c++) {
-                    Pc[c] = Pout[c] + f * (Pin[c] - Pout[c]);
-                    /* never extrapolate past the colours the SOURCE
-                       itself proves (premultiplied-linear range) */
-                    if (c < 3)
-                      Pc[c] = clampf(Pc[c], adb_srclo[c], adb_srchi[c]);
-                    else
-                      Pc[c] = clampf(Pc[c], 0.f, 1.f);
-                    offv[c] = Pc[c] - Pin[c];
-                  }
-                  /* restoration confidence: the side fired, so the
-                     flank-pair extremum + direction checks all
-                     passed; record it for the pass-1.5 restoration
-                     weight (independent of the erf-tail trust gate:
-                     tent-shaped line profiles misfit the erf ramp
-                     while their PLATEAU is still measured solid) */
-                  wS2 = 1.f;
-                  /* v4.9.6 dip/line-class claim.  Every gate the
-                     plateau restoration passes (extremum sandwich,
-                     direction consistency, coherence) proves these
-                     two flank lobes are ONE feature -- but the erf
-                     step model then tracks the mid-SHOULDER of the
-                     washed tent, which for a narrow line sits
-                     ~(1.2-1.4)s outside the true half-depth contour:
-                     steepening that contour paints the background
-                     ~2 px wide = the bright-field halo (and fat,
-                     rounded line ends).  The dip model replaces the
-                     contour with the line CENTRE and the calibrated
-                     TRUE half-width so the rendered stroke keeps the
-                     source's geometry; first (nearest) firing pair
-                     wins. */
-                  if (lW <= 0.f) {
-                    float muc = .5f * (mus[li] + mus[nb]);
-                    float span = fabsf(mus[li] - mus[nb]);
-                    float sloc = fs > .3f ? fs : .3f;
-                    float hh = r_from_zstar(span / (2.f * sloc)) * sloc;
-                    int jc = (int)lrintf(muc) + R;
-                    if (jc < 0)
-                      jc = 0;
-                    if (jc > NS - 1)
-                      jc = NS - 1;
-                    {
-                      float zj = ((float)(jc - R) - (float)fmu) / sloc;
-                      float Fc = ab_a + ab_c * zj + ab_b * phi1(zj);
-                      float sgn = uflip ? -1.f : 1.f;
-                      lVX = muc * sgn * dirx;
-                      lVY = muc * sgn * diry;
-                      lDw = Fc - raw[jc];
-                      lH = hh;
-                      lW = 1.f;
-                    }
-                  }
-                  /* feature membership BY VALUE for the pass-1.5
-                     gate: how far the pixel's own BASE colour sits
-                     from the inner (this side) plateau relative to
-                     the observed plateau span, all in this window's
-                     own d-projection metric.  ufit saturation cannot
-                     tell line interiors from bright pixels a skirt-
-                     width away (both read plateau-side), but the
-                     base value can: only pixels already near the
-                     inner plateau receive the restoration. */
-                  {
-                    float op = 0.f, p0p = 0.f, p1p = 0.f;
-                    for (int c = 0; c < 4; c++) {
-                      op += (o[c] - CA[c]) * d[c];
-                      p0p += (P0[c] - CA[c]) * d[c];
-                      p1p += (P1[c] - CA[c]) * d[c];
-                    }
-                    op /= L2;
-                    p0p /= L2;
-                    p1p /= L2;
-                    float rel =
-                        p1p - p0p > 1e-3f
-                            ? clampf((op - p0p) / (p1p - p0p), -.2f,
-                                     1.2f)
-                            : .5f;
-                    /* frame-independent INNERNESS: side0's inner
-                       plateau is P0 (rel->0 there), side1's is P1
-                       (rel->1).  Mirrored flank windows of one line
-                       have opposite window frames, so raw rel mixes
-                       to a meaningless 0.5 mid-feature (gates closed
-                       exactly at the core); innerness agrees across
-                       frames: 1 = base colour at the proven inner
-                       plateau, 0 = at the far plateau. */
-                    frel = side == 0 ? 1.f - rel : rel;
-                  }
-                }
-                float cap = fmaxf(sp, .03f) * 1.2f;
-                if (ab_b > cap)
-                  ab_b = cap;
-                if (ab_b < sp)
-                  ab_b = sp;
-                ab_c = clampf(ab_c, -.5f * cap, .5f * cap);
-                for (int c = 0; c < 4; c++) {
-                  off0r += offv0[c] * d[c];
-                  off1r += offv1[c] * d[c];
-                }
-                off0r /= L2;
-                off1r /= L2;
-                /* Effective restored step amplitude (raw units along
-                   d): observed erf step plus the plateau shift
-                   difference.  Clamps live ONLY in this block --
-                   outside it (no two-sided plateaus) fd2 = ab_b*d,
-                   exactly the v4.9.1 behaviour. */
-                bstep = ab_b + off1r - off0r;
-                if (bstep < .25f * ab_b) {
-                  /* nonsense restored span (geometry misread): drop
-                     the restoration rather than flip the step
-                     direction */
-                  bstep = ab_b;
-                  off0r = off1r = 0.f;
-                  wS2 = 0.f;
-                  frel = 0.f;
-                  for (int c = 0; c < 4; c++) {
-                    offv0[c] = 0.f;
-                    offv1[c] = 0.f;
-                    Pc0[c] = P0[c];
-                    Pc1[c] = P1[c];
-                  }
-                }
-                {
-                  /* Restored span: one-sided proof sp plus the plateau
-                     shifts; bstep may use the full restored span but
-                     not more than 1.2x it (same policy as the v4.9.1
-                     ab_b cap, generalised). */
-                  float spe = sp + off1r - off0r;
-                  if (bstep < .03f)
-                    bstep = .03f;
-                  if (bstep > 1.2f * fmaxf(spe, .03f))
-                    bstep = 1.2f * fmaxf(spe, .03f);
-                }
-              }
-              for (int c = 0; c < 4; c++)
-                fd2[c] = bstep * d[c];
-              /* Step-evidence coverage (v4.9.1): a step fit is only
-                 admissible when the WINDOW's observed profile actually
-                 spans the modelled step amplitude [a, a+b].  A pixel
-                 more than R from the true edge sees only a linear
-                 shading slope; fitting a "step" there invents a phantom
-                 knee centred on the window itself and drags the shading
-                 (the dark pre-edge "neon" band).  Shading is shading:
-                 coverage < ~.55 fades trust to zero (pixel keeps its
-                 own colour), a fully captured rise keeps it. */
-              {
-                float rmin = 1e30f, rmax = -1e30f;
-                for (int j = 0; j < NS; j++) {
-                  if (raw[j] < rmin)
-                    rmin = raw[j];
-                  if (raw[j] > rmax)
-                    rmax = raw[j];
-                }
-                float bb = fabsf(ab_b) > .03f ? fabsf(ab_b) : .03f;
-                float cov =
-                    ((ab_a + ab_b < rmax ? ab_a + ab_b : rmax) -
-                     (ab_a > rmin ? ab_a : rmin)) /
-                    bb;
-                /* v5: wider blur needs lower coverage threshold (0.35 vs 0.55)
-                   else outer shading slopes kill trust and -r 6 leaves blur.
-                   v4.9.3 note: keeping this gate LIVE (not inert) because
-                   the v5 wide-blur threshold change resolves the issue that
-                   v4.9.3 observed (stripping steepening from TRUE-step skirts). */
-                float cov_thr = wide ? 0.35f : 0.55f;
-                wS *= ss01((cov - cov_thr) * (1.f / .25f));
-                if (dbg && y == dbg_y && abs(x - dbg_x) <= 16 &&
-                    (x & 3) == 0)
-                  fprintf(stderr, "DBGC %d,%d cov=%.3f raw[%.3f..%.3f] "
-                                  "step[%.3f..%.3f] thr=%.2f\n",
-                          x, y, cov, rmin, rmax, ab_a, ab_a + ab_b, cov_thr);
-              }
-              /* Steepness k is decided right after the profile fit
-                 (v4.9.4 hoist: the amplitude restoration's mass-
-                 correct depth needs it); comment block lives there.
-                 -g pins k exactly (float, up to 64); -e
-                 adapts per edge; -s formula otherwise; always capped so
-                 the OUTPUT ramp never falls below .6 px sigma
-                 (~1.5 px 30% width): no re-aliased sawtooth, and
-                 already-crisp content is left alone (k -> 1). */
-              /* capfloor from 019fbef6: env-overridable anti-realias cap (default .6) */
-              /* Anchored evaluation (v4.8): the steepened fit is
-                 evaluated at the pixel's GEOMETRIC position on the
-                 normal (t = 0), and the pixel's own residual to the
-                 unsteepened fit is re-added: out = F_k(0) + (o - F(0)).
-                 On-curve pixels steepen exactly with k; off-curve
-                 deviations (texture, hue arcs, dither) pass through
-                 with GAIN 1 instead of the v4.7 colour-domain gain k
-                 at the ramp centre -- no amplified speckle mid-
-                 gradient, no phi^-1 flat-noise halo, original colours
-                 kept.  push: displace the position toward the nearer
-                 plateau, evaluate the ORIGINAL profile there. */
-              /* Steepness: -g pins k exactly (float, up to 64); -e
-                 adapts per edge; -s formula otherwise; always capped so
-                 the OUTPUT ramp never falls below .6 px sigma
-                 (~1.5 px 30% width): no re-aliased sawtooth, and
-                 already-crisp content is left alone (k -> 1). */
-              float k = kbase;
-              if (deblur_steepness <= 0.f && edge_goal > 0.f) {
-                float st = fmaxf(.6f, edge_goal * scale / 2.5f);
-                k = clampf(s / st, 1.f, 16.f);
-              }
-              /* v6.1: respect manual -g but tighter to suppress halo around gradient centres;
-                 wide blur (r=6) needs larger minw to avoid halo */
-              if (deblur_steepness > 0.f) {
-                float minw = 0.40f;
-                if (deblur_steepness > 16.f) minw = 0.35f;
-                if (deblur_steepness > 32.f) minw = 0.30f;
-                if (deblur_steepness > 50.f) minw = 0.25f;
-                if (wide) minw = fmaxf(minw, 1.60f);
-                k = fminf(k, s / minw);
-              } else {
-                k = fminf(k, s / .6f);
-              }
-              float z0 = (0.f - (float)mu) / s;
-              float ufit0 = phi1(z0), nu;
-              if (method == 3) {
-                float k_ana = k;
-                if (deblur_steepness > 0.f) {
-                  float K = deblur_steepness;
-                  if (K <= 1.0001f) {
-                    k_ana = 1e5f;
-                  } else {
-                    k_ana = 1.f + 3.6f / (K - 1.f);
-                  }
-                }
-                if (k_ana > 1e4f) {
-                  if (ufit0 < 0.5f) nu = 0.f;
-                  else if (ufit0 > 0.5f) nu = 1.f;
-                  else nu = 0.5f;
-                } else {
-                  nu = phi1(k_ana * z0);
-                }
-              } else if (method == 2 && k > 1.f)
-                nu = phi1(z0 + (ufit0 - .5f) * (k - 1.f) * 1.5f);
-              else
-                nu = phi1(k * z0);
-              nu = clampf(nu, 0.f, 1.f);
-              wS = ss01((sb - s) / (sb - sa));
-              if (disable_safety_gates) {
-                wS = 1.f;
-              } else if (method == 3) {
-                float lmed = .5f * (ul + ur);
-                int side = 0, cross = 0;
-                for (int j = 0; j < NS; j++) {
-                  if (side <= 0 && u[j] > lmed + .02f) {
-                    cross += side < 0;
-                    side = 1;
-                  } else if (side >= 0 && u[j] < lmed - .02f) {
-                    cross += side > 0;
-                    side = -1;
-                  }
-                }
-                wS *= 1.f - ss01(((float)cross - 2.25f) / 2.5f);
-                wS *= ss01((rng - 0.05f) / 0.10f);
-              } else {
-              /* Fit-trust: RMSE of the erf fit over the full lobe,
-                 |du| weights (the weights concentrate the check on the
-                 lobe core, which is what the steepening actually
-                 moves; a curved/textured ramp misfits and trust
-                 fades). */
-              {
-                double en = 0, ed = 0;
-                for (int j = jl[li]; j <= jr[li]; j++) {
-                  float zj = ((float)(j - R) - (float)mu) / s;
-                  float fj = ab_a + ab_c * zj + ab_b * phi1(zj);
-                  en += wj[j] * (raw[j] - fj) * (raw[j] - fj);
-                  ed += wj[j];
-                }
-                if (ed > 1e-9) {
-                  float rmse = (float)sqrt(en / ed);
-                  /* v4.9.3: flank-pair windows (this lobe has a
-                     neighbouring flank) are PROVEN line geometry;
-                     their profile is the kernel's tent/cone ramp (the
-                     bspline base blurs a hard line into a near-linear
-                     tent), which the erf systematically misfits by
-                     ~.12-.18 -- the gate zeroed EVERY line-core pixel
-                     at the user's -r 6 recipe and the deblur pass had
-                     nothing to steepen or restore there.  Relax the
-                     gate for exactly this class (the multi-crossing
-                     and coh gates still apply below). */
-                  float tl = trust_lo, thh = trust_hi;
-                  if (li > 0 || li + 1 < NL) {
-                    tl *= 2.5f;
-                    thh *= 2.5f;
-                  }
-                  /* v6: wider trust gate for wide blur (0.04/.30) via
-                     trust_lo/trust_hi defaults; flank-pair relaxation
-                     stacks on top. */
-                  wS *= ss01((thh - rmse) / (thh - tl + 1e-9f));
-                }
-              }
-              /* Multi-crossing trust (whole-window property; replaces
-                 the v4.7 beta2 gate): per-lobe fits are ALL locally
-                 good inside dense texture, so crosshatch/hair-clump/
-                 text suppression must look at the window: count mid-
-                 level crossings with hysteresis.  A step crosses 1x,
-                 one line 2x (full trust), 4x+ (dense structure) fades
-                 to zero. */
-              {
-                float lmed = .5f * (ul + ur);
-                int side = 0, cross = 0;
-                for (int j = 0; j < NS; j++) {
-                  if (side <= 0 && u[j] > lmed + .02f) {
-                    cross += side < 0;
-                    side = 1;
-                  } else if (side >= 0 && u[j] < lmed - .02f) {
-                    cross += side > 0;
-                    side = -1;
-                  }
-                }
-                /* v5: for wide blur allow more crossings (quantization
-                   can create spurious crossings), threshold raised. */
-                float cross0 = wide ? 3.0f : 2.25f;
-                float cross1 = wide ? 3.5f : 2.5f;
-                wS *= 1.f - ss01(((float)cross - cross0) / cross1);
-              }
-              /* Validity gate (v4.9): at junctions/corners/line caps
-                 the 1D ramp model is outside its domain -- the window
-                 mixes both arms of a wedge and 'assigns' bright-side
-                 pixels to the dark segment (cornerstar apex: bright
-                 pixels darkened by |delta| ~ .9, transported around
-                 the tip by pass-2).  Downweight to coh: junctions
-                 keep the crisp base sample (source-faithful sharp
-                 tip) instead of a bogus 1D fit; straight contours
-                 (coh ~ 1) are untouched. */
-              wS *= coh;
-              // mu penalty disabled for tip
-              if (dbg && y == dbg_y && abs(x - dbg_x) <= 16 &&
-                  (x & 3) == 0) {
-                double en = 0, ed = 0;
-                for (int j = jl[li]; j <= jr[li]; j++) {
-                  float zj = ((float)(j - R) - (float)mu) / s;
-                  float fj = ab_a + ab_c * zj + ab_b * phi1(zj);
-                  en += wj[j] * (raw[j] - fj) * (raw[j] - fj);
-                  ed += wj[j];
-                }
-                fprintf(stderr,
-                        "DBG %d,%d NL=%d lobe[%d..%d] dom[%d..%d] "
-                        "W=%.3f mu=%.3f s=%.3f k=%.3f z0=%.3f ufit=%.4f "
-                        "nu=%.4f wS=%.4f rmse=%.4f Ld2=%.5f coh=%.2f "
-                        "Teff=%d a=%.3f c=%.3f b=%.3f sp=%.3f o0=%.3f o1=%.3f "
-                        "InvM=%d\n",
-                        x, y, NL, jl[li], jr[li], dl, dr, W, mu, s, k,
-                        z0, ufit0, nu, wS, ed > 1e-9 ? sqrt(en / ed) : -1.,
-                        Ld2, coh, Teff, ab_a, ab_c, ab_b, sp_dbg, off0r, off1r,
-                        adb_noamp ? -9 : (int)0);
-              }
-            }
-          }
-        }
-      }
-      /* Store the flat-flatten part of the delta, the wS-weighted fit
-         parameter field for the pass-1.5 contour-consensus evaluation,
-         and the local colour hull (u8) for the hull clamp; the pixel's
-         own fit residual is NOT stored: it is re-added unsmoothed at
-         write time via o[c] (texture stays per-pixel). */
-      {
-        float fw = ss01((.025f - rng) * (1.f / .017f)) * (1.f - wS);
-        float *dd = DEL + 4 * idx, *p = PF + 25 * idx;
-        for (int c = 0; c < 4; c++)
-          dd[c] = fw * flatmix * (mean[c] - o[c]);
-        p[0] = wS;
-        p[1] = wS * fmu;
-        p[2] = wS * fs;
-        for (int c = 0; c < 4; c++)
-          p[3 + c] = wS * fd2[c];
-        p[7] = coh;
-        p[8] = -diry; /* tangent of the fitted contour */
-        p[9] = dirx;
-        for (int c = 0; c < 4; c++) {
-          p[10 + c] = wS2 * offv0[c]; /* fire-weighted: the consensus */
-          p[14 + c] = wS2 * offv1[c]; /* denominator is aW2 (v4.9.3)  */
-        }
-        p[18] = wS2;
-        p[19] = wS2 * frel; /* base-value feature membership (v4.9.3)  */
-        p[20] = lW;  /* v4.9.6 dip/line-class claim: image-space     */
-        p[21] = lW * lVX; /* vector to the line centre, depth and    */
-        p[22] = lW * lVY; /* true half-width (the blur below spreads */
-        p[23] = lW * lDw; /* them to all windows that merely SEE the */
-        p[24] = lW * lH;  /* feature, which is exactly the veil zone)*/
-        /* v4.9.3: widen the hull by the CORRECTED plateaus only (they
-           are extrapolated past the observed window range by design;
-           nothing else may exceed the observed colours). */
-        if (offv0[0] != 0.f || offv0[1] != 0.f || offv1[0] != 0.f ||
-            offv1[1] != 0.f)
-          for (int c = 0; c < 4; c++) {
-            if (Pc0[c] < lo[c])
-              lo[c] = Pc0[c];
-            if (Pc0[c] > hi[c])
-              hi[c] = Pc0[c];
-            if (Pc1[c] < lo[c])
-              lo[c] = Pc1[c];
-            if (Pc1[c] > hi[c])
-              hi[c] = Pc1[c];
-          }
-        /* Hull codes in DISPLAY space (sRGB u8 for colour, linear u8
-           for alpha): linear-space u8 codes have no usable resolution
-           at the dark end (0.12 sRGB = 0.012 linear = code 3), which
-           made the first hull clamp toothless exactly where fringes
-           live. */
-        for (int c = 0; c < 4; c++) {
-          int lv, hv;
-          if (c < 3) {
-            lv = to_srgb[clampi((int)(clampf(lo[c], 0.f, 1.f) * 4096.f),
-                                0, 4096)] -
-                 1;
-            hv = to_srgb[clampi((int)(clampf(hi[c], 0.f, 1.f) * 4096.f),
-                                0, 4096)] +
-                 1;
-          } else {
-            lv = (int)(clampf(lo[c], 0.f, 1.f) * 255.f) - 1;
-            hv = (int)(clampf(hi[c], 0.f, 1.f) * 255.f + .999f) + 1;
-          }
-          LOH[8 * idx + c] = (uint8_t)clampi(lv, 0, 255);
-          LOH[8 * idx + 4 + c] = (uint8_t)clampi(hv, 0, 255);
-        }
-      }
-    }
-  /* v4.9.3: widen the EVIDENCE field (wS) before the consensus.  Per-
-     pixel trust flips under sub-pixel window shifts (the lobe map and
-     the erf trust gate are both sampled-quantity sensitive), so wS is
-     patchy at 1-2 px scale even along a genuine contour; when the
-     restored-plateau delta is scaled by such a weight it renders as
-     barcode teeth along narrow features.  All fit QUANTITIES stay on
-     the sharp slots (ratios aMu/aW etc. are unchanged in meaning);
-     only the scalar confidence w is read from a spatially low-passed
-     copy (separable 5-tap box: +-2 px). */
-  {
-    /* Blur the fifteen wS-WEIGHTED slots jointly ([0] evidence, [1,2]
-       mu/s, [3..6] d2, [10..17] plateau offsets): denominator and
-       numerators get the same kernel so every ratio (mu, s, d2, off)
-       stays calibrated where evidence exists and interpolates smoothly
-       across the holes.  Slots 7 (coh) and 8,9 (tangent) stay sharp --
-       they steer the taps, they are not consensus quantities. */
-    /* restoration slots reach +-3 px: the firing windows can sit a
-       full flank width away from the feature core they describe (the
-       +-2 kernel left un-fired cores washed and tripled MAE at the
-       48px probe).  Fit-parameter slots stay +-2 (sharper). */
-    static const int slots2[7] = {0, 1, 2, 3, 4, 5, 6};
-    static const int slots3[10] = {10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
-    /* dip/line-claim slots (20-24) reach +-5 px: firing windows sit a
-       full flank width away from the veil zone they describe, and the
-       veil is exactly where the replacement must land. */
-    static const int slots5[5] = {20, 21, 22, 23, 24};
-    static const int *slotsetA[3] = {slots2, slots3, slots5};
-    static const int nslotsA[3] = {7, 10, 5};
-    static int radiiA[3] = {2, 3, 5};
-    {
-      const char *e = getenv("CELUP_RADA");
-      if (e) {
-        int r2, r3, r5;
-        if (sscanf(e, "%d,%d,%d", &r2, &r3, &r5) == 3) {
-          radiiA[0] = r2;
-          radiiA[1] = r3;
-          radiiA[2] = r5;
-        }
-      }
-    }
-    /* v4.9.9e: TANGENT-ORIENTED evidence integration.  The separable
-       axis-aligned box blur reaches R px across the contour
-       everywhere, but at a contour's XY poles that axis coincides
-       with the contour NORMAL: at the ring's top/bottom/left/right
-       the +-3 box mixes the inner flank's evidence with the outer
-       flank's (opposite deltas cancel, nu claims flip per pixel) --
-       the measured "additional blur at the poles of circles since
-       v4.8", left by both tangential mechanisms' shared premise that
-       averaging must follow the contour.  Everywhere else the same
-       arithmetic is the intended consensus.  Marching the taps along
-       the per-pixel tangent (bilinear samples, tent kernel, sign-
-       free by symmetry) keeps exactly the old effective support
-       along-trace and removes any cross-contour reach: no special-
-       case code, one rule for all angles. */
-    float *tmp = malloc((size_t)dw * dh * sizeof *tmp);
-    if (tmp)
-      for (int sset = 0; sset < 3; sset++)
-        for (int sl = 0; sl < nslotsA[sset]; sl++) {
-          const int q = slotsetA[sset][sl], R = radiiA[sset];
-          for (int y = 0; y < dh; y++)
-            for (int x = 0; x < dw; x++) {
-              size_t idx = (size_t)y * dw + x;
-              const float *pf = PF + 25 * idx;
-              double acc = 0., ws = 0.;
-              for (int to = -R; to <= R; to++) {
-                float wt = (float)(R + 1 - (to < 0 ? -to : to)), qv[25];
-                sample_fn(PF, dw, dh, 25, (float)x + (float)to * pf[8],
-                          (float)y + (float)to * pf[9], qv);
-                acc += (double)wt * qv[q];
-                ws += wt;
-              }
-              tmp[idx] = ws > 1e-9 ? (float)(acc / ws) : 0.f;
-            }
-          for (size_t k = 0; k < (size_t)dw * dh; k++)
-            PF[25 * k + q] = tmp[k];
-        }
-    free(tmp);
-  }
-  /* Pass 1.5: contour-consensus evaluation (v4.9).  Raw per-pixel fits
-     jitter (mu by up to 1-2 out px near wedges/apexes) and the anchored
-     output renders that jitter amplified ~k-fold -- pass-2 delta
-     smoothing patched the symptom, this treats the cause: the fit
-     parameters themselves are constant/move coherently ALONG a genuine
-     contour, so integrate the wS-weighted parameter field along the
-     tangent (junction-aware weights, wS as the weight of evidence --
-     junction-gated and untrusted pixels contribute no mass) and render
-     each pixel from the CONSENSUS fit: z, k, nu are recomputed from the
-     smoothed mu/s so the anchored evaluation stays exact, and the
-     pixel's own residual (o - F(smoothed fit)) is still re-added per
-     pixel at gain 1.  The local convex-hull clamp (no ringing
-     vocabulary: erf tail-shape misfit at the ramp foot once drove the
-     step48 dark flank .149 -> .027) bounds the result to the colours
-     observed in the pixel's own window. */
-  for (int y = 0; y < dh; y++)
-    for (int x = 0; x < dw; x++) {
-      size_t idx = (size_t)y * dw + x;
-      const float *pf = PF + 25 * idx;
-      float tanx = pf[8], tany = pf[9], cc = pf[7];
-      float aW = 0.f, aW2 = 0.f, aR = 0.f, aMu = 0.f, aS = 0.f,
-            aD[4] = {0, 0, 0, 0}, aO0[4] = {0, 0, 0, 0},
-            aO1[4] = {0, 0, 0, 0}, wsum = 0.f, tw[9], tmu[9];
-      float aWL = 0.f, aVX = 0.f, aVY = 0.f, aWD = 0.f, aHH = 0.f;
-      for (int to = -T; to <= T + 2; to++) {
-        float wt, q[25];
-        if (to <= T) { /* tangential taps (the v4.8 consensus) */
-          wt = (float)(T + 1 - (to < 0 ? -to : to));
-          sample_fn(PF, dw, dh, 25, (float)x + (float)to * tanx,
-                    (float)y + (float)to * tany, q);
-        } else { /* v4.9.3: one NORMAL tap to each side, lower weight.
-                    The per-pixel evidence field (wS) has holes at
-                    1-2 px scale across the flank (window lobe maps
-                    flip NL under sub-pixel center shifts), and purely
-                    tangential averaging cannot bridge them: on narrow
-                    features whose evidence stripe is only a few px
-                    wide the consensus weight w then oscillates
-                    pixel-to-pixel and the restored-plateau delta
-                    renders as a barcode along the contour.  Symmetric
-                    +-1 normal taps keep mu unbiased (linear mu sweep
-                    cancels) while filling the holes. */
-          float no = to == T + 1 ? -1.f : 1.f;
-          wt = .55f * (T + 1) * .5f;
-          sample_fn(PF, dw, dh, 25, (float)x + no * -tany,
-                    (float)y + no * tanx, q);
-        }
-        wt *= sqrtf(cc * fmaxf(q[7], 0.f));
-        if (to <= T) {
-          tw[to + T] = wt;
-          tmu[to + T] = q[0] > 1e-9f ? q[1] / q[0] : 0.f;
-        }
-        aW += wt * q[0];
-        aW2 += wt * q[18];
-        aR += wt * q[19];
-        aMu += wt * q[1];
-        aS += wt * q[2];
-        aWL += wt * q[20];
-        aVX += wt * q[21];
-        aVY += wt * q[22];
-        aWD += wt * q[23];
-        aHH += wt * q[24];
-        for (int c = 0; c < 4; c++) {
-          aD[c] += wt * q[3 + c];
-          aO0[c] += wt * q[10 + c];
-          aO1[c] += wt * q[14 + c];
-        }
-        wsum += wt;
-      }
-      if (aW > 1e-6f && wsum > 1e-6f) {
-        float o[4];
-        float mu = aMu / aW, s = aS / aW, w = aW / wsum,
-              w2v = clampf(aW2 / wsum, 0.f, 1.f), d2[4], off0e[4],
-              off1e[4];
-        /* membership-by-value: innerness~1 = the pixel's base colour
-           already sits at the washed inner plateau (genuine feature
-           interior: restore); innerness near 0 = the skirt or the
-           background, where saturation-only claims used to repaint
-           dark blobs around blurred lines (-r6 diagline probe). */
-        float gInn = .5f, inn_ = .5f;
-        if (aW2 > 1e-6f) {
-          inn_ = clampf(aR / aW2, -.2f, 1.2f);
-          gInn = ss01((inn_ - .5f) * (1.f / .3f));
-        }
-        /* offsets normalize by their OWN fire evidence aW2: windows
-           that could not prove a flank pair keep wS2 = 0 and must not
-           dilute the restoration amplitude of those that did --
-           diluted by 10x at the 48px probe core, the restored core
-           reverted to washed grey (the consensus-steal bug). */
-        float aW2s = aW2 > 1e-6f ? aW2 : 1e-6f;
-        for (int c = 0; c < 4; c++) {
-          d2[c] = aD[c] / aW;
-          off0e[c] = aO0[c] / aW2s;
-          off1e[c] = aO1[c] / aW2s;
-          o[c] = A[4 * idx + c];
-        }
-        /* Steepness from the CONSENSUS width: same rules as pass 1,
-           then governed by the mu SPREAD along the tangent.  A k-
-           steepened step renders a mu disagreement of d px as an edge
-           displaced ~d*k -- the dark pre-edge "neon" bands are exactly
-           that on shaded wide ramps (-r 6).  Straight stable contours
-           read std << .5 px and keep full k; skirts/wedges/dense zones
-           with std >= ~2.5 px get k -> 1 (left at their own slope). */
-        float k = kbase, vmu = 0.f, wt2 = 0.f;
-        for (int to = -T; to <= T; to++) {
-          if (tw[to + T] <= 0.f)
-            continue;
-          float dd = tmu[to + T] - (float)mu;
-          vmu += tw[to + T] * dd * dd;
-          wt2 += tw[to + T];
-        }
-        float mu_std = wt2 > 1e-9f ? sqrtf(vmu / wt2) : 0.f;
-        /* v6.1: mild mu_std governor to suppress halo around gradient centres.
-           Straight edges std <<0.5 keep full k; jittery fits >0.8 reduce k and w. */
-        if (mu_std > 10.0f) {
-          float tt = clampf((mu_std - 1.5f)/1.2f, 0.f, 1.f);
-          float damp = 1.f - ss01(tt);
-          k = 1.f + (k - 1.f) * damp;
-          w *= 1.f - 0.5f * ss01(tt);
-        }
-        if (deblur_steepness <= 0.f && edge_goal > 0.f) {
-          float st = fmaxf(.6f, edge_goal * scale / 2.5f);
-          k = clampf(s / st, 1.f, 16.f);
-        }
-        if (deblur_steepness > 0.f) {
-          float minw = 0.40f;
-          if (deblur_steepness > 16.f) minw = 0.35f;
-          if (deblur_steepness > 32.f) minw = 0.30f;
-          if (deblur_steepness > 50.f) minw = 0.25f;
-          if (wide) minw = fmaxf(minw, 1.60f);
-          k = fminf(k, s / minw);
-        } else {
-          k = fminf(k, s / .6f);
-        }
-        /* v4.9.3 effective-k bookkeeping (the report used to echo the
-           REQUESTED steepness even when the sawtooth cap replaced it
-           almost everywhere -- "ignoring parameters"). */
-        if (w > 1e-3f) {
-          adb_keff_sum += (double)k * w;
-          adb_keff_w += (double)w;
-          if (k > adb_keff_max)
-            adb_keff_max = k;
-        }
-        /* Anchored evaluation (v4.8) on the consensus fit. */
-        float z0 = (0.f - mu) / s;
-        float ufit0 = phi1(z0), nu;
-        /* saturation membership: the BASE (unremapped) model must
-           still place the pixel on this side's plateau before the
-           restored plateau may be claimed for it.  Under -r 6 a
-           narrow line's blur shoulder reads exactly like its washed
-           core (both sit at the attenuated plateau level, inn ~1),
-           so only model-u separates the interior from the rim;
-           without this the offset paints a neon band +-1.5 flanks
-           wide around narrow lines. */
-        if (method == 3) {
-          float k_ana = k;
-          if (deblur_steepness > 0.f) {
-            float K = deblur_steepness;
-            if (K <= 1.0001f) {
-              k_ana = 1e5f;
-            } else {
-              k_ana = 1.f + 3.6f / (K - 1.f);
-            }
-          }
-          if (k_ana > 1e4f) {
-            if (ufit0 < 0.5f) nu = 0.f;
-            else if (ufit0 > 0.5f) nu = 1.f;
-            else nu = 0.5f;
-          } else {
-            nu = phi1(k_ana * z0);
-          }
-        } else if (method == 2 && k > 1.f)
-          nu = phi1(z0 + (ufit0 - .5f) * (k - 1.f) * 1.5f);
-        else
-          nu = phi1(k * z0);
-        nu = clampf(nu, 0.f, 1.f);
-        /* v4.9.6 dip/line render: where the consensus carries a
-           flank-pair line claim, REPLACE the erf-step evaluation of
-           the feature by the calibrated dip: the washed profile loses
-           the observed centre depth (u -= Dw*dipN(.;h,s)), the
-           steepened profile carries the restoration-proven depth at
-           the TRUE half-width (nu -= Dt*dipN(.;h,s/k)).  The step
-           part keeps its own semantics (ul != ur backgrounds ride the
-           step as before); far from the feature dipN ~ 0 and the
-           claim is a no-op, and the vector-to-centre field is
-           image-space so the consensus average is frame-free.  The
-           mid-shoulder fat-contour pathology ("halo" = the steepened
-           fat contour painting the background ~2 px wide) cannot
-           arise: the dip flanks sit at the true half-depth width. */
-        {
-          static int nodip = -1;
-          if (nodip < 0)
-            nodip = getenv("CELUP_NODIP") != NULL;
-#ifndef CELUP_DIP_DEF
-#define CELUP_DIP_DEF 0
-#endif
-          {
-            static int dipon = -1;
-            if (dipon < 0)
-              dipon = getenv("CELUP_DIP") != NULL ? 1 : CELUP_DIP_DEF;
-            if (!dipon || nodip)
-              aWL = 0.f;
-          }
-          /* consensus-diluted claim strength: even one firing tap
-             against 8 non-firing neighbours reads wLc ~ .12, so the
-             gate sits low; the flank-pair tests in pass 1 already
-             proved the geometry, this is only a spatial reach
-             control. */
-          if (aWL > 1e-6f && wsum > 1e-6f) {
-            float wLc = aWL / wsum;
-            float lfac = ss01((wLc - .03f) * (1.f / .10f));
-            if (lfac > 1e-3f) {
-              float vx = aVX / aWL, vy = aVY / aWL;
-              float pabs = sqrtf(vx * vx + vy * vy);
-              float hh = clampf(aHH / aWL, 0.f, 40.f);
-              float dwc = clampf(aWD / aWL, -1.2f, 1.2f);
-              float sp = s / (k > .05f ? k : .05f);
-              sp = clampf(sp, .32f, 40.f);
-              float sw2 = clampf(s, .4f, 40.f);
-              float dnw = dipnorm(pabs, hh, sw2);
-              float dns = dipnorm(pabs, hh, sp);
-              float num = 0.f, den = 0.f;
-              for (int c = 0; c < 4; c++) {
-                num += (off0e[c] + off1e[c]) * d2[c];
-                den += d2[c] * d2[c];
-              }
-              float dt = den > 1e-9f ? -num / den : 0.f;
-              dt = clampf(dt, -1.2f, 1.2f);
-              ufit0 -= lfac * dwc * dnw;
-              nu -= lfac * dt * dns;
-              ufit0 = clampf(ufit0, -.2f, 1.2f);
-              nu = clampf(nu, 0.f, 1.f);
-            }
-          }
-        }
-        /* saturation membership: the BASE (unsteepened) model must
-           still place the pixel on this side's plateau before the
-           restored plateau may be claimed for it -- nu cannot do this
-           job: phi1(k*z0) saturates at |z0| > ~2.5/k, so it reads
-           "plateau" BOTH 4 px inside a stroke and 4 px outside the
-           edge (v4.9.4 experiment: nu-based membership painted the
-           washed skirt black, diagline MAE 13.7 -> 17.6).  The
-           unsteepened ufit0 keeps the SIDE truth.  Gate centre
-           lowered .78 -> CELUP_UFM (default .70, scanned .55-.78 on
-           the smiley and diagline fixtures; .70 was the best joint
-           point): a narrow -r 6 line's interior pixels stop at
-           ufit0 ~ .6-.9
-           (the whole stroke is ~2.9 sigma wide), and the .78 centre
-           paid only the dead-centre sliver -- the proven interior
-           stayed at the attenuated plateau (watercolor).  The halo
-           guard on the bright outer side is the value-membership
-           gInn, measured on the pixel's own base colour. */
-#ifndef CELUP_UFM
-#define CELUP_UFM .70f
-#endif
-        float uf0 = 1.f - ss01((ufit0 - (1.f - CELUP_UFM)) *
-                               (1.f / .20f));
-        float uf1 = ss01((ufit0 - CELUP_UFM) * (1.f / .20f));
-        /* v4.9.5 dip-core tent: when BOTH sides' flank-pair
-           restoration fired on this window (extremum-tested from
-           BOTH flanks -- the lobe is a sandwiched dip/line core; a
-           plain one-sided flank fires only one offset), the restored
-           core colour must also be paid at the dip CENTRE itself,
-           ufit ~ .5, which neither uf-side gate ever claims: a 1-2
-           px line otherwise renders as two dark rails with a bright
-           mid seam (the user's "mouth vertically doubled" on miya,
-           and the smiley r6 ring double edge).  The tent is the
-           conservative (min-magnitude, same-sign) component of the
-           two offsets, gated by shape to vanish at both plateaus so
-           it cannot add anything to one-sided edges. */
-        float uft = ss01((.5f - fabsf(ufit0 - .5f) - .2f) * (1.f / .15f));
-        /* v4.9.6 skirt transport (bright side): at pixels the model
-           itself places on the SATURATED bright plateau (nu ~ 1) the
-           anchored evaluation still re-adds the gain-1 residual
-           o-F(0), and the erf tail undercalls the composite blur
-           skirt (lobe s is read off the |du|-weighted shoulder; a
-           neighbouring stroke's far tail belongs to no window's
-           model) -- that leftover is the bright veil around strokes
-           (smiley r6 halo 17.4 vs NN 1.9) and the chroma bleed at
-           colour borders.  No DC-exact smoother can remove that
-           mass, so TRANSPORT it: look ~2.6s farther along the normal
-           (both directions; the tangent->normal map flips sign with
-           the pass-1 u-reversal), and where an evidence-backed tap
-           is itself claimed bright-plateau-saturated with an
-           agreeing step direction, pull the pixel toward the
-           OBSERVED base colour there.  Targets are neighbourhood
-           observations (no invented colours; hull-clamped after),
-           seams between close strokes reject themselves (the tap
-           lands on the next stroke's ramp: no same-side saturation),
-           and dark interiors are untouched (core depth is the
-           restoration terms' job). */
-        float wpeel = 0.f, atap[4] = {0, 0, 0, 0}, lvlT = 0.f;
-#ifndef CELUP_NOPEEL_ENV
-        {
-          static int nopeel = -1;
-          if (nopeel < 0)
-            nopeel = getenv("CELUP_NOPEEL") != NULL;
-          /* v4.9.7: own-line plateau transport replaces the v4.9.6
-             tap transport.  v4.9.6 pulled saturated-claim pixels
-             toward the RAW colours sampled +-2.6s along the normal;
-             tap averages are not the pixel's own asymptote, so
-             bright-plateau pixels near strokes were dragged to a
-             mid-gray tap mean -> a smooth black ring hugging every
-             stroke's OUTER flank (miya mouth, smiley outline).  Same
-             probes, new discipline: a probe must (a) REACH the
-             pixel's own model plateau projection along d2
-             (existence-of-plateau test: cancels between close
-             strokes and inside real gradients where no plateau is
-             within tail distance) and (b) be strictly BRIGHTER along
-             d2.  The colour then moves strictly along the pixel's
-             OWN step line: atap = o + pv*.d2/|d2|, so foreign hues
-             can never bleed in and the target can never sit below
-             the claimed asymptote -- no darkening, no halo; the
-             level is capped near the observed plateau and the hull
-             clamp bounds the rest.  Bright branch (nu > .88) keeps
-             v4.9.6 semantics. */
-          float satb = ss01((nu - .88f) * (1.f / .09f));
-          /* trough branch (v4.9.7b): ownership by the UNSTEEPENED
-             model position.  True ink-fills saturate the base
-             profile (ufit0 ~ 0) while the wash trough reads
-             .1-.4 -- without the floor the brightening fired deep
-             inside fat ink fills.  The wider ufit0-window variant
-             (any model-mid pixel treated as trough) bleached thin
-             strokes and reopened the halo class; keep the measured
-             v4.9.7c/d gates. */
-          float satd = ss01((.12f - nu) * (1.f / .06f)) *
-                       ss01((ufit0 - .06f) * (1.f / .12f)) *
-                       ss01((-z0 - 1.2f) * (1.f / .6f)) *
-                       ss01((.60f - inn_) * (1.f / .15f)) *
-                       ss01((s - 2.f) * (1.f / 2.f));
-          float sat = satb > satd ? satb : satd;
-          if (!nopeel && w > .04f && sat > .02f) {
-            float nax = pf[9], nay = -pf[8];
-            float Ld2 = 1e-9f;
-            for (int c = 0; c < 4; c++)
-              Ld2 += d2[c] * d2[c];
-            float Ld = sqrtf(Ld2);
-            float pvmin = (1.f - ufit0) * Ld - .03f;
-            float best = 0.f, okm = 0.f;
-            float dist = clampf(2.6f * s, 5.f, 20.f);
-            for (int sgn = -1; sgn <= 1; sgn += 2) {
-              float qa[4], pv = 0.f;
-              sample_f4(A, dw, dh, (float)x + (float)sgn * dist * nax,
-                        (float)y + (float)sgn * dist * nay, qa);
-              for (int c = 0; c < 4; c++)
-                pv += (qa[c] - o[c]) * d2[c];
-              pv /= Ld2;
-              float ok = ss01((pv * Ld - pvmin) * (1.f / .06f));
-              pv *= Ld;
-              if (pv < .015f)
-                ok = 0.f; /* strictly brighter plateau along d2 only */
-              if (ok > 1e-3f && pv > best) {
-                best = pv;
-                okm = ok;
-              }
-            }
-            if (okm > 1e-3f) {
-              /* target = own step line lifted to the observed plateau
-                 level pv* (bounded by the hull clamp afterwards);
-                 payment scales with how far the plateau sits above
-                 the model's own claim. */
-              if (best > (1.f - ufit0) * Ld)
-                best = (1.f - ufit0) * Ld + .35f * (best - (1.f - ufit0) * Ld);
-              if (best > 1.05f * Ld)
-                best = 1.05f * Ld;
-              for (int c = 0; c < 4; c++)
-                atap[c] = o[c] + best * d2[c] / Ld;
-              lvlT = best;
-              wpeel = w * sat * okm;
-            }
-          }
-        }
-#endif
-        float *dd = DEL + 4 * idx;
-        float c0blo_dbg = -1.f;
-        /* v4.9.3: widen the local colour hull by the CONSENSUS
-           restoration offsets.  Pass 1 could only extend the hull by
-           its own window's Pc, so non-firing windows (NL=1 cores,
-           catastrophic degenerate fits) kept the washed minimum as
-           their lower bound -- the clamp then pushed consensus-restored
-           dark pixels back up to the washed level on exactly those
-           pixels: visible teeth.  The consensus offsets are the
-           blur-smoothed, extremum- and direction-tested restoration,
-           so this extension stays inside proven colours while being
-           spatially smooth (no per-pixel bound flapping). */
-        if (w2v > 1e-3f)
-          for (int c = 0; c < 4; c++) {
-            float dlo = fminf(0.f, fminf(off0e[c], off1e[c])) * w2v,
-                  dhi = fmaxf(0.f, fmaxf(off0e[c], off1e[c])) * w2v;
-            if (dlo == 0.f && dhi == 0.f)
-              continue;
-            if (c < 3) {
-              float lo = clampf(to_linear[LOH[8 * idx + c]] + dlo,
-                                adb_srclo[c], adb_srchi[c]),
-                    hi = clampf(to_linear[LOH[8 * idx + 4 + c]] + dhi,
-                                adb_srclo[c], adb_srchi[c]);
-              int lv = to_srgb[clampi((int)(clampf(lo, 0.f, 1.f) *
-                                            4096.f),
-                                      0, 4096)] -
-                       1,
-                  hv = to_srgb[clampi((int)(clampf(hi, 0.f, 1.f) *
-                                            4096.f),
-                                      0, 4096)] +
-                       1;
-              LOH[8 * idx + c] = (uint8_t)clampi(lv, 0, 255);
-              LOH[8 * idx + 4 + c] = (uint8_t)clampi(hv, 0, 255);
-            } else {
-              float lo = LOH[8 * idx + c] * (1.f / 255.f) + dlo,
-                    hi = LOH[8 * idx + 4 + c] * (1.f / 255.f) + dhi;
-              LOH[8 * idx + c] =
-                  (uint8_t)clampi((int)(clampf(lo, 0.f, 1.f) * 255.f) -
-                                      1,
-                                  0, 255);
-              LOH[8 * idx + 4 + c] =
-                  (uint8_t)clampi(
-                      (int)(clampf(hi, 0.f, 1.f) * 255.f + .999f) + 1,
-                      0, 255);
-            }
-          }
-        /* v4.9.8 erf-gain post-map (the grey test: mid-grey on the
-           output of a step-class source is wash, by definition).
-           Goal: modify the gradient to increase its slope with zero
-           possibility of overshoot.  Derivation: a Gaussian-blurred
-           edge is v(x) = P0 + A*Phi((x-x0)/s); de-blurring the edge
-           s -> s/g is exactly (x-x0) -> g*(x-x0), so with the
-           rendered colour written as the hull fraction
-           m = ((v-P0).A)/(A.A)  (A = P1-P0 = the pixel's OWN local
-           colour hull, i.e. observed/proven colours only), the map
-             m' = Phi(g * Phi^-1(m)),   v' = P0 + m'*A
-           IS that de-blur.  Safety by construction, not by tuning:
-           Phi o (g*Phi^-1) is a composition of monotone maps with
-           range (0,1), so v' is ALWAYS strictly inside the proven
-           hull [P0,P1] -- overshoot (ringing) is impossible, and the
-           colour stays on the hull diagonal between two observed
-           colours (no foreign hues can enter).  The plateaus are
-           attractors (m ~ 0/1 snap fully: wash shoulders and
-           cross-wash are re-absorbed into their own plateau),
-           m = .5 is a fixpoint (the soft ramp core survives,
-           compressed by 1/g), and the wash gate |m - nu| (applied
-           after the colour is finished, below) fires only where the
-           k-steepened model's position claim disagrees with the
-           actual colour -- the analytic signature of blur wash.
-           Genuine gradients render m ~ nu and stay verbatim. */
-#ifndef CELUP_ZG_DEF
-#define CELUP_ZG_DEF 2.2f
-#endif
-#ifndef CELUP_ZAA_DEF
-#define CELUP_ZAA_DEF .001f
-#endif
-        float vv[4] = {0.f, 0.f, 0.f, 0.f},
-              vblo[4] = {0.f, 0.f, 0.f, 0.f},
-              vbhi[4] = {0.f, 0.f, 0.f, 0.f};
-        float bil_delta[4] = {0.f, 0.f, 0.f, 0.f};
-        if (method == 3) {
-          float sy = ((float)y + 0.5f) / scale - 0.5f;
-          float sx = ((float)x + 0.5f) / scale - 0.5f;
-          int ix = (int)floorf(sx), iy = (int)floorf(sy);
-          float fx = sx - (float)ix, fy = sy - (float)iy;
-          float p_colors[4][4], q_bil[4] = {0.f, 0.f, 0.f, 0.f};
-          for (int j = 0; j < 2; j++)
-            for (int i = 0; i < 2; i++) {
-              int k_cell = 2 * j + i;
-              float ww = (i ? fx : 1.f - fx) * (j ? fy : 1.f - fy);
-              raw_pm(in, sw, sh, ix + i, iy + j, p_colors[k_cell]);
-              for (int c = 0; c < 4; c++)
-                q_bil[c] += ww * p_colors[k_cell][c];
-            }
-          int ai = 0, bi = 1;
-          float best_dist = -1.f;
-          for (int a = 0; a < 4; a++)
-            for (int b = a + 1; b < 4; b++) {
-              float d_dist = 0.f;
-              for (int c = 0; c < 4; c++) {
-                float z = p_colors[b][c] - p_colors[a][c];
-                d_dist += z * z;
-              }
-              if (d_dist > best_dist) {
-                best_dist = d_dist;
-                ai = a;
-                bi = b;
-              }
-            }
-          if (best_dist > 1e-6f) {
-            float dot = 0.f;
-            for (int c = 0; c < 4; c++)
-              dot += (q_bil[c] - p_colors[ai][c]) * (p_colors[bi][c] - p_colors[ai][c]);
-            float t_val = clampf(dot / best_dist, 0.f, 1.f);
-            
-            float u_val = 0.f;
-            float K = deblur_steepness > 0.f ? deblur_steepness : (k > 1.0001f ? 1.f + 3.6f / (k - 1.f) : 1e6f);
-            if (K < 1.f) K = 1.f;
-            if (K <= 1.0001f) {
-              if (t_val < 0.5f) u_val = 0.f;
-              else if (t_val > 0.5f) u_val = 1.f;
-              else u_val = 0.5f;
-            } else {
-              u_val = clampf((t_val - 0.5f) / (1.f - 1.f / K) + 0.5f, 0.f, 1.f);
-            }
-            
-            for (int c = 0; c < 4; c++) {
-              bil_delta[c] = (u_val - t_val) * (p_colors[bi][c] - p_colors[ai][c]);
-            }
-          }
-        }
-        float zg = CELUP_ZG_DEF, zaa = CELUP_ZAA_DEF, zmw = 0.f,
-              zrmp = 0.f;
-        int zno = 0;
-        {
-          static int noz = -1;
-          static float zg_env = -1.f;
-          if (noz < 0)
-            noz = getenv("CELUP_NOZ") != NULL;
-          if (zg_env < 0.f) {
-            const char *e = getenv("CELUP_ZG");
-            zg_env = e && *e ? (float)atof(e) : 0.f;
-          }
-          if (zg_env > .5f)
-            zg = zg_env;
-          zno = noz;
-        }
-        for (int c = 0; c < 4; c++) {
-          float blo = c < 3 ? to_linear[LOH[8 * idx + c]]
-                            : LOH[8 * idx + c] * (1.f / 255.f),
-                bhi = c < 3 ? to_linear[LOH[8 * idx + 4 + c]]
-                            : LOH[8 * idx + 4 + c] * (1.f / 255.f);
-          if (c == 0)
-            c0blo_dbg = blo;
-          /* v4.9.3: delta = contour remap (nu-ufit)*d2 PLUS the
-             plateau restoration lerp(off0,off1,nu) -- at saturation
-             (nu->0/1) the remap vanishes and the restored plateau
-             remains, so narrow-feature interiors recover their
-             un-attenuated colour instead of the washed base value. */
-          /* steepening keeps the rmse-trust weight w; the plateau
-             restoration runs on its own smooth confidence w2v (the
-             erf tail misfit of tent-shaped line cores used to gate
-             the plateau away pixel-by-pixel = barcode teeth) */
-          float vr = w2v * gInn;
-          /* v4.9.4: at a pixel that every gate independently places
-             DEEP inside a proven washed feature, replace the smeared
-             consensus weight with full restoration: w2v is a blurred
-             confidence (max ~0.5-0.7 in firing zones) and paid only
-             ~60% of the proven depth back -- the -r 6 smiley strokes
-             stopped at ~215/255 ink (watercolor).  Where the base
-             model's own saturation puts the pixel squarely on this
-             side's plateau (nu ~ 0/1, uf ~ 1) and the value gate
-             agrees (gInn > .6), fire the proven offset at full
-             strength instead (still no weight when any gate is
-             partial, so rims/skirts keep the diluted path). */
-        if (nu < .02f && uf0 > .98f && gInn > .6f)
-            vr = gInn * uf0;
-          if (nu > .98f && uf1 > .98f && gInn > .6f)
-            vr = gInn * uf1;
-        /* dip-core tent component (v4.9.5): conservative same-sign
-             component of the two offsets, paid at the dip centre
-             where the side gates are silent; uses the ordinary
-             diluted weight (no fullfire -- shape, not depth). */
-          float t0 = off0e[c], t1 = off1e[c], tc = 0.f;
-          if (t0 * t1 > 0.f)
-            tc = fabsf(t0) < fabsf(t1) ? t0 : t1;
-          float v;
-          if (method == 3) {
-            v = clampf(o[c] + w * bil_delta[c], blo, bhi);
-          } else {
-            v = clampf(o[c] + w * ((nu - ufit0) * d2[c]) +
-                               vr * (uf0 * (1.f - nu) * off0e[c] +
-                                     uf1 * nu * off1e[c]) +
-                               w2v * gInn * uft * tc,
-                           blo, bhi);
-          }
-          if (method != 3 && wpeel > 0.f)
-            v = clampf(v + wpeel * (atap[c] - v), blo, bhi);
-          vv[c] = v;
-          vblo[c] = blo;
-          vbhi[c] = bhi;
-        }
-        /* v4.9.8 erf-gain post-map, applied to the FINISHED colour:
-           m -> Phi(zg * Phi^-1(m)) along the pixel's own proven
-           plateau line (see above), re-clamped to the local hull.
-           Alpha is left alone (smoke-fringe class, parked). */
-        float zm_dbg = -1.f, zmm_dbg = -1.f, zal_dbg = -1.f,
-              wz_dbg = 0.f;
-        {
-          /* endpoints = the pixel's OWN local colour hull (LOH:
-             separable extrema of observed colours, consensus-widened;
-             measured earlier: hull colours == NN colours within ~1
-             8-bit step inside NN zones), NOT the LSQ step amplitude,
-             which is under-read on washed flanks (m measured against
-             o+-.ufit*d2+offs was uncalibrated: |A| ~ 1.3 in a 0..1
-             range, P0 ~ -1).  m = hull fraction of the finished
-             colour; steepen in z-space: mm = Phi(zg * Phi^-1(m)). */
-          float num = 0.f, den = 0.f, calh = 0.f;
-          for (int c = 0; c < 3; c++) {
-            float Aq = vbhi[c] - vblo[c], rq = adb_srchi[c] - adb_srclo[c];
-            num += (vv[c] - vblo[c]) * Aq;
-            den += Aq * Aq;
-            calh += rq * rq;
-          }
-          calh = sqrtf(calh);
-          if (den > 1e-8f) {
-            float m = clampf(num / den, 0.f, 1.f);
-            float alh = sqrtf(den);
-            /* v4.9.8b corridor map: the base model reports this
-               pixel's signed offset mu from the PROVEN step centre.
-               Within the true-AA corridor |mu| <= a (= zaa*scale out
-               px) the rendered value is LEFT ALONE: it encodes the
-               feature's exact sub-pixel width -- information that
-               lives only in the boundary pixels' values; any
-               positional repaint (linear ramp etc.) destroys it
-               (crisp-GT check: MAE 13.2 -> 19+).  BEYOND the
-               corridor a mid value cannot be true anti-aliasing --
-               the underlying crisp image has its plateau there -- so
-               it is blur wash, mapped fully to the pixel's own
-               proven plateau (hull endpoint on the side d2 points
-               to, globally extended on global-extremes steps).
-               Monotone side selection + proven endpoints + hull
-               clamp: overshoot impossible by construction. */
-            {
-              static float zaa_env = -2.f;
-              if (zaa_env < -1.f) {
-                const char *e = getenv("CELUP_ZAA");
-                zaa_env = e && *e ? (float)atof(e) : 0.f;
-              }
-              if (zaa_env > 0.f)
-                zaa = zaa_env;
-            }
-            float a = zaa * scale;
-            float mmu = mu < 0.f ? -mu : mu;
-            /* v4.9.9 deblur completion.  The value map
-               mm = Phi(zg*Phi^-1(m)) has an unbreakable fixpoint at
-               m = .5: one washed mid column per contour always
-               survives (the residual "sharper halo").  A POSITIONAL
-               tie-break via the consensus step offset mu does not
-               work either: between a thin stroke's two flanks the
-               nearest-lobe step assignment flips per pixel, and
-               rendering that with a sub-pixel transition width is
-               salt-and-pepper (measured catastrophe v4.9.9a: the eye
-               ring doubled and hashed).  The stable tie-break is the
-               pixel's own COLOUR side: m is smooth (it is the
-               finished colour projected on the hull diagonal), so a
-               large-but-finite gain in m-space places the threshold
-               crossing on a smooth curve -- on quantized (step-class)
-               sources boost the value gain zg by ZBOOST (default 4x
-               => effective 12): everything with m < .47 snaps to its
-               own dark plateau, m > .53 to the bright one, and the
-               gray band shrinks to the sub-pixel strip where the
-               colour itself is truly mid.  Same construction, same
-               proof: monotone map, range (0,1), proven endpoints --
-               no overshoot is possible, only geometry decided by the
-               colour itself. */
-            /* step-class completion needs TWO premises: a quantized
-               source AND real blur to undo.  At -r <= ~1.2 the base
-               adds no composite wash -- the source staircase is then
-               true quantizer structure the renderer must preserve
-               verbatim (the -l 0.5 crisp probe: hide the treads and
-               the staircase detector goes toothless), so the
-               completion fades out there. */
-            float qq = ss01((adb_qconf - .60f) * (1.f / .30f)) *
-                       ss01((sref - 1.2f) * (1.f / .8f));
-            /* huge local hull span = a true step lives here, not a
-               smooth-gradient fragment (skin/hair shading spans far
-               less): extend the endpoints toward the source-global
-               range -- in a wide wash the local extrema never reach
-               the true plateau (the washed floor ~49/255 reads as the
-               "plateau"), so the snap targets the span the step
-               ACTUALLY connects.  calh = the source-GLOBAL channel
-               range span; rmp engages only when the local window
-               demonstrably straddles a global-extremes step. */
-            /* v4.9.9c full extension on quantized sources: the r6
-               wash band's local hull spans 60-90% of the global
-               range, so the proportional extension left (1-rcp) of
-               the washed floor inside the snap target -- measured
-               remnants .084 linear ~ lum 80.  On a step-class source
-               every map-admissible step is taken to connect the
-               source-global extremes (small local steps -- colour
-                 pairs in multi-level content -- never pass the alh
-                 admission floor), so extend to the extremes outright
-                 whenever the step-span gate fires at all. */
-            float rmp = ss01((alh - .22f * calh) * (1.f / .45f)) *
-                        ss01((adb_qconf - .5f) * (1.f / .3f));
-            /* v4.9.9 washed-core full extension ("remove the highest
-               caps"): the model claims this pixel sits DEEP on a
-               plateau (|z0| > 2.2) yet the finished colour still
-               floats > .18 away from the claimed level -- the local
-               window never saw the true level (a washed stroke core),
-               so on quantized sources extend to the source-global
-               extremes outright.  Spatially coherent (the |z0|
-               saturation zone is contiguous along the feature), and
-               photos never enter: qq = 0 there, the global-injection
-               fringe class stays locked out. */
-            float fullsat =
-                qq * ss01((fabsf(z0) - 2.2f) * (1.f / .8f)) *
-                ss01((fabsf(m - ufit0) - .18f) * (1.f / .15f));
-            float rcp = rmp > fullsat ? rmp : fullsat;
-            /* evidence: fit trust w, or flank-pair proof w2v
-               DISCOUNTED by how far the colour itself sits from the
-               steepened model's verdict (frame-flipped camps have nu
-               saturated against m; those keep the bare w). */
-#ifndef CELUP_EVW2V
-#define CELUP_EVW2V 1
-#endif
-            /* admission: fit trust w, plus flank-pair proof w2v
-               where the steepened model's verdict nu and the
-               measured colour fraction m DISAGREE -- the analytic
-               signature of blur wash (a genuine gradient has m ~ nu,
-               wash does not).  Frame-flip safety comes from the
-               target, not the gate: the map pays to the pixel's OWN
-               proven hull along the colour diagonal reached from its
-               own colour -- a frame-flipped fit changes WHICH side
-               the fit claims, never which side the colour is on. */
-            float mis = ss01((fabsf(nu - m) - .10f) * (1.f / .30f));
-            float evz = fmaxf(w, w2v * mis);
-            /* v4.9.9e straggler channel: occasionally a whole
-               vertical/horizontal strip of pixels carries HEAVY
-               model-vs-colour mismatch while both trust channels
-               read ~0 (the nearest-lobe framing is unstable along
-               the exact XY-pole rows of circles: wS and the flank-
-               pair restoration both fall silent there, and the map's
-               own gate then leaves the wash in place as a gray seam
-               cutting the ring -- the "additional blur at the poles"
-               the user sees).  The signature is unambiguous on a
-               quantized source: mismatch near full scale plus a hull
-               that still spans the global step.  Let the colour side
-               settle those too: the target is the same own proven
-               hull, so snap-away is still by-decision-only.  Photos:
-               qq = 0, unreachable. */
-            if (qq > 1e-3f) {
-              float alt = ss01((fabsf(nu - m) - .45f) *
-                               (1.f / .30f)) *
-                          qq * ss01((alh - .80f) * (1.f / .50f));
-              if (alt > evz)
-                evz = alt;
-            }
-            /* weight: real step span x corridor exit x evidence.
-               The true-AA corridor (|mu| <= a) is kept ONLY for
-               continuous sources: there the boundary column's value
-               encodes exact sub-pixel feature width (crisp-GT check:
-               repainting it costs MAE 13.2 -> 19).  On quantized
-               (step-class) sources that column is quantizer residue,
-               and its linear hull fraction (footprint-majority
-               coverage) assigns it to its own side's proven
-               plateau. */
-            float wz = ss01((evz - .10f) * (1.f / .4f)) *
-                       ss01((alh - .30f) * (1.f / .25f)) *
-                       fmaxf(ss01((mmu - a) * (1.f / .7f)), qq);
-            float elo3[3], ehi3[3];
-            for (int c = 0; c < 3; c++) {
-              elo3[c] = vblo[c] + rcp * (adb_srclo[c] - vblo[c]);
-              ehi3[c] = vbhi[c] + rcp * (adb_srchi[c] - vbhi[c]);
-            }
-            /* v4.9.9 evidence broadening: inside deep wash the erf
-               trust w is ~0 BY CONSTRUCTION (the wash is what the erf
-               cannot fit), so gating the deblur's own payment by w
-               alone starves exactly the stroke cores it exists for.
-               The flank-pair restoration evidence w2v, which is
-               proven there instead, is equally binding -- take the
-               max.  Geometry still comes from the proven hulls, so
-               the payment remains bounded by proven colours. */
-            /* outside the corridor: value-space erf-gain map of the
-               rendered colour (orientation-free: m is measured along
-               the hull diagonal, so the pass-1 u-reversal cannot
-               flip it); on quantized sources the gain is boosted to
-               an effectively hard (but smooth) threshold. */
-#ifndef CELUP_ZBOOST_DEF
-#define CELUP_ZBOOST_DEF 4.f
-#endif
-            float zge = zg;
-            {
-              static float zb_env = -1.f;
-              if (zb_env < 0.f) {
-                const char *e = getenv("CELUP_ZBOOST");
-                zb_env = e && *e ? (float)atof(e) : 0.f;
-              }
-              zge *= 1.f + qq * ((zb_env > 1.f ? zb_env
-                                                : CELUP_ZBOOST_DEF) -
-                                 1.f);
-            }
-            float mm = phi1(zge * probit01(m));
-            zm_dbg = m;
-            zmm_dbg = mm;
-            zal_dbg = alh;
-            wz_dbg = wz;
-            zmw = zno ? 0.f : wz;
-            zrmp = rcp;
-            if (!zno && wz > 1e-3f) {
-              /* cap removal: a strongly-firing gate pays in full --
-                 the partial lerp used to leave 30-50% of the proven
-                 deblur behind on exactly the washed pixels it exists
-                 for. */
-              /* cap removal, second pass: .30/.12 fullness -- the
-                 .55/.20 band left .1-linear floor remnants (lum 80)
-                 on exactly the pixels it half-paid.  Gates below
-                 keep their evidence role; the payment is binary. */
-              float wz2 =
-                  wz > .30f ? 1.f : ss01((wz - .12f) * (1.f / .18f));
-              for (int c = 0; c < 3; c++) {
-                /* target = mm-fraction across the channel's own HULL
-                   span (hull amplitude is proven; the LSQ d2
-                   amplitude is not -- a washed flank under-reads it
-                   ~2x), oriented per channel by the d2 sign (the
-                   pass-1 u-reversal flips the axis: never index
-                   plateaus as dark/bright). */
-                float tgt = elo3[c] + mm * (ehi3[c] - elo3[c]);
-                vv[c] =
-                    clampf(vv[c] + wz2 * (tgt - vv[c]), elo3[c],
-                           ehi3[c]);
-              }
-            }
-          }
-        }
-        for (int c = 0; c < 4; c++)
-          dd[c] += vv[c] - o[c];
-        /* The map owns this pixel's colour now: (a) pass 2's final
-           hull clamp must not raise the washed floor back onto it --
-           extend LOH toward the global range by the same rmp so the
-           later clamp agrees with the map's span; (b) record the map
-           weight so pass 2's staircase cleanup (which lerps the
-           pixel back toward the WASHED base average) and the
-           tangential delta smoothing stand down exactly where the
-           map fired. */
-        if (zmw > 1e-3f) {
-          ZM[idx] = zmw;
-          if (zrmp > 1e-3f)
-            for (int c = 0; c < 3; c++) {
-              float elo = vblo[c] + zrmp * (adb_srclo[c] - vblo[c]),
-                    ehi = vbhi[c] + zrmp * (adb_srchi[c] - vbhi[c]);
-              int lv = to_srgb[clampi((int)(clampf(elo, 0.f, 1.f) *
-                                            4096.f),
-                                      0, 4096)] -
-                       1,
-                  hv = to_srgb[clampi((int)(clampf(ehi, 0.f, 1.f) *
-                                            4096.f),
-                                      0, 4096)] +
-                       1;
-              if (lv < LOH[8 * idx + c])
-                LOH[8 * idx + c] = (uint8_t)clampi(lv, 0, 255);
-              if (hv > LOH[8 * idx + 4 + c])
-                LOH[8 * idx + 4 + c] = (uint8_t)clampi(hv, 0, 255);
-            }
-        }
-        {
-          static FILE *zm = NULL;
-          static int zm_on = -1;
-          if (zm_on < 0) {
-            const char *e = getenv("CELUP_ZDBG");
-            zm_on = e && *e;
-            if (zm_on)
-              zm = fopen(e, "w");
-          }
-          if (zm)
-            fprintf(zm,
-                    "%d %d %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f "
-                    "%.5f %.5f %.5f\n",
-                    x, y, w, w2v, nu, ufit0, wpeel, zal_dbg, zm_dbg,
-                    zmm_dbg, wz_dbg, o[0], vv[0]);
-        }
-        {
-          static FILE *wm = NULL;
-          static int wm_on = -1;
-          if (wm_on < 0) {
-            const char *e = getenv("CELUP_WMAP");
-            wm_on = e && *e;
-            if (wm_on)
-              wm = fopen(e, "w");
-          }
-          if (wm) {
-            float pabs_d =
-                aWL > 1e-6f
-                    ? sqrtf(aVX / aWL * (aVX / aWL) +
-                            aVY / aWL * (aVY / aWL))
-                    : 0.f;
-            fprintf(wm, "%d %d %.5f %.5f %.5f %.5f %.5f %.4f %.4f\n",
-                    x, y, w, w2v, nu, ufit0, wpeel, pabs_d);
-          }
-        }
-        if (dbg && y == dbg_y && abs(x - dbg_x) <= 16 && (x & 1) == 0)
-          fprintf(stderr,
-                  "DBGS %d,%d mu=%.3f s=%.3f k=%.3f ufit=%.4f nu=%.4f "
-                  "wSeff=%.4f w2=%.4f inn=%.3f gI=%.2f o0e=%.4f "
-                  "o1e=%.4f d2=%.4f v0=%.4f blo=%.4f (cons)\n",
-                  x, y, mu, s, k, ufit0, nu, w, w2v,
-                  aW2 > 1e-6f ? aR / aW2 : -.5f, gInn, off0e[0],
-                  off1e[0], d2[0],
-                  o[0] + w * ((nu - ufit0) * d2[0]) +
-                      w2v * gInn * (uf0 * (1.f - nu) * off0e[0] +
-                                    uf1 * nu * off1e[0]) +
-                      w2v * gInn * uft *
-                          (off0e[0] * off1e[0] > 0.f
-                               ? (fabsf(off0e[0]) < fabsf(off1e[0])
-                                      ? off0e[0]
-                                      : off1e[0])
-                               : 0.f),
-                  c0blo_dbg);
-      }
-    }
-  }
-  /* Pass 2: tangential smoothing of the residual delta.  Fit jitter is
-     already absorbed by the pass-1.5 consensus; this only polishes the
-     small delta noise of the flat-flatten path and any rounding of the
-     consensus evaluation.  Junction-aware taps (v4.9): a corner's delta
-     is not exchangeable with its contour neighbours' -- tangents rotate
-     there. */
-  for (int y = 0; y < dh; y++)
-    for (int x = 0; x < dw; x++) {
-      size_t idx = (size_t)y * dw + x;
-      const float *pf = PF + 25 * idx;
-      float cc = pf[7];
-      float acc[4] = {0, 0, 0, 0}, o[4], res[4], wsum = 0.f;
-      for (int to = -T; to <= T; to++) {
-        float wt = (float)(T + 1 - (to < 0 ? -to : to)), q[4], qc[25];
-        float sx = (float)x + (float)to * pf[8],
-              sy = (float)y + (float)to * pf[9];
-        sample_fn(PF, dw, dh, 25, sx, sy, qc);
-        wt *= sqrtf(cc * fmaxf(qc[7], 0.f));
-        sample_f4(DEL, dw, dh, sx, sy, q);
-        for (int c = 0; c < 4; c++)
-          acc[c] += wt * q[c];
-        wsum += wt;
-      }
-      /* v4.9.3 quant-staircase cleanup: on trusted ramp zones of a
-         hard-quantized source, smooth ALONG THE NORMAL (terraces run
-         parallel to the contour, so tangential smoothing cannot reach
-         them).  A [1,2,3,2,1]/9 average over +-2 normal offsets of the
-         RESTORED image (A + DEL, not the washed base) kills 3-6 px
-         terraces; it is DC-exact on linear shading, and the fitted
-         contour itself was already applied as the DELTA.  Blend weight
-         = qconf * wS so unfitted texture/flats stay verbatim, and the
-         hull clamp below still bounds the result. */
-      float navg[4] = {0, 0, 0, 0}, qn = 0.f;
-      if (!adb_noter && adb_qconf > 1e-3f && pf[0] > 1e-3f && wsum > 1e-6f) {
-        /* Skirt gate: terraces live on the ramp skirts (between the
-           quant steps); near the contour core (|z0| < ~1) smoothing
-           along the normal would bleed the corrected stroke colour
-           across the contour (the neon band regression).  Only the
-           skirt/plateau zones get the normal cleanup. */
-        float zmu = pf[1] / pf[0], zs = pf[2] / pf[0];
-        float z0 = fabsf((0.f - zmu) / (zs > .3f ? zs : .3f));
-        float skirt = ss01((z0 - 1.0f) * (1.f / 1.2f));
-        float wx = -pf[9], wy = pf[8], tw2 = 0.f;
-        static const float nk[5] = {1.f, 2.f, 3.f, 2.f, 1.f};
-        for (int no = -2; no <= 2; no++) {
-          float q[4];
-          sample_f4(A, dw, dh, (float)x + (float)no * wx,
-                    (float)y + (float)no * wy, q);
-          for (int c = 0; c < 4; c++)
-            navg[c] += nk[no + 2] * q[c];
-          tw2 += nk[no + 2];
-        }
-        float inv = tw2 > 1e-6f ? 1.f / tw2 : 0.f;
-        qn = adb_qconf * pf[0] * skirt * .7f *
-             (1.f - ss01((ZM[idx] - .05f) * (1.f / .25f)));
-        for (int c = 0; c < 4; c++)
-          navg[c] = qn * (navg[c] * inv - A[4 * idx + c]);
-      }
-      float zmq = ZM[idx];
-      for (int c = 0; c < 4; c++) {
-        o[c] = A[4 * idx + c];
-        float tang = wsum > 1e-6f ? acc[c] / wsum : 0.f;
-        /* v6.3 isotropic smoothing of delta for wide blur to reduce halo around gradient centres */
-        float iso = 0.f;
-        if (wide) {
-          float sum = 0.f;
-          for (int jy=-1; jy<=1; jy++) for (int ix=-1; ix<=1; ix++) {
-            int sx = x+ix, sy = y+jy;
-            if (sx<0) sx=0; if (sx>=dw) sx=dw-1;
-            if (sy<0) sy=0; if (sy>=dh) sy=dh-1;
-            sum += DEL[4 * ((size_t)sy * dw + sx) + c];
-          }
-          iso = sum / 9.f;
-        }
-        float delta = wide ? (0.55f * tang + 0.45f * iso) : tang;
-        float v = o[c] + delta;
-        /* v4.9.8: where the erf-gain map owns this pixel, keep its
-           own (mapped) delta instead of the tangentially averaged
-           one -- the average mixes the snapped colour with its
-           unmapped neighbours' wash and re-introduces the mid band
-           the map just removed. */
-        if (zmq > 1e-3f && wsum > 1e-6f)
-          v += zmq * .85f * (DEL[4 * idx + c] - acc[c] / wsum);
-        v += navg[c];
-        /* Final hull clamp (v4.9): pass-1.5 clamps each pixel's own
-           evaluation, but the smoothed delta can still leave the hull
-           by transport.  No output may leave the locally observed
-           colour range -- enforced here by construction. */
-        float blo = c < 3 ? to_linear[LOH[8 * idx + c]]
-                          : LOH[8 * idx + c] * (1.f / 255.f),
-              bhi = c < 3 ? to_linear[LOH[8 * idx + 4 + c]]
-                          : LOH[8 * idx + 4 + c] * (1.f / 255.f);
-        float range = bhi - blo;
-        float maxDelta = 0.20f * range;
-        v = clampf(v, o[c] - maxDelta, o[c] + maxDelta);
-        res[c] = clampf(v, blo, bhi);
-      }
-      /* v4.9.3 texture-residual gain (queue #1): where the 1D step model
-         abstained (wS low) AND there is real local contrast (not a flat),
-         crispen the base's own lattice detail, hull-clamped.  It is a
-         SEPARATE channel from the model residual (invariant #2 intact),
-         clamped to the window hull (invariant #1: no new colours), and
-         only fires where the deblur step model is OFF, so clean edges
-         and shading ramps are untouched. */
-      if (texgain > 0.f) {
-        float wS_pix = clampf(pf[0], 0.f, 1.f);
-        float model_off = 1.f - wS_pix;
-        float coh_dir = ramp01(clampf(pf[7], 0.f, 1.f), 0.20f, 0.55f);
-        float hull_rng = 0.f;
-        for (int c = 0; c < 3; c++) {
-          float blo = to_linear[LOH[8 * idx + c]],
-                bhi = to_linear[LOH[8 * idx + 4 + c]];
-          if (bhi - blo > hull_rng)
-            hull_rng = bhi - blo;
-        }
-        if (model_off > 0.05f && coh_dir > 0.02f && hull_rng > 0.02f) {
-          float g = texgain * model_off * coh_dir;
-          int xL = x > 0 ? x - 1 : 0, xR = x + 1 < dw ? x + 1 : dw - 1,
-              yU = y > 0 ? y - 1 : 0, yD = y + 1 < dh ? y + 1 : dh - 1;
-          for (int c = 0; c < 4; c++) {
-            float lap = 4.f * o[c] -
-                        A[4 * ((size_t)yU * dw + x) + c] -
-                        A[4 * ((size_t)yD * dw + x) + c] -
-                        A[4 * ((size_t)y * dw + xL) + c] -
-                        A[4 * ((size_t)y * dw + xR) + c];
-            float blo = c < 3 ? to_linear[LOH[8 * idx + c]]
-                              : LOH[8 * idx + c] * (1.f / 255.f),
-                  bhi = c < 3 ? to_linear[LOH[8 * idx + 4 + c]]
-                              : LOH[8 * idx + 4 + c] * (1.f / 255.f);
-            res[c] = clampf(res[c] + g * lap, blo, bhi);
-          }
-        }
-      }
-      put(dst + 4 * idx, res[0], res[1], res[2], res[3]);
-    }
-  }
-  memcpy(out, dst, n * 4);
-  free(dst);
-  free(LOH);
-  free(PF);
-  free(DEL);
-  free(A);
-  free(ZM);
-  return 1;
-}
-
+static void sample_f4(const float *img, int w, int h, float x, float y, float q[4]);
 /* autodeblur_analytic_pass -- the "analytical" deblur (method 3).
 
    A second, deliberately different deblur that does NOT use the per-pixel
@@ -5419,6 +2786,1053 @@ static int autodeblur_analytic_pass(uint8_t *out, int dw, int dh, float scale) {
 }
 
 static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
+                              int dw, int dh);
+/* Standard-normal CDF (libm erff). */
+static float phi1(float z) { return .5f * (1.f + erff(z * 0.70710678f)); }
+
+/* v4.9.8: inverse normal CDF Phi^-1(p), p in (0,1) -- Acklam's
+   rational approximation (max abs error ~3e-9 in z, far below the
+   1/255 output quantum).  Used by the erf-gain post-map. */
+static float probit01(float p) {
+  static const float a[6] = {-3.969683028665376e+01f,
+                             2.209460984245205e+02f,
+                             -2.759285104469687e+02f,
+                             1.383577518672690e+02f,
+                             -3.066479806614716e+01f,
+                             2.506628277459239e+00f};
+  static const float b[5] = {-5.447609879822406e+01f,
+                             1.615858368580409e+02f,
+                             -1.556989798598866e+02f,
+                             6.680131188771972e+01f,
+                             -1.328068155288572e+01f};
+  static const float c[6] = {-7.784894002430293e-03f,
+                             -3.223964580411365e-01f,
+                             -2.400758277161838e+00f,
+                             -2.549732539343734e+00f,
+                             4.374664141464968e+00f,
+                             2.938163982698783e+00f};
+  static const float d[4] = {7.784695709041462e-03f,
+                             3.224671290700398e-01f,
+                             2.445134137142996e+00f,
+                             3.754408661907416e+00f};
+  const float plow = .02425f, phigh = 1.f - .02425f;
+  if (p <= 1e-6f)
+    return -4.7534f; /* phi1(-4.7534) ~ 1e-6 */
+  if (p >= 1.f - 1e-6f)
+    return 4.7534f;
+  if (p < plow) {
+    float q = sqrtf(-2.f * logf(p));
+    return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) *
+                q +
+            c[5]) /
+           ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.f);
+  }
+  if (p <= phigh) {
+    float q = p - .5f, r = q * q;
+    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) *
+                r +
+            a[5]) *
+           q /
+           (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) *
+                r +
+            1.f);
+  }
+  {
+    float q = sqrtf(-2.f * logf(1.f - p));
+    return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) *
+                 q +
+             c[5]) /
+            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.f);
+  }
+}
+/* v6: trust gate further widened .04/.30 (was .03/.10 then .04/.22);
+   narrow gate zeroed many wide-blur fits (r=6) -> parameter ignoring.
+   Wide blur needs higher hi to keep fits. */
+static float trust_lo = .04f, trust_hi = .30f; /* debug override: CDG=lo,hi */
+
+/* v4.9.6 dip/line-profile helper: the box(h)-gauss(sig) dip shape,
+   normalized to 1 at the centre (p = |position - line centre|). */
+static float dipnorm(float p, float h, float sig) {
+  if (p < 0.f)
+    p = -p;
+  if (h < 0.f)
+    h = 0.f;
+  if (sig < .05f)
+    sig = .05f;
+  float den = 2.f * phi1(h / sig) - 1.f;
+  if (den < 1e-3f) { /* h << sig: gaussian-limit bump */
+    float z = p / sig;
+    return expf(-.5f * z * z);
+  }
+  return (phi1((p + h) / sig) - phi1((p - h) / sig)) / den;
+}
+
+#define ZSTAR_N 1024
+/* Half-width calibration: the |du|-weighted flank centroids of a
+   blurred line sit at the half-depth points of the box-gauss dip,
+   z*(r) sigma from centre, with r = true half-width / sigma.  For
+   r << 1 z* -> 1.177 (gaussian half-max); for r >> 1 z* -> r.  LUT
+   maps the observed half-span q (= z*) back to r. */
+#define ZSTAR_N 1024
+static float zstar_r[ZSTAR_N], zstar_z[ZSTAR_N];
+static int zstar_ready = 0;
+static void zstar_init(void) {
+  if (zstar_ready)
+    return;
+  for (int i = 0; i < ZSTAR_N; i++) {
+    float r = .02f * powf(400.f, (float)i / (float)(ZSTAR_N - 1));
+    float target = phi1(r) - .5f; /* dip(0)/2 */
+    float lo = 0.f, hi = r + 5.f;
+    if (target < 1e-4f) {
+      zstar_z[i] = 1.17741f;
+    } else {
+      for (int it = 0; it < 60; it++) {
+        float z = .5f * (lo + hi);
+        float du = phi1(z + r) - phi1(z - r);
+        if (du > target)
+          lo = z;
+        else
+          hi = z;
+      }
+      zstar_z[i] = .5f * (lo + hi);
+    }
+    zstar_r[i] = r;
+  }
+  zstar_ready = 1;
+}
+static float r_from_zstar(float q) {
+  zstar_init();
+  if (q <= zstar_z[0])
+    return zstar_r[0];
+  int lo = 0, hi = ZSTAR_N - 1;
+  while (hi - lo > 1) {
+    int mid = (lo + hi) / 2;
+    if (zstar_z[mid] <= q)
+      lo = mid;
+    else
+      hi = mid;
+  }
+  float t = (q - zstar_z[lo]) / (zstar_z[hi] - zstar_z[lo] + 1e-9f);
+  return zstar_r[lo] + clampf(t, 0.f, 1.f) * (zstar_r[hi] - zstar_r[lo]);
+}
+static float ss01(float z) {
+  z = clampf(z, 0.f, 1.f);
+  return z * z * (3.f - 2.f * z);
+}
+/* 3-parameter weighted profile fit on a projection line:
+   y = *A + *C*z + *B*phi(z), z = (j - R - mu)/s, weights wj over
+   [dl..dr].  Linear baseline = shading content; phi = the step to
+   deblur.  Degenerate pivot falls back to the 2-param amplitude fit. */
+static void lsq_profile(const float *raw, const float *wj, int dl, int dr,
+                        double mu, float s, int R, float *A, float *C,
+                        float *B) {
+  double sw = 0, sz = 0, szz = 0, sp = 0, spp = 0, szp = 0, sy = 0,
+         szy = 0, spy = 0;
+  float a = 0.f, b = 1.f, c = 0.f;
+  for (int j = dl; j <= dr; j++) {
+    if (wj[j] <= 1e-9f)
+      continue;
+    double z = (j - R - mu) / s, p = phi1((float)z), yv = raw[j],
+           w2 = wj[j];
+    sw += w2;
+    sz += w2 * z;
+    szz += w2 * z * z;
+    sp += w2 * p;
+    spp += w2 * p * p;
+    szp += w2 * z * p;
+    sy += w2 * yv;
+    szy += w2 * z * yv;
+    spy += w2 * p * yv;
+  }
+  double m00 = sw, m01 = sz, m02 = sp, m11 = szz, m12 = szp, m22 = spp,
+         c00 = m11 * m22 - m12 * m12, c01 = m02 * m12 - m01 * m22,
+         c02 = m01 * m12 - m02 * m11, c11 = m00 * m22 - m02 * m02,
+         c12 = m01 * m02 - m00 * m12, c22 = m00 * m11 - m01 * m01,
+         det = m00 * c00 + m01 * c01 + m02 * c02;
+  if (fabs(det) > 1e-9 * sw * sw * sw && sw > 1e-9) {
+    a = (float)((sy * c00 + szy * c01 + spy * c02) / det);
+    c = clampf((float)((sy * c01 + szy * c11 + spy * c12) / det), -.3f,
+               .3f);
+    b = clampf((float)((sy * c02 + szy * c12 + spy * c22) / det), .25f,
+               4.f);
+    a = clampf(a, -1.f, 2.f);
+  } else if (sw * m22 - sp * sp > 1e-12 && sw > 1e-9) {
+    double d2p = sw * m22 - sp * sp;
+    a = clampf((float)((sy * m22 - sp * spy) / d2p), -1.f, 2.f);
+    b = clampf((float)((sw * spy - sp * sy) / d2p), .25f, 4.f);
+  }
+  *A = a;
+  *C = c;
+  *B = b;
+}
+
+/* autodeblur core pass (v4.8: ANCHORED single-lobe profile steepening).
+
+   The v4.3..v4.6 pass steepened each channel independently toward
+   per-channel box-window extremes (hue inversion, boxy halos);
+   v4.7 introduced the 4D single-gradient sampling and the analytic
+   erf/pulse fit, but evaluated the steepened curve by inverting the
+   pixel's COLOUR: nu = phi(k * phi^-1(u_px)).  Review forensics:
+   - d(nu)/du = k at the ramp centre, so any pixel sitting epsilon off
+     the fitted curve rendered k*epsilon off -> outstanding pixels at
+     gradient centres;
+   - near plateaus phi^-1 explodes, turning flat noise into a colour
+     halo that starts at a line's centre and dies near its edge;
+   - one window-wide fit spanning a thin line mixed BOTH flanks and
+     BOTH backgrounds into one phantom step centred mid-line ("2
+     gradients surrounding the edge combined instead of not going
+     further than each other") -> snake-tongue forks at line caps;
+   - every output was snapped onto the fit's 1D colour segment,
+     discarding the orthogonal colour component -> "watered away
+     colors".
+
+   v4.8 keeps the v4.7 sampling (ONE gradient direction per pixel for
+   the whole premultiplied RGBA vector; tangentially averaged line
+   samples) but changes fit domain and evaluation:
+   - LOBE MAP: |du| along the normal is segmented into transition
+     lobes.  Each pixel is assigned its nearest lobe; plateau colours,
+     centre mu and width s come from THAT lobe alone with one-sided
+     margins clipped at neighbouring lobes -- two flanks and two
+     backgrounds never enter one fit.
+   - ANCHORED EVALUATION: the steepened fit is evaluated at the
+     pixel's GEOMETRIC position on the normal (t = 0), and the pixel's
+     own residual to the unsteepened fit is re-added with GAIN 1:
+     out = F_k(0) + (o - F(0)).  On-curve pixels steepen exactly by k;
+     off-curve deviations (texture, hue arcs, dither, alpha) pass
+     through unamplified; line interiors and plateaus evaluate to
+     plateau + residual = identity, so misassignment is never an
+     artifact.  Consequence: float steepness is now safe far beyond 8
+     (-g accepts 1..64), still capped so output ramps keep >= .6 px
+     sigma (no re-aliased sawtooth).
+   - MULTI-CROSSING trust replaces the beta2 gate: per-lobe fits are
+     all locally good inside dense texture, so suppression counts
+     hysteresis mid-level crossings over the whole window (step = 1,
+     one line = 2: full trust; 4+: crosshatch/hair-clump/text fades to
+     zero), beside the erf-RMSE-over-domain trust gate.
+   -D method 1 (remap): evaluate the slope-steepened fit at t = 0.
+   -D method 2 (push):  evaluate the ORIGINAL fit at a position
+     displaced toward the nearer plateau by (ufit-.5)(k-1)*s*1.5/s --
+     the Anime4K heightmap push in analytic form.
+
+   v4.9 review forensics (smiley test: rounded corners + smooth "neon"
+   glow around lines):
+   - CORNER ROUNDING: both tangential mechanisms (line-sample averaging
+     and pass-2 delta smoothing) assume the contour is translation-
+     invariant along its tangent.  At corners/tips that premise fails:
+     taps run AROUND the corner, the radial fit is diluted and the
+     sharpened edge is dissolved into an arc.  Fix: junction measure
+     rho = lambda2/lambda1 from the SAME structure tensor scales the
+     tangent span and the pass-2 tap weights -- a corner keeps its own
+     radial fit and stays sharp; straight contours are untouched.
+   - NEON GLOW (v4.9.1 redo): v4.9 "fixed" the skirt by rendering the
+     base at sigma r/min(K,8); the user rejected that instantly: the
+     crisp base brought the lattice staircase (-r 6 exists exactly to
+     blur it away), per-tread speckle and forked caps back.  The real
+     mechanism of the dark pre-edge band: the clamped projection kills
+     ramp tails whenever the window is narrower than the blur, and a
+     pure erf cannot represent step-on-linear-shading, so the fit
+     dragged whole shading gradients to a flat plateau colour.  v4.9.1
+     keeps the base at sigma R and fixes the FIT: raw (unclamped)
+     projection restores the tails, a linear+erf LS keeps shading in
+     the gain-1 residual, the drag amplitude is the locally proven
+     one-sided plateau span (robust against LS phi/linear degeneracy
+     BOTH ways), and a step-evidence coverage gate mutes fits where
+     the window does not contain the modelled transition.
+   - CONTOUR CONSENSUS: raw per-pixel fits misplaced mu by 1-2 out px
+     near wedge apexes (cornerstar48); anchored evaluation amplified
+     that ~k into +-0.25 colour deltas with alternating sign, and
+     delta transport pushed pixels outside the locally observed
+     colours.  Fix: pass 1.5 integrates the wS-weighted fit parameters
+     along the (junction-aware) tangent and re-derives z/k/nu from the
+     consensus; plus a convex-hull output clamp (deblur has no ringing
+     vocabulary), quantized in DISPLAY space. */
+/* Bilinear sampler for float4 fields (used for the tangential
+   anti-jitter smoothing of the model delta below). */
+static void sample_f4(const float *img, int w, int h, float x, float y,
+                      float q[4]) {
+  int ix = (int)floorf(x), iy = (int)floorf(y);
+  float fx = x - (float)ix, fy = y - (float)iy;
+  q[0] = q[1] = q[2] = q[3] = 0.f;
+  for (int j = 0; j < 2; j++)
+    for (int i = 0; i < 2; i++) {
+      float ww = (i ? fx : 1.f - fx) * (j ? fy : 1.f - fy);
+      const float *p =
+          img + 4 * ((size_t)clampi(iy + j, 0, h - 1) * w +
+                     clampi(ix + i, 0, w - 1));
+      for (int c = 0; c < 4; c++)
+        q[c] += ww * p[c];
+    }
+}
+
+/* Bilinear sampler for interleaved nc-channel float fields (the v4.9
+   fit-parameter field). */
+static void sample_fn(const float *img, int w, int h, int nc, float x,
+                      float y, float *q) {
+  int ix = (int)floorf(x), iy = (int)floorf(y);
+  float fx = x - (float)ix, fy = y - (float)iy;
+  for (int c = 0; c < nc; c++)
+    q[c] = 0.f;
+  for (int j = 0; j < 2; j++)
+    for (int i = 0; i < 2; i++) {
+      float ww = (i ? fx : 1.f - fx) * (j ? fy : 1.f - fy);
+      const float *p =
+          img + (size_t)nc * ((size_t)clampi(iy + j, 0, h - 1) * w +
+                              clampi(ix + i, 0, w - 1));
+      for (int c = 0; c < nc; c++)
+        q[c] += ww * p[c];
+    }
+}
+static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
+                           int method) {
+  size_t n = (size_t)dw * dh;
+  float *A = malloc(n * 4 * sizeof *A);
+  float *DEL = malloc(n * 4 * sizeof *DEL);  /* flat + model colour delta */
+  /* v4.9 fit-parameter field, wS-weighted: [wS, wS*mu, wS*s, wS*d2x4,
+     coh, tanx, tany].  Pass 1.5 integrates it ALONG THE CONTOUR so each
+     pixel is rendered from a contour-consensus fit instead of its own
+     jittering 1D fit (near-apex windows misplace mu by 1-2 out px and
+     raw per-pixel deltas swung +-0.25 with alternating sign). */
+  float *PF = malloc(n * 10 * sizeof *PF);
+  uint8_t *LOH = malloc(n * 8);              /* local hull, u8/chan    */
+  uint8_t *dst = malloc(n * 4);
+  if (!A || !DEL || !PF || !LOH || !dst) {
+    free(A);
+    free(DEL);
+    free(PF);
+    free(LOH);
+    free(dst);
+    return 0;
+  }
+  for (int y = 0; y < dh; y++)
+    for (int x = 0; x < dw; x++) {
+      float q[4];
+      raw_pm(out, dw, dh, x, y, q);
+      for (int c = 0; c < 4; c++)
+        A[4 * ((size_t)y * dw + x) + c] = q[c];
+    }
+  {
+    const char *cdg = getenv("CDG");
+    if (cdg)
+      sscanf(cdg, "%f,%f", &trust_lo, &trust_hi);
+  }
+  /* sref = ASSUMED source blur (window sizing, shading gate).  When the
+     reconstruction sigma was decoupled (v4.9) the assumed value is kept
+     separately: fitted_sigma is then the (smaller) base-render sigma. */
+  float sref0 = adb_assumed_sigma > 0.f ? adb_assumed_sigma : fitted_sigma;
+  float sref = sref0 > 1.f ? sref0 : 1.f;
+  int wide = scale * sref > 4.001f;
+  int R = wide ? clampi((int)(1.25f * scale * sref + .5f), 2, 64)
+               : clampi((int)(1.25f * scale + .5f), 2, 12);
+  int NS = 2 * R + 1; /* R <= 64 -> NS <= 129 */
+  /* v6: k from -s up to 16 (was 3 then 8) so -s 100 keeps effect;
+     manual -g still wins but cap looser. */
+  float kbase = deblur_steepness > 0.f
+                    ? deblur_steepness
+                    : clampf(1.f + .25f * (compress_strength - 1.f), 1.f, 16.f);
+  if (autodeblur_is_photo) {
+    /* for photos, don't quantize gradients into plateaus: cap k to 2.2 (was up to 16) */
+    kbase = fminf(kbase, 2.2f);
+  }
+  last_deblur_k = deblur_steepness > 0.f   ? deblur_steepness
+                  : edge_goal > 0.f        ? 0.f
+                                           : kbase;
+  float sa = 1.3f * scale * sref, sb = 2.4f * scale * sref;
+  float flatmix = .25f;
+  float capfloor = 0.6f;
+  float texgain = deblur_texgain;
+  { const char *e = getenv("CELUP_CAPFLOOR");
+    if (e) capfloor = strtof(e, 0); }
+  /* v6: T max 8 (was 6) to keep tangential averaging effective at wide r=6 */
+  int T = clampi((int)(scale * .75f + .35f * sref + .5f), 1, 32);
+  {
+    const char *e = getenv("CELUP_TSPAN");
+    if (e) {
+      float tm = strtof(e, 0);
+      if (tm > 0.f)
+        T = clampi((int)((float)T * tm + .5f), 1, 8);
+    }
+  }
+  /* per-fit diagnostic dump: CELUP_DBG=x,y prints the fit internals for
+     pixels near (x,y) (step 4 px) */
+  int dbg = 0, dbg_x = 96, dbg_y = 96;
+  {
+    const char *e = getenv("CELUP_DBG");
+    if (e) {
+      dbg = 1;
+      sscanf(e, "%d,%d", &dbg_x, &dbg_y);
+    }
+  }
+  for (int y = 0; y < dh; y++)
+    for (int x = 0; x < dw; x++) {
+      size_t idx = (size_t)y * dw + x;
+      float o[4];
+      for (int c = 0; c < 4; c++)
+        o[c] = A[4 * idx + c];
+      /* 4D structure tensor from per-channel Sobel taps on A. */
+      int xl = x > 0 ? x - 1 : 0, xr = x + 1 < dw ? x + 1 : dw - 1,
+          yu = y > 0 ? y - 1 : 0, yd = y + 1 < dh ? y + 1 : dh - 1;
+      float Jxx = 0.f, Jxy = 0.f, Jyy = 0.f;
+      for (int c = 0; c < 4; c++) {
+        float gx = A[4 * ((size_t)yu * dw + xr) + c] +
+                   2 * A[4 * ((size_t)y * dw + xr) + c] +
+                   A[4 * ((size_t)yd * dw + xr) + c] -
+                   A[4 * ((size_t)yu * dw + xl) + c] -
+                   2 * A[4 * ((size_t)y * dw + xl) + c] -
+                   A[4 * ((size_t)yd * dw + xl) + c],
+              gy = A[4 * ((size_t)yd * dw + xl) + c] +
+                   2 * A[4 * ((size_t)yd * dw + x) + c] +
+                   A[4 * ((size_t)yd * dw + xr) + c] -
+                   A[4 * ((size_t)yu * dw + xl) + c] -
+                   2 * A[4 * ((size_t)yu * dw + x) + c] -
+                   A[4 * ((size_t)yu * dw + xr) + c];
+        gx *= 1.f / 16.f;
+        gy *= 1.f / 16.f;
+        Jxx += gx * gx;
+        Jxy += gx * gy;
+        Jyy += gy * gy;
+      }
+      float trh = .5f * (Jxx - Jyy),
+            root = sqrtf(trh * trh + Jxy * Jxy),
+            lam = .5f * (Jxx + Jyy) + root;
+      /* v4.9 junction measure rho = lambda2/lambda1: ~0 on a straight
+         contour (translation-invariant ALONG it -- the premise of both
+         tangential line-sample averaging and pass-2 delta smoothing),
+         ->1 at corners/junctions where that premise fails.  coh scales
+         the tangent span and the pass-2 tap weights, so a corner keeps
+         its own radial fit (sharp tip) instead of being dissolved into
+         an arc by taps running around it; straight edges keep the full
+         anti-wobble averaging unchanged. */
+      float lam2 = .5f * (Jxx + Jyy) - root;
+      float rho = lam > 1e-12f ? lam2 / lam : 0.f;
+      /* Gate band tuned so long blurred arcs (rings/corner torture,
+         face contours) keep full tangential averaging and only genuine
+         junctions/tips (rho >= ~.3 on a 3x3 tensor) lose it. */
+      float coh = 1.f - ss01((rho - .10f) * (1.f / .20f));
+      float dirx = 1.f, diry = 0.f;
+      if (lam > 1e-12f) {
+        float vx = Jxy, vy = lam - Jxx;
+        if (vx * vx + vy * vy < 1e-18f) {
+          vx = lam - Jyy;
+          vy = Jxy;
+        }
+        float vl = vx * vx + vy * vy;
+        if (vl > 1e-18f) {
+          float inv = 1.f / sqrtf(vl);
+          dirx = vx * inv;
+          diry = vy * inv;
+        }
+      }
+      /* Line samples along the normal, TANGENTIALLY AVERAGED over a
+         small neighborhood perpendicular to it (v4.7 corner-scallop
+         fix): steepening an edge whose source staircase survived the
+         fit would otherwise amplify the source lattice into visible
+         S-wobbles along the contour.  Genuine edges are translation-
+         invariant along their contour, so averaging a few offset
+         normals keeps the profile while erasing the grid-periodic
+         jitter (period ~1 src px). */
+      float tanx = -diry, tany = dirx;
+      /* Coherence-scaled tangent span (v4.9): full T on straight
+         contours, 0 at junctions/corners/tips. */
+      int Teff = (int)((float)T * coh + .5f);
+      float C[129][4], u[129], raw[129],
+            lo[4] = {1e30f, 1e30f, 1e30f, 1e30f},
+            hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f},
+            mean[4] = {0, 0, 0, 0};
+      for (int j = 0; j < NS; j++) {
+        float t = (float)(j - R), acc[4] = {0, 0, 0, 0};
+        for (int to = -Teff; to <= Teff; to++) {
+          float q[4];
+          sample_pm(out, dw, dh, (float)x + t * dirx + (float)to * tanx,
+                    (float)y + t * diry + (float)to * tany, q);
+          for (int c = 0; c < 4; c++)
+            acc[c] += q[c];
+        }
+        float inv = 1.f / (2 * Teff + 1);
+        for (int c = 0; c < 4; c++) {
+          C[j][c] = acc[c] * inv;
+          mean[c] += C[j][c];
+          if (C[j][c] < lo[c])
+            lo[c] = C[j][c];
+          if (C[j][c] > hi[c])
+            hi[c] = C[j][c];
+        }
+      }
+      float rng = 0.f;
+      for (int c = 0; c < 3; c++)
+        if (hi[c] - lo[c] > rng)
+          rng = hi[c] - lo[c];
+      for (int c = 0; c < 4; c++)
+        mean[c] *= 1.f / NS;
+      /* Endpoint segment (both endpoints are REAL local colours). */
+      int mE = R / 3;
+      if (mE < 1)
+        mE = 1;
+      float CA[4] = {0, 0, 0, 0}, CB[4] = {0, 0, 0, 0}, d[4], L2;
+      for (int j = 0; j < mE; j++)
+        for (int c = 0; c < 4; c++) {
+          CA[c] += C[j][c];
+          CB[c] += C[NS - 1 - j][c];
+        }
+      L2 = 0.f;
+      for (int c = 0; c < 4; c++) {
+        CA[c] /= mE;
+        CB[c] /= mE;
+        d[c] = CB[c] - CA[c];
+        L2 += d[c] * d[c];
+      }
+      /* v4.9: the pixel-level fit parameters (consensus-evaluated in
+         pass 1.5); zero when no fit was made. */
+      float wS = 0.f, fmu = 0.f, fs = 0.f, fd2[4] = {0, 0, 0, 0};
+      if (L2 >= 6.4e-5f) { /* |d| >= .008: not a flat */
+        for (int j = 0; j < NS; j++) {
+          float uu = 0.f;
+          for (int c = 0; c < 4; c++)
+            uu += (C[j][c] - CA[c]) * d[c];
+          raw[j] = uu / L2; /* unclamped: ramp TAILS live here         */
+          u[j] = clampf(raw[j], 0.f, 1.f);
+        }
+        float corr = 0.f;
+        for (int j = 0; j < NS; j++)
+          corr += (float)(j - R) * u[j];
+        if (corr < 0.f) { /* orient u increasing along +t */
+          for (int j = 0; j < NS / 2; j++) {
+            for (int c = 0; c < 4; c++) {
+              float tmp = C[j][c];
+              C[j][c] = C[NS - 1 - j][c];
+              C[NS - 1 - j][c] = tmp;
+            }
+            float tu = u[j];
+            u[j] = u[NS - 1 - j];
+            u[NS - 1 - j] = tu;
+          }
+          float swp[4];
+          memcpy(swp, CA, sizeof swp);
+          memcpy(CA, CB, sizeof swp);
+          memcpy(CB, swp, sizeof swp);
+          for (int c = 0; c < 4; c++)
+            d[c] = -d[c];
+        }
+        float ul = 0.f, ur = 0.f;
+        for (int j = 0; j < mE; j++) {
+          ul += u[j];
+          ur += u[NS - 1 - j];
+        }
+        ul /= mE;
+        ur /= mE;
+        {
+          /* -------- v4.8: unified single-lobe erf profile fit ------ */
+          /* Lobe map: |du| along the normal is segmented into
+             transition lobes (runs above a relative floor, single-
+             sample dips bridged).  The pixel is assigned its NEAREST
+             lobe; the erf profile is fit on that lobe only, with
+             plateau colours taken one-sided from just outside it and
+             the domain clipped at neighbouring lobes -- a thin line's
+             two flanks and its two backgrounds ("2 gradients
+             surrounding edge") never combine into one phantom step,
+             and shading slopes on the plateaus never dilute the
+             moments.  Misassignment degrades to identity: far from the
+             lobe centre both nu and ufit saturate, so the output is
+             plateau + residual = the original pixel. */
+          float wj[129], wmax = 0.f, th;
+          int jl[16], jr[16], NL = 0;
+          wj[0] = wj[NS - 1] = 0.f;
+          for (int j = 1; j < NS - 1; j++) {
+            wj[j] = fabsf(raw[j + 1] - raw[j - 1]);
+            if (wj[j] > wmax)
+              wmax = wj[j];
+          }
+          th = wmax * .06f;
+          if (th < .004f)
+            th = .004f;
+          for (int j = 1; j < NS - 2 && NL < 16;) {
+            if (wj[j] < th) {
+              j++;
+              continue;
+            }
+            int a = j;
+            /* Run, bridging single-sample dips -- but a SATURATED flat
+               plateau (u pinned at 0/1 while |du| dies) is a hard
+               break: it is the interior of a thin line/tip, and the
+               raw (unclamped) wj keeps sloping there so without this
+               the two flanks merge into one phantom step exactly like
+               the pre-lobe-map days.  A saturated but still-sloping
+               ramp (neck skirt: u pinned, raw still falling) does NOT
+               break -- that tail belongs to the lobe. */
+            while (j + 1 < NS - 1 &&
+                   (wj[j + 1] >= th || (j + 2 < NS - 1 && wj[j + 2] >= th)) &&
+                   !((u[j + 1] <= .002f || u[j + 1] >= .998f) &&
+                     wj[j + 1] < th))
+              j++;
+            jl[NL] = a;
+            jr[NL] = j;
+            NL++;
+            j++;
+          }
+          if (NL > 0) {
+            int li = 0, lbest = INT_MAX;
+            for (int q = 0; q < NL; q++) {
+              int dist = R < jl[q] ? jl[q] - R : R > jr[q] ? R - jr[q] : 0;
+              if (dist < lbest) {
+                lbest = dist;
+                li = q;
+              }
+            }
+            /* Fit domain: lobe + one-sided plateau margins, clipped at
+               neighbouring lobes and window ends. */
+            int dl = jl[li] - mE, dr = jr[li] + mE;
+            if (li > 0 && dl <= jr[li - 1])
+              dl = jr[li - 1] + 1;
+            if (li + 1 < NL && dr >= jl[li + 1])
+              dr = jl[li + 1] - 1;
+            if (dl < 0)
+              dl = 0;
+            if (dr > NS - 1)
+              dr = NS - 1;
+            float P0[4], P1[4], d2[4], Ld2 = 0.f;
+            int n0 = 0, n1 = 0;
+            for (int c = 0; c < 4; c++) {
+              P0[c] = 0.f;
+              P1[c] = 0.f;
+            }
+            for (int j = dl; j <= dr; j++)
+              if (u[j] < .25f) {
+                n0++;
+                for (int c = 0; c < 4; c++)
+                  P0[c] += C[j][c];
+              } else if (u[j] > .75f) {
+                n1++;
+                for (int c = 0; c < 4; c++)
+                  P1[c] += C[j][c];
+              }
+            for (int c = 0; c < 4; c++) {
+              P0[c] = n0 ? P0[c] / n0 : C[jl[li]][c];
+              P1[c] = n1 ? P1[c] / n1 : C[jr[li]][c];
+              d2[c] = P1[c] - P0[c];
+              Ld2 += d2[c] * d2[c];
+            }
+            /* Full-lobe moments (v4.8): |du| centroid and second moment
+               over the whole lobe.  Windowed-moment refinements were
+               tried and rejected: a core-trimmed centroid halves the
+               tail lever arm but starves the width (sigma 6 reads as
+               2.5 -- the fit-trust gate then rejects every clean wide
+               ramp), and the Gaussian truncation inversion is exact
+               only for perfect Gaussians and flaps the gate per pixel.
+               The residual jitter of plain moments shows up only as
+               +/-1 LSB random dither on noisy synthetic ramps and is
+               suppressed where it is coherent: pass-2 tangential
+               smoothing. */
+            double W = 0, mu = 0, sq = 0;
+            for (int j = jl[li]; j <= jr[li]; j++) {
+              W += wj[j];
+              mu += wj[j] * (j - R);
+            }
+            if (Ld2 > 6.4e-5f && W > 1e-9) {
+              mu /= W;
+              for (int j = jl[li]; j <= jr[li]; j++) {
+                double t = j - R - mu;
+                sq += wj[j] * t * t;
+              }
+              float s = (float)sqrt(sq / W), lwm = .5f * (jr[li] - jl[li] + 1);
+              if (s < .3f)
+                s = .3f;
+              if (s > lwm)
+                s = lwm;
+              fmu = (float)mu;
+              fs = s;
+              /* Profile fit (v4.9.1): linear baseline + erf step on the
+                 RAW projection, y = a + c*z + b*phi(z).  The clamped u
+                 destroys ramp TAILS whenever the window is narrower
+                 than the blur (-r 6), and an erf alone cannot represent
+                 step-on-linear-shading: the explicit linear term takes
+                 the baked-in shading so phi only models the step.  The
+                 baseline cancels in v = o + b*(phi(kz)-phi(z))*d, so
+                 shading passes through the residual channel untouched.
+                 (A two-round centroid refinement on the step component
+                 was tried and REMOVED: re-centring mu on y-raw-c*z at
+                 tips/corners moved the fit grid ~.3 px and rounded
+                 them, and the plain single LS already produces a
+                 healthy b once the raw projection restores the ramp
+                 tails to the lobe map.) */
+              float ab_a, ab_b, ab_c;
+              lsq_profile(raw, wj, dl, dr, mu, s, R, &ab_a, &ab_c,
+                          &ab_b);
+              /* Drag amplitude = the one-sided PLATEAU SPAN (v4.8
+                 estimator, robust, shading-free), not the LS b.  On a
+                 soft wide ramp (decouple-reverted base) the 3-param LS
+                 systematically shifts contrast between phi and the
+                 near-parallel linear term, so ab_b reads low (~.7*sp)
+                 at tips and corners -> the render under-drags and
+                 rounds them; and on shaded skirts (-r 6) it can spike
+                 ABOVE the span -> flat-top dark "neon" band.  sp is
+                 the contrast the window itself PROVES between its two
+                 plateaus -- exactly the v4.8/v4.9 fd2 = d2 semantics.
+                 Bounds: nothing when b degenerates, 1.2x span when the
+                 fit spikes. */
+              float sp_dbg = -1.f;
+              if (n0 > 0 && n1 > 0) {
+                float sp = 0.f;
+                for (int c = 0; c < 4; c++)
+                  sp += (P1[c] - P0[c]) * d[c];
+                sp /= L2;
+                sp_dbg = sp;
+                float cap = fmaxf(sp, .03f) * 1.2f;
+                if (ab_b > cap)
+                  ab_b = cap;
+                if (ab_b < sp)
+                  ab_b = sp;
+                ab_c = clampf(ab_c, -.5f * cap, .5f * cap);
+              }
+              for (int c = 0; c < 4; c++)
+                fd2[c] = ab_b * d[c];
+              /* Step-evidence coverage (v4.9.1): a step fit is only
+                 admissible when the WINDOW's observed profile actually
+                 spans the modelled step amplitude [a, a+b].  A pixel
+                 more than R from the true edge sees only a linear
+                 shading slope; fitting a "step" there invents a phantom
+                 knee centred on the window itself and drags the shading
+                 (the dark pre-edge "neon" band).  Shading is shading:
+                 coverage < ~.55 fades trust to zero (pixel keeps its
+                 own colour), a fully captured rise keeps it. */
+              {
+                float rmin = 1e30f, rmax = -1e30f;
+                for (int j = 0; j < NS; j++) {
+                  if (raw[j] < rmin)
+                    rmin = raw[j];
+                  if (raw[j] > rmax)
+                    rmax = raw[j];
+                }
+                float bb = fabsf(ab_b) > .03f ? fabsf(ab_b) : .03f;
+                float cov =
+                    ((ab_a + ab_b < rmax ? ab_a + ab_b : rmax) -
+                     (ab_a > rmin ? ab_a : rmin)) /
+                    bb;
+                /* v5: wider blur needs lower coverage threshold (0.35 vs 0.55)
+                   else outer shading slopes kill trust and -r 6 leaves blur. */
+                float cov_thr = wide ? 0.35f : 0.55f;
+                wS *= ss01((cov - cov_thr) * (1.f / .25f));
+                if (dbg && y == dbg_y && abs(x - dbg_x) <= 16 &&
+                    (x & 3) == 0)
+                  fprintf(stderr, "DBGC %d,%d cov=%.3f raw[%.3f..%.3f] "
+                                  "step[%.3f..%.3f] thr=%.2f\n",
+                          x, y, cov, rmin, rmax, ab_a, ab_a + ab_b, cov_thr);
+              }
+              /* Steepness: -g pins k exactly (float, up to 64); -e
+                 adapts per edge; -s formula otherwise; always capped so
+                 the OUTPUT ramp never falls below .6 px sigma
+                 (~1.5 px 30% width): no re-aliased sawtooth, and
+                 already-crisp content is left alone (k -> 1). */
+              float k = kbase;
+              if (deblur_steepness <= 0.f && edge_goal > 0.f) {
+                float st = fmaxf(.6f, edge_goal * scale / 2.5f);
+                k = clampf(s / st, 1.f, 16.f);
+              }
+              /* v6.1: respect manual -g but tighter to suppress halo around gradient centres;
+                 wide blur (r=6) needs larger minw to avoid halo */
+              if (deblur_steepness > 0.f) {
+                float minw = 0.40f;
+                if (deblur_steepness > 16.f) minw = 0.35f;
+                if (deblur_steepness > 32.f) minw = 0.30f;
+                if (deblur_steepness > 50.f) minw = 0.25f;
+                if (wide) minw = fmaxf(minw, 1.60f);
+                k = fminf(k, s / minw);
+              } else {
+                k = fminf(k, s / .6f);
+              }
+              float z0 = (0.f - (float)mu) / s;
+              float ufit0 = phi1(z0), nu;
+              if (method == 2 && k > 1.f)
+                nu = phi1(z0 + (ufit0 - .5f) * (k - 1.f) * 1.5f);
+              else
+                nu = phi1(k * z0);
+              nu = clampf(nu, 0.f, 1.f);
+              wS = ss01((sb - s) / (sb - sa));
+              /* Fit-trust: RMSE of the erf fit over the full lobe,
+                 |du| weights (the weights concentrate the check on the
+                 lobe core, which is what the steepening actually
+                 moves; a curved/textured ramp misfits and trust
+                 fades). */
+              {
+                double en = 0, ed = 0;
+                for (int j = jl[li]; j <= jr[li]; j++) {
+                  float zj = ((float)(j - R) - (float)mu) / s;
+                  float fj = ab_a + ab_c * zj + ab_b * phi1(zj);
+                  en += wj[j] * (raw[j] - fj) * (raw[j] - fj);
+                  ed += wj[j];
+                }
+                if (ed > 1e-9) {
+                  float rmse = (float)sqrt(en / ed);
+                  float trust_lo_eff = wide ? 0.04f : 0.03f;
+                  float trust_hi_eff = wide ? 0.30f : 0.22f;
+                  wS *= ss01((trust_hi_eff - rmse) /
+                             (trust_hi_eff - trust_lo_eff + 1e-9f));
+                }
+              }
+              /* Multi-crossing trust (whole-window property; replaces
+                 the v4.7 beta2 gate): per-lobe fits are ALL locally
+                 good inside dense texture, so crosshatch/hair-clump/
+                 text suppression must look at the window: count mid-
+                 level crossings with hysteresis.  A step crosses 1x,
+                 one line 2x (full trust), 4x+ (dense structure) fades
+                 to zero. */
+              {
+                float lmed = .5f * (ul + ur);
+                int side = 0, cross = 0;
+                for (int j = 0; j < NS; j++) {
+                  if (side <= 0 && u[j] > lmed + .02f) {
+                    cross += side < 0;
+                    side = 1;
+                  } else if (side >= 0 && u[j] < lmed - .02f) {
+                    cross += side > 0;
+                    side = -1;
+                  }
+                }
+                /* v5: for wide blur allow more crossings (quantization
+                   can create spurious crossings), threshold raised. */
+                float cross0 = wide ? 3.0f : 2.25f;
+                float cross1 = wide ? 3.5f : 2.5f;
+                wS *= 1.f - ss01(((float)cross - cross0) / cross1);
+              }
+              /* Validity gate (v4.9): at junctions/corners/line caps
+                 the 1D ramp model is outside its domain -- the window
+                 mixes both arms of a wedge and 'assigns' bright-side
+                 pixels to the dark segment (cornerstar apex: bright
+                 pixels darkened by |delta| ~ .9, transported around
+                 the tip by pass-2).  Downweight to coh: junctions
+                 keep the crisp base sample (source-faithful sharp
+                 tip) instead of a bogus 1D fit; straight contours
+                 (coh ~ 1) are untouched. */
+              wS *= coh;
+              // mu penalty disabled for tip
+              if (dbg && y == dbg_y && abs(x - dbg_x) <= 16 &&
+                  (x & 3) == 0) {
+                double en = 0, ed = 0;
+                for (int j = jl[li]; j <= jr[li]; j++) {
+                  float zj = ((float)(j - R) - (float)mu) / s;
+                  float fj = ab_a + ab_c * zj + ab_b * phi1(zj);
+                  en += wj[j] * (raw[j] - fj) * (raw[j] - fj);
+                  ed += wj[j];
+                }
+                fprintf(stderr,
+                        "DBG %d,%d NL=%d lobe[%d..%d] dom[%d..%d] "
+                        "W=%.3f mu=%.3f s=%.3f k=%.3f z0=%.3f ufit=%.4f "
+                        "nu=%.4f wS=%.4f rmse=%.4f Ld2=%.5f coh=%.2f "
+                        "Teff=%d a=%.3f c=%.3f b=%.3f sp=%.3f\n",
+                        x, y, NL, jl[li], jr[li], dl, dr, W, mu, s, k,
+                        z0, ufit0, nu, wS, ed > 1e-9 ? sqrt(en / ed) : -1.,
+                        Ld2, coh, Teff, ab_a, ab_c, ab_b, sp_dbg);
+              }
+            }
+          }
+        }
+      }
+      /* Store the flat-flatten part of the delta, the wS-weighted fit
+         parameter field for the pass-1.5 contour-consensus evaluation,
+         and the local colour hull (u8) for the hull clamp; the pixel's
+         own fit residual is NOT stored: it is re-added unsmoothed at
+         write time via o[c] (texture stays per-pixel). */
+      {
+        float fw = ss01((.025f - rng) * (1.f / .017f)) * (1.f - wS);
+        float *dd = DEL + 4 * idx, *p = PF + 10 * idx;
+        for (int c = 0; c < 4; c++)
+          dd[c] = fw * flatmix * (mean[c] - o[c]);
+        p[0] = wS;
+        p[1] = wS * fmu;
+        p[2] = wS * fs;
+        for (int c = 0; c < 4; c++)
+          p[3 + c] = wS * fd2[c];
+        p[7] = coh;
+        p[8] = -diry; /* tangent of the fitted contour */
+        p[9] = dirx;
+        /* Hull codes in DISPLAY space (sRGB u8 for colour, linear u8
+           for alpha): linear-space u8 codes have no usable resolution
+           at the dark end (0.12 sRGB = 0.012 linear = code 3), which
+           made the first hull clamp toothless exactly where fringes
+           live. */
+        for (int c = 0; c < 4; c++) {
+          int lv, hv;
+          if (c < 3) {
+            lv = to_srgb[clampi((int)(clampf(lo[c], 0.f, 1.f) * 4096.f),
+                                0, 4096)] -
+                 1;
+            hv = to_srgb[clampi((int)(clampf(hi[c], 0.f, 1.f) * 4096.f),
+                                0, 4096)] +
+                 1;
+          } else {
+            lv = (int)(clampf(lo[c], 0.f, 1.f) * 255.f) - 1;
+            hv = (int)(clampf(hi[c], 0.f, 1.f) * 255.f + .999f) + 1;
+          }
+          LOH[8 * idx + c] = (uint8_t)clampi(lv, 0, 255);
+          LOH[8 * idx + 4 + c] = (uint8_t)clampi(hv, 0, 255);
+        }
+      }
+    }
+  /* Pass 1.5: contour-consensus evaluation (v4.9).  Raw per-pixel fits
+     jitter (mu by up to 1-2 out px near wedges/apexes) and the anchored
+     output renders that jitter amplified ~k-fold -- pass-2 delta
+     smoothing patched the symptom, this treats the cause: the fit
+     parameters themselves are constant/move coherently ALONG a genuine
+     contour, so integrate the wS-weighted parameter field along the
+     tangent (junction-aware weights, wS as the weight of evidence --
+     junction-gated and untrusted pixels contribute no mass) and render
+     each pixel from the CONSENSUS fit: z, k, nu are recomputed from the
+     smoothed mu/s so the anchored evaluation stays exact, and the
+     pixel's own residual (o - F(smoothed fit)) is still re-added per
+     pixel at gain 1.  The local convex-hull clamp (no ringing
+     vocabulary: erf tail-shape misfit at the ramp foot once drove the
+     step48 dark flank .149 -> .027) bounds the result to the colours
+     observed in the pixel's own window. */
+  for (int y = 0; y < dh; y++)
+    for (int x = 0; x < dw; x++) {
+      size_t idx = (size_t)y * dw + x;
+      const float *pf = PF + 10 * idx;
+      float tanx = pf[8], tany = pf[9], cc = pf[7];
+      float aW = 0.f, aMu = 0.f, aS = 0.f, aD[4] = {0, 0, 0, 0},
+            wsum = 0.f, tw[9], tmu[9];
+      for (int to = -T; to <= T; to++) {
+        float wt = (float)(T + 1 - (to < 0 ? -to : to)), q[10];
+        sample_fn(PF, dw, dh, 10, (float)x + (float)to * tanx,
+                  (float)y + (float)to * tany, q);
+        wt *= sqrtf(cc * fmaxf(q[7], 0.f));
+        tw[to + T] = wt;
+        tmu[to + T] = q[0] > 1e-9f ? q[1] / q[0] : 0.f;
+        aW += wt * q[0];
+        aMu += wt * q[1];
+        aS += wt * q[2];
+        for (int c = 0; c < 4; c++)
+          aD[c] += wt * q[3 + c];
+        wsum += wt;
+      }
+      if (aW > 1e-6f && wsum > 1e-6f) {
+        float o[4];
+        float mu = aMu / aW, s = aS / aW, w = aW / wsum, d2[4];
+        // mu far penalty disabled
+        for (int c = 0; c < 4; c++) {
+          d2[c] = aD[c] / aW;
+          o[c] = A[4 * idx + c];
+        }
+        /* Steepness from the CONSENSUS width: same rules as pass 1,
+           then governed by the mu SPREAD along the tangent.  A k-
+           steepened step renders a mu disagreement of d px as an edge
+           displaced ~d*k -- the dark pre-edge "neon" bands are exactly
+           that on shaded wide ramps (-r 6).  Straight stable contours
+           read std << .5 px and keep full k; skirts/wedges/dense zones
+           with std >= ~2.5 px get k -> 1 (left at their own slope). */
+        float k = kbase, vmu = 0.f, wt2 = 0.f;
+        for (int to = -T; to <= T; to++) {
+          if (tw[to + T] <= 0.f)
+            continue;
+          float dd = tmu[to + T] - (float)mu;
+          vmu += tw[to + T] * dd * dd;
+          wt2 += tw[to + T];
+        }
+        float mu_std = wt2 > 1e-9f ? sqrtf(vmu / wt2) : 0.f;
+        /* v6.1: mild mu_std governor to suppress halo around gradient centres.
+           Straight edges std <<0.5 keep full k; jittery fits >0.8 reduce k and w. */
+        if (mu_std > 10.0f) {
+          float tt = clampf((mu_std - 1.5f)/1.2f, 0.f, 1.f);
+          float damp = 1.f - ss01(tt);
+          k = 1.f + (k - 1.f) * damp;
+          w *= 1.f - 0.5f * ss01(tt);
+        }
+        if (deblur_steepness <= 0.f && edge_goal > 0.f) {
+          float st = fmaxf(.6f, edge_goal * scale / 2.5f);
+          k = clampf(s / st, 1.f, 16.f);
+        }
+        if (deblur_steepness > 0.f) {
+          float minw = 0.40f;
+          if (deblur_steepness > 16.f) minw = 0.35f;
+          if (deblur_steepness > 32.f) minw = 0.30f;
+          if (deblur_steepness > 50.f) minw = 0.25f;
+          if (wide) minw = fmaxf(minw, 1.60f);
+          k = fminf(k, s / minw);
+        } else {
+          k = fminf(k, s / .6f);
+        }
+        /* Anchored evaluation (v4.8) on the consensus fit. */
+        float z0 = (0.f - mu) / s;
+        float ufit0 = phi1(z0), nu;
+        if (method == 2 && k > 1.f)
+          nu = phi1(z0 + (ufit0 - .5f) * (k - 1.f) * 1.5f);
+        else
+          nu = phi1(k * z0);
+        nu = clampf(nu, 0.f, 1.f);
+        float *dd = DEL + 4 * idx;
+        for (int c = 0; c < 4; c++) {
+          float blo = c < 3 ? to_linear[LOH[8 * idx + c]]
+                            : LOH[8 * idx + c] * (1.f / 255.f),
+                bhi = c < 3 ? to_linear[LOH[8 * idx + 4 + c]]
+                            : LOH[8 * idx + 4 + c] * (1.f / 255.f);
+          float v = clampf(o[c] + w * (nu - ufit0) * d2[c], blo, bhi);
+          dd[c] += v - o[c];
+        }
+        if (dbg && y == dbg_y && abs(x - dbg_x) <= 16 && (x & 3) == 0)
+          fprintf(stderr,
+                  "DBGS %d,%d mu=%.3f s=%.3f k=%.3f ufit=%.4f nu=%.4f "
+                  "wSeff=%.4f mu_std=%.3f (consensus)\n",
+                  x, y, mu, s, k, ufit0, nu, w, mu_std);
+      }
+    }
+  /* Pass 2: tangential smoothing of the residual delta.  Fit jitter is
+     already absorbed by the pass-1.5 consensus; this only polishes the
+     small delta noise of the flat-flatten path and any rounding of the
+     consensus evaluation.  Junction-aware taps (v4.9): a corner's delta
+     is not exchangeable with its contour neighbours' -- tangents rotate
+     there. */
+  for (int y = 0; y < dh; y++)
+    for (int x = 0; x < dw; x++) {
+      size_t idx = (size_t)y * dw + x;
+      const float *pf = PF + 10 * idx;
+      float cc = pf[7];
+      float acc[4] = {0, 0, 0, 0}, o[4], res[4], wsum = 0.f;
+      for (int to = -T; to <= T; to++) {
+        float wt = (float)(T + 1 - (to < 0 ? -to : to)), q[4], qc[10];
+        float sx = (float)x + (float)to * pf[8],
+              sy = (float)y + (float)to * pf[9];
+        sample_fn(PF, dw, dh, 10, sx, sy, qc);
+        wt *= sqrtf(cc * fmaxf(qc[7], 0.f));
+        sample_f4(DEL, dw, dh, sx, sy, q);
+        for (int c = 0; c < 4; c++)
+          acc[c] += wt * q[c];
+        wsum += wt;
+      }
+      for (int c = 0; c < 4; c++) {
+        o[c] = A[4 * idx + c];
+        float tang = wsum > 1e-6f ? acc[c] / wsum : 0.f;
+        /* v6.3 isotropic smoothing of delta for wide blur to reduce halo around gradient centres */
+        float iso = 0.f;
+        if (wide) {
+          float sum = 0.f;
+          for (int jy=-1; jy<=1; jy++) for (int ix=-1; ix<=1; ix++) {
+            int sx = x+ix, sy = y+jy;
+            if (sx<0) sx=0; if (sx>=dw) sx=dw-1;
+            if (sy<0) sy=0; if (sy>=dh) sy=dh-1;
+            sum += DEL[4 * ((size_t)sy * dw + sx) + c];
+          }
+          iso = sum / 9.f;
+        }
+        float delta = wide ? (0.55f * tang + 0.45f * iso) : tang;
+        float v = o[c] + delta;
+        float blo = c < 3 ? to_linear[LOH[8 * idx + c]]
+                          : LOH[8 * idx + c] * (1.f / 255.f),
+              bhi = c < 3 ? to_linear[LOH[8 * idx + 4 + c]]
+                          : LOH[8 * idx + 4 + c] * (1.f / 255.f);
+        float range = bhi - blo;
+        float maxDelta = 0.20f * range;
+        v = clampf(v, o[c] - maxDelta, o[c] + maxDelta);
+        res[c] = clampf(v, blo, bhi);
+      }
+      put(dst + 4 * idx, res[0], res[1], res[2], res[3]);
+    }
+  memcpy(out, dst, n * 4);
+  free(dst);
+  free(LOH);
+  free(PF);
+  free(DEL);
+  free(A);
+  return 1;
+}
+
+static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
                               int dw, int dh) {
   /* v6.4 photo detection: if image is photo-like (not pixel-art, many soft links, many colours), reduce deblur strength to avoid plateau quantization */
   {
@@ -5443,39 +3857,12 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
      blends -- by the lobe map, consensus evaluation and hull clamp. */
   adb_sigma_div = 0.f;
   adb_assumed_sigma = 0.f;
-  adb_qconf = estimate_qconf(in, sw, sh);
-  if (adb_qconf > 1e-3f)
-    fprintf(stderr,
-            "source quantization: qconf=%.2f (hard-quantized; terrace "
-            "smoothing engaged on trusted ramps)\n",
-            adb_qconf);
-  for (int c = 0; c < 3; c++) {
-    adb_srclo[c] = 1e30f;
-    adb_srchi[c] = -1e30f;
-  }
-  for (long k = 0; k < (long)sw * sh; k++) {
-    float q[4];
-    raw_pm(in, sw, sh, (int)(k % sw), (int)(k / sw), q);
-    for (int c = 0; c < 3; c++) {
-      if (q[c] < adb_srclo[c])
-        adb_srclo[c] = q[c];
-      if (q[c] > adb_srchi[c])
-        adb_srchi[c] = q[c];
-    }
-  }
   if (!upscale_autoblur(in, sw, sh, out, dw, dh))
     return 0;
   int method = deblur_method;
-  if (method == 3) {
-    /* analytical deblur: opt-in global gradient-field ramp narrowing.  It has
-       its own pass (full-image gradient, not the per-pixel erf fit) and its
-       own inverted -g semantics, so it is not part of the auto proxy. */
-    last_deblur_method = 3;
-    return autodeblur_analytic_pass(out, dw, dh, (float)dw / sw);
-  }
   if (method)
     fprintf(stderr, "autodeblur method %s (manual)\n",
-            method == 1 ? "remap" : (method == 2 ? "push" : "compress2x2"));
+            method == 1 ? "remap" : "push");
   if (!method) {
     /* Auto-choice over the implemented deblur methods with the same
        self-supervised 2x-downscale proxy the blur fit uses: whichever
@@ -5487,15 +3874,15 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
       uint8_t *recon = malloc((size_t)sw * sh * 4);
       double bs = 1e300;
       if (train && recon)
-        for (int m = 1; m <= 3; m++) {
+        for (int m = 1; m <= 2; m++) {
           if (!render_soft(train, tw, th, recon, sw, sh, fitted_kernel,
                            fitted_sigma, fitted_curve, fitted_cp))
             continue;
-          if (!autodeblur_pass(recon, sw, sh, (float)sw / tw, m, train, tw, th))
+          if (!autodeblur_pass(recon, sw, sh, (float)sw / tw, m))
             continue;
           double s = image_pm_mse(recon, in, sw, sh, 2);
           fprintf(stderr, "autodeblur method %s proxy MSE %.8g\n",
-                  m == 1 ? "remap" : (m == 2 ? "push" : "compress2x2"), s);
+                  m == 1 ? "remap" : "push", s);
           if (s < bs) {
             bs = s;
             method = m;
@@ -5504,28 +3891,13 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
       free(train);
       free(recon);
       fprintf(stderr, "autodeblur auto-selected %s\n",
-              method == 1 ? "remap" : (method == 2 ? "push" : "compress2x2"));
+              method == 1 ? "remap" : "push");
     }
   }
   last_deblur_method = method;
-  return autodeblur_pass(out, dw, dh, (float)dw / sw, method, in, sw, sh);
-}
-
-/* Analytical deblur (method 3): whole-image consistent gradient push.
-   Semantics inverted: deblur_steepness==1 is maximum deblur (push to single point),
-   higher values reduce deblur. No case-specific safety gates. Uses 4-color
-   premultiplied RGBA vector gradients; reconstructs by pushing start/end of
-   each gradient ramp toward each other. Avoids premul blending artifacts by
-   direct linear reconstruction on the segment. */
-static int analytical_deblur_pass(uint8_t *out, int dw, int dh, float scale) {
-  /* Reuse the existing autodeblur machinery but with method=3 semantics.
-     For a full implementation the pass would be rewritten to do global
-     gradient analysis; here we delegate to the core pass with inverted
-     steepness handling (1 = max push). */
-  /* The core pass already supports the structure; we simply call it and
-     treat deblur_steepness semantics as inverted inside autodeblur_pass
-     when method==3. (Implementation detail kept minimal for consistency.) */
-  return autodeblur_pass(out, dw, dh, scale, 3);
+  if (method == 3)
+    return autodeblur_analytic_pass(out, dw, dh, (float)dw / sw);
+  return autodeblur_pass(out, dw, dh, (float)dw / sw, method);
 }
 
 /* ---------------------------------------------------------------------------
@@ -5612,10 +3984,10 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
       /* Checker/Nyquist ambiguity suppresses seeding outright: re-fitting
          geometry there invents structure the class policy says we cannot
          know. */
-      float ck = cm.w_edge[k] * (1.f - cm.w_checker[k]) * (1.f - cm.w_junction[k]);
+      float ck = cm.w_edge[k] * (1.f - cm.w_checker[k]);
       float gx = cm.edge_gx[k], gy = cm.edge_gy[k];
       float g2 = gx * gx + gy * gy;
-      if (ck <= .18f || g2 < .08f * .08f || g2 > 1.8f * 1.8f)
+      if (ck <= .35f || g2 < .12f * .12f || g2 > 1.4f * 1.4f)
         continue;
       float g = sqrtf(g2);
       /* De-dilute the ramp width.  The classifier's t-plane gradient comes
@@ -5650,7 +4022,7 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
           float d = (t - .5f) * invg;
           /* Trust the plane only near its own ramp: a short segment's fit
              must not ghost-extend its contour across empty space. */
-          if (fabsf(d) > 3.5f)
+          if (fabsf(d) > 2.6f)
             continue;
           float Kw = ck * expf(-r2 / (2.f * 1.5f * 1.5f));
           size_t kp = (size_t)py * sw + px;
@@ -5678,10 +4050,11 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
       float inv = 1.f / iw;
       for (int c = 0; c < 10; c++)
         f[c] *= inv;
+      f[10] *= ramp01(iw, .15f, .5f);
     }
   }
   free(accw);
-  /* Straighten + coherence-gate: four [1,2,1]^2 passes relax residual stair
+  /* Straighten + coherence-gate: one [1,2,1]^2 pass relaxes residual stair
      wobble to the chord, then |grad d| is estimated from the smoothed
      field. */
   {
@@ -5689,36 +4062,32 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
     if (d0 && d1) {
       for (size_t k = 0; k < n; k++)
         d0[k] = fld[11 * k];
-      for (int iter = 0; iter < 4; iter++) {
-        for (int y = 0; y < sh; y++)
-          for (int x = 0; x < sw; x++) {
-            size_t k = (size_t)y * sw + x;
-            d1[k] = (d0[(size_t)y * sw + clampi(x - 1, 0, sw - 1)] +
-                     2.f * d0[k] +
-                     d0[(size_t)y * sw + clampi(x + 1, 0, sw - 1)]) *
-                    .25f;
-          }
-        for (int y = 0; y < sh; y++)
-          for (int x = 0; x < sw; x++) {
-            size_t k = (size_t)y * sw + x;
-            d0[k] =
-                (d1[(size_t)clampi(y - 1, 0, sh - 1) * sw + x] + 2.f * d1[k] +
-                 d1[(size_t)clampi(y + 1, 0, sh - 1) * sw + x]) *
-                .25f;
-          }
-      }
-      for (size_t k = 0; k < n; k++)
-        fld[11 * k] = d0[k];
       for (int y = 0; y < sh; y++)
         for (int x = 0; x < sw; x++) {
           size_t k = (size_t)y * sw + x;
-          float gx = (d0[(size_t)y * sw + clampi(x + 1, 0, sw - 1)] -
-                      d0[(size_t)y * sw + clampi(x - 1, 0, sw - 1)]) *
+          d1[k] = (d0[(size_t)y * sw + clampi(x - 1, 0, sw - 1)] +
+                   2.f * d0[k] +
+                   d0[(size_t)y * sw + clampi(x + 1, 0, sw - 1)]) *
+                  .25f;
+        }
+      for (int y = 0; y < sh; y++)
+        for (int x = 0; x < sw; x++) {
+          size_t k = (size_t)y * sw + x;
+          fld[11 * k] =
+              (d1[(size_t)clampi(y - 1, 0, sh - 1) * sw + x] + 2.f * d1[k] +
+               d1[(size_t)clampi(y + 1, 0, sh - 1) * sw + x]) *
+              .25f;
+        }
+      for (int y = 0; y < sh; y++)
+        for (int x = 0; x < sw; x++) {
+          size_t k = (size_t)y * sw + x;
+          float gx = (d1[(size_t)y * sw + clampi(x + 1, 0, sw - 1)] -
+                      d1[(size_t)y * sw + clampi(x - 1, 0, sw - 1)]) *
                      .5f;
-          float gy = (d0[(size_t)clampi(y + 1, 0, sh - 1) * sw + x] -
-                      d0[(size_t)clampi(y - 1, 0, sh - 1) * sw + x]) *
+          float gy = (d1[(size_t)clampi(y + 1, 0, sh - 1) * sw + x] -
+                      d1[(size_t)clampi(y - 1, 0, sh - 1) * sw + x]) *
                      .5f;
-          fld[11 * k + 10] *= ramp01(sqrtf(gx * gx + gy * gy), .05f, .20f);
+          fld[11 * k + 10] *= ramp01(sqrtf(gx * gx + gy * gy), .5f, .8f);
         }
     }
     free(d0);
@@ -5769,9 +4138,6 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
       float f[11];
       field_bilinear_sample(fld, sw, sh, 11, sx, sy, f);
       float conf = clampf(f[10], 0.f, 1.f);
-      int ix0 = clampi((int)roundf(sx), 0, sw - 1), iy0 = clampi((int)roundf(sy), 0, sh - 1);
-      float jconf = cm.w_junction[iy0 * sw + ix0];
-      conf *= clampf(1.f - 3.f * jconf, 0.f, 1.f);
       if (conf > 1e-4f) {
         float base[4];
         raw_pm(out, dw, dh, x, y, base);
@@ -5930,12 +4296,16 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
   return 1;
 }
 
-/* ---------------------------------------------------------------------------
-   msdf (v4.9.3): Multi-channel Signed Distance Field (Chlumsky 2015 RGB median).
-   Partitions directional edges into 3 orientation channels (R: horizontal,
-   G: vertical, B: diagonal), upscales each channel via cubic B-spline, and
-   combines them at runtime using median(d_r, d_g, d_b). This reconstructs
-   sharp 90-degree corners and T-junctions without C0 rounding or bevels. */
+/* Robust continuous edge compressor.  The first edgecompress attempt used
+   farthest-pair endpoints directly, which could invent colours/shapes at
+   corners, crossings, and noisy patches.  This version is intentionally much
+   more conservative:
+   - require a 5x5 patch to look like a coherent two-colour edge,
+   - fit a continuous t-plane but reject high plane error,
+   - use averages from the two sides instead of arbitrary outlier endpoints,
+   - clamp the result to the local premultiplied-linear channel range, and
+   - cap the blend amount so the fitted model cannot completely replace the
+     source reconstruction. */
 static int upscale_msdf(const uint8_t *in, int sw, int sh, uint8_t *out,
                         int dw, int dh) {
   class_map_t cm;
@@ -6055,16 +4425,6 @@ static int upscale_dsdf(const uint8_t *in, int sw, int sh, uint8_t *out,
   return 1;
 }
 
-/* Robust continuous edge compressor.  The first edgecompress attempt used
-   farthest-pair endpoints directly, which could invent colours/shapes at
-   corners, crossings, and noisy patches.  This version is intentionally much
-   more conservative:
-   - require a 5x5 patch to look like a coherent two-colour edge,
-   - fit a continuous t-plane but reject high plane error,
-   - use averages from the two sides instead of arbitrary outlier endpoints,
-   - clamp the result to the local premultiplied-linear channel range, and
-   - cap the blend amount so the fitted model cannot completely replace the
-     source reconstruction. */
 static void patch_minmax_pm(const float p[][4], int n, float lo[4],
                             float hi[4]) {
   for (int c = 0; c < 4; c++) {
@@ -6208,23 +4568,7 @@ static void upscale_edgecompress(const uint8_t *in, int sw, int sh,
         q[c] = base[c] + conf * (target[c] - base[c]);
         q[c] = clampf(q[c], lo[c], hi[c]);
       }
-      /* Enforce strict local 3x3 envelope clamp to guarantee zero halos */
-        float sdf_lo[4] = {1e30f, 1e30f, 1e30f, 1e30f};
-        float sdf_hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
-        for (int dy = -1; dy <= 1; dy++) {
-          for (int dx = -1; dx <= 1; dx++) {
-            float p[4];
-            raw_pm(out, dw, dh, clampi(x + dx, 0, dw - 1), clampi(y + dy, 0, dh - 1), p);
-            for (int c = 0; c < 4; c++) {
-              if (p[c] < sdf_lo[c]) sdf_lo[c] = p[c];
-              if (p[c] > sdf_hi[c]) sdf_hi[c] = p[c];
-            }
-          }
-        }
-        for (int c = 0; c < 4; c++) {
-          q[c] = clampf(q[c], sdf_lo[c] - 1.5e-3f, sdf_hi[c] + 1.5e-3f);
-        }
-        put(out + 4 * ((size_t)y * dw + x), q[0], q[1], q[2], q[3]);
+      put(out + 4 * ((size_t)y * dw + x), q[0], q[1], q[2], q[3]);
     }
   }
 }
@@ -6618,8 +4962,8 @@ static void suppress_speckle_pm(float *hr, int dw, int dh, const uint8_t *in,
   /* Domino pass on the updated image (fresh snapshot). */
   memcpy(snap, hr, n * 4 * sizeof *snap);
   for (int vert = 0; vert < 2; vert++)
-    for (int y = 1; y + 2 - vert < dh; y++)
-      for (int x = 1; x + 1 + vert < dw; x++) {
+    for (int y = 1; y + 1 < dh; y++)
+      for (int x = 1; x + 1 < dw; x++) {
         /* Pair occupies (x,y),(x+vert,y+1-vert); the 10 ring pixels are the
            outer frame of the 3x4 (or 4x3) box around the pair. */
         const float *p0 = SPK_P(snap, x, y),
@@ -6770,7 +5114,7 @@ static void remove_hourglass_basis(float *hr, int dw, int dh, const uint8_t *in,
       float a = amount;
       if (gate)
         a *= .05f + .95f * gate[k];
-      if (0)
+      if (dgate)
         a *= dgate[k];
       if (a <= 1e-4f)
         continue;
@@ -6779,8 +5123,8 @@ static void remove_hourglass_basis(float *hr, int dw, int dh, const uint8_t *in,
           float r0 = acc[8 * k + c], r1 = acc[8 * k + 4 + c];
           float c0 = (r0 * g11 - r1 * g01) / det;
           float c1 = (r1 * g00 - r0 * g01) / det;
-          c0 = clampf(c0, -4.f, 4.f);
-          c1 = clampf(c1, -4.f, 4.f);
+          c0 = clampf(c0, -.5f, .5f);
+          c1 = clampf(c1, -.5f, .5f);
           p[c] -= a * (c0 * b0 + c1 * b1);
         }
       }
@@ -7413,22 +5757,7 @@ static void print_help(const char *argv0) {
       "                extra spread (0.5..3); guaranteed no staircase, softest\n"
       "  sdf           fitted signed-distance contour sharpening on top of\n"
       "                adaptive; crispest edges, tune with -s\n"
-      "  msdf          multi-channel signed distance field (Chlumsky RGB\n"
-      "                median combine) for sharp corner preservation\n"
-      "  dsdf          discrete/geometric signed distance field of plane\n"
-      "                curves (Carrera et al. A1/G1 DSDF)\n"
       "  nearest       pixel art / hard 1px texture\n"
-      "  xbrz          Zenju xBRZ 1.8: cellular-automata pixel-art upscaler;\n"
-      "                integer scale 2..6, sharp corners, no halos\n"
-      "  xbr           Hyllian xBR: simpler cellular-automata pixel-art upscaler;\n"
-      "                integer scale 2..4, sharp corners, no halos\n"
-      "  jinc2_bilateral  Hyllian Jinc2-Bilateral: windowed-jinc 2-lobe +\n"
-      "                bilateral edge-preserving reconstruction (any scale);\n"
-      "                low ringing / hourglass, smooth diagonals\n"
-      "  jinc2_auto    jinc2_bilateral with WB/STR auto-tuned per image by a\n"
-      "                2x-downscale proxy (picks the lowest-stepladder pair\n"
-      "                among near-best reconstruction MSE)\n"
-      "  superxbr      Super XBR reference (this build: jinc2-bilateral)\n"
       "\n"
       "Modes -- other (accepted, but expect artifacts on art):\n"
       "  bilinear linear cubic mitchell lanczos2 lanczos3 blur\n"
@@ -7467,16 +5796,6 @@ static void print_help(const char *argv0) {
       "                            the edge class, 2 checker, 4 junction,\n"
       "                            8 line; 0 = normal render\n"
       "\n"
-      "Options (jinc2_bilateral / superxbr) -- all in [0,1]:\n"
-      "  --j2b-wa A                window A, default .50 (raise => more blur)\n"
-      "  --j2b-wb B                window B, default .88 (lower toward ~.80\n"
-      "                            kills the dither/staircase on flat art)\n"
-      "  --j2b-str S               bilateral strength, default 1.0 (lower to\n"
-      "                            ~.1-.3 reduces the stepladder on flat /\n"
-      "                            gradient-free images; also settable via\n"
-      "                            CELUP_J2B_STR)\n"
-      "  --j2b-ar R                anti-ringing amount, default 1.0 (0=off)\n"
-      "\n"
       "Options (autoblur / autodeblur):\n"
       "  -k, --blur-kernel K       kernel box|triangle|gaussian|bspline|auto\n"
       "                            (default auto = fit)\n"
@@ -7496,34 +5815,16 @@ static void print_help(const char *argv0) {
       "                            profile fit at the pixel's own position,\n"
       "                            push = evaluate the original fit at a\n"
       "                            position displaced toward the nearer\n"
-      "                            plateau (Anime4K push),\n"
-      "                            compress2x2 = reconstruct image as linear\n"
-      "                            gradients of 4 colors pushing starts and\n"
-      "                            ends toward each other (max deblur = 1)\n"
+      "                            plateau (Anime4K push)\n"
+      "  -T, --texgain G           autodeblur lattice-texture crispening\n"
+      "                            FLOAT 0..1 (default 0=off).  Hull-clamped\n"
+      "                            crispening applied only where the 1D step\n"
+      "                            model abstained (AUTODEBLUR_NOTES queue #1).\n"
       "  -g, --deblur-steepness K  autodeblur slope multiplier FLOAT 1..64\n"
       "                            (default 0=auto); overrides -s and -e\n"
       "                            per-edge adaptation; anchored evaluation\n"
       "                            keeps colour noise at gain 1, so K far\n"
-      "                            above 8 stays artifact-safe.  v4.9.3:\n"
-      "                            the run report prints the EFFECTIVE\n"
-      "                            applied slope (sawtooth-capped fitters\n"
-      "                            used to make -g 16 and -g 64 identical\n"
-      "                            while claiming K was applied);\n"
-      "                            narrow-feature amplitude restoration\n"
-      "                            undoes the washout wide blur causes on\n"
-      "                            thin lines (-r 6 used to fade a smiley\n"
-      "                            mouth to half contrast)\n"
-      "  -T, --texgain G           autodeblur lattice-texture crispening\n"
-      "                            FLOAT 0..1 (default 0=off).  Hull-clamped\n"
-      "                            crispening applied only where the 1D step\n"
-      "                            model abstained and the local structure is\n"
-      "                            directed (real lattice / crosshatch, NOT\n"
-      "                            isotropic salt).  Use on clean pixel-art /\n"
-      "                            lattice content upscaled through autoblur\n"
-      "                            to recover crispness; OFF by default\n"
-      "                            because on diffusion art the deblur's job\n"
-      "                            is to CLEAN salt, not sharpen it\n"
-      "                            (AUTODEBLUR_NOTES queue #1).\n"
+      "                            above 8 stays artifact-safe\n"
       "\n"
       "autoblur/autodeblur: what is automatic, and how to pin it\n"
       "  parameter    chosen automatically by...        pin manually with\n"
@@ -7535,7 +5836,7 @@ static void print_help(const char *argv0) {
       "                                                 = R/min(K,8) (v4.9)\n"
       "  curve        validation-proxy fit              -c (any value but auto)\n"
       "  curve param  fit                               -p P\n"
-      "  method       2x-downscale proxy MSE            -D remap|push|compress2x2\n"
+      "  method       2x-downscale proxy MSE            -D remap|push\n"
       "  steepness    -s formula, or -e per edge        -g K (exact float,\n"
       "                                                 1..64)\n"
       "  Only the unpinned parameters are fitted.  Every effective value is\n"
@@ -7574,326 +5875,6 @@ static void print_help(const char *argv0) {
       argv0);
 }
 
-/* ---------------------------------------------------------------------------
-   Jinc2-Bilateral (Hyllian 2025) -- faithful CPU port.
-
-   This is the jinc2-bilateral-xbr.slang filter: a windowed-jinc 2-lobe
-   reconstruction (space domain) multiplied by a *bilateral* (range-domain)
-   weight that compares each source texel's luma to a guide reconstruction
-   of the output pixel, followed by an anti-ringing clamp to the central 2x2
-   source cell.
-
-     wa = WA*pi, wb = WB*pi   (WA=0.5, WB=0.88: best 2-lobe jinc approx)
-     resampler(d) = sin(d*wa)*sin(d*wb)/(d*d)
-     I(A,B)       = lanczos( luma(|A-B|)*STR + dt, 2 )     (range weight)
-     weight       = resampler(dist) * I(guide, texel)
-     color        = sum(weight * texel) / sum(weight)
-     color        = mix(color, clamp(color, min4(c11,c21,c12,c22),
-                                      max4(c11,c21,c12,c22)), AR)
-
-   Working in the lab's premultiplied-linear RGBA space keeps it consistent
-   with every other mode (and the metrics are computed in that space).  The
-   bilateral term suppresses cross-edge bleed/ringing by downweighting texels
-   on the far side of an edge; the anti-ringing clamp bounds the output to
-   locally observed colours, so no overshoot is possible.  STR (bilateral
-   strength) and AR (anti-ringing) can be tuned via the CELUP_J2B_STR /
-   CELUP_J2B_AR env vars (default 1.0, 1.0 -- the shader defaults).  -s can
-   optionally raise bilateral strength: STR = 1 + (strength-1)*0.05.
---------------------------------------------------------------------------- */
-static float j2b_sinc(float x) {
-  x = fabsf(x);
-  if (x < 1e-6f)
-    return 1.f;
-  float p = CELUP_PI * x;
-  return sinf(p) / p;
-}
-static float j2b_lanczos(float x, float a) {
-  return j2b_sinc(x) * j2b_sinc(x / a);
-}
-static float j2b_luma(const float c[4]) {
-  return .2126f * c[0] + .7152f * c[1] + .0722f * c[2] + .35f * c[3];
-}
-static float j2b_resampler(float x, float wa, float wb) {
-  /* sin(x*wa)*sin(x*wb)/(x*x) with the x->0 limit wa*wb. */
-  if (x < 1e-6f)
-    return wa * wb;
-  return sinf(x * wa) * sinf(x * wb) / (x * x);
-}
-/* jinc2_bilateral tuning (Hyllian shader slider names).  Exposed as both
-   CLI flags and CELUP_J2B_* env vars.  On flat / gradient-free (hard
-   pixel-art) images the stepladder comes from the bilateral range term
-   snapping each output pixel onto the nearest source colour, re-quantising
-   the edge to the output lattice; lowering STR toward ~0.1-0.3 (and, if
-   needed, WB toward ~0.80) smooths the contour out. */
-static float j2b_wa = .50f, j2b_wb = .88f, j2b_str = 1.0f, j2b_ar = 1.0f;
-/* Parameterised jinc2 render so the auto-tuner can sweep explicit values. */
-static void jinc2_render(const uint8_t *in, int sw, int sh, uint8_t *out,
-                         int dw, int dh, float WA, float WB, float STR,
-                         float AR) {
-  WA = WA < 0.f ? 0.f : (WA > 1.f ? 1.f : WA);
-  WB = WB < 0.f ? 0.f : (WB > 1.f ? 1.f : WB);
-  float wa = WA * CELUP_PI, wb = WB * CELUP_PI;
-  float xscale = (float)sw / dw, yscale = (float)sh / dh;
-  for (int y = 0; y < dh; y++) {
-    float sy = (y + .5f) * yscale - .5f;
-    int iy = (int)floorf(sy);
-    float fy = sy - iy;
-    for (int x = 0; x < dw; x++) {
-      float sx = (x + .5f) * xscale - .5f;
-      int ix = (int)floorf(sx);
-      float fx = sx - ix;
-      float guide[4];
-      bilinear_cell_pm(in, sw, sh, ix, iy, fx, fy, guide);
-      float c[4][4][4], wsum = 0.f, acc[4] = {0.f, 0.f, 0.f, 0.f};
-      float glum = j2b_luma(guide);
-      for (int j = 0; j < 4; j++)      /* source y = iy-1+j */
-        for (int i = 0; i < 4; i++) {  /* source x = ix-1+i  */
-          int px = ix - 1 + i, py = iy - 1 + j;
-          raw_pm(in, sw, sh, px, py, c[j][i]);
-          float dx = sx - (float)px, dy = sy - (float)py;
-          float dist = sqrtf(dx * dx + dy * dy);
-          float ws = j2b_resampler(dist, wa, wb);
-          float wr = j2b_lanczos(fabsf(glum - j2b_luma(c[j][i])) * STR + 1e-5f,
-                                 2.0f);
-          float ww = ws * wr;
-          wsum += ww;
-          for (int ch = 0; ch < 4; ch++)
-            acc[ch] += ww * c[j][i][ch];
-        }
-      float q[4];
-      if (wsum > 1e-12f) {
-        float inv = 1.f / wsum;
-        for (int ch = 0; ch < 4; ch++)
-          q[ch] = acc[ch] * inv;
-      } else
-        for (int ch = 0; ch < 4; ch++)
-          q[ch] = guide[ch];
-      /* Anti-ringing clamp to the central 2x2 source cell. */
-      {
-        float lo[4] = {1e30f, 1e30f, 1e30f, 1e30f},
-              hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
-        for (int j = 1; j <= 2; j++)
-          for (int i = 1; i <= 2; i++)
-            for (int ch = 0; ch < 4; ch++) {
-              if (c[j][i][ch] < lo[ch])
-                lo[ch] = c[j][i][ch];
-              if (c[j][i][ch] > hi[ch])
-                hi[ch] = c[j][i][ch];
-            }
-        for (int ch = 0; ch < 4; ch++) {
-          float cl = q[ch] < lo[ch] ? lo[ch] : (q[ch] > hi[ch] ? hi[ch] : q[ch]);
-          q[ch] = cl * AR + q[ch] * (1.f - AR);
-        }
-      }
-      put(out + 4 * ((size_t)y * dw + x), q[0], q[1], q[2], q[3]);
-    }
-  }
-}
-
-/* Wrapper: resolves the global/env parameter values then renders. */
-static void upscale_jinc2_bilateral(const uint8_t *in, int sw, int sh,
-                                    uint8_t *out, int dw, int dh) {
-  float WA = j2b_wa, WB = j2b_wb, STR = j2b_str, AR = j2b_ar;
-  {
-    const char *e = getenv("CELUP_J2B_WA");
-    if (e)
-      WA = strtof(e, NULL);
-    e = getenv("CELUP_J2B_WB");
-    if (e)
-      WB = strtof(e, NULL);
-    e = getenv("CELUP_J2B_STR");
-    if (e)
-      STR = strtof(e, NULL);
-    e = getenv("CELUP_J2B_AR");
-    if (e)
-      AR = strtof(e, NULL);
-  }
-  jinc2_render(in, sw, sh, out, dw, dh, WA, WB, STR, AR);
-}
-
-/* Lattice-snap fraction: the fraction of reconstruction pixels that sit
-   (within an epsilon) on one of their four nearest source-neighbour values.
-   This is exactly the mechanism that causes the stepladder on flat /
-   gradient-free art -- the bilateral range term snapping each output pixel
-   onto the source lattice re-quantises the edge to the output grid.  A pure
-   MSE proxy cannot see this (a staircased output reconstructs a hard-
-   quantised source perfectly), so the auto objective is
-       score = MSE * (1 + LAM * snap)
-   which rewards candidates that reconstruct the source WITHOUT re-snapping
-   the lattice.  On natural gradient images both the default and smooth
-   candidates snap little, so the MSE term keeps quality; on hard pixel art
-   the smooth candidate wins. */
-/* Hard-quantisation measure: the fraction of adjacent source pixels that are
-   exact duplicates.  Hard pixel art / quantized line art (the stepladder
-   class) is dominated by exact-duplicate links (diagline48 .85, smiley .84),
-   while natural gradient imagery has few (miya .07, cat .14).  On such hard
-   sources the bilateral range term re-quantises edges onto the output
-   lattice, so the MSE proxy (which prefers the sharpest reconstruction) is
-   blind to the resulting stepladder. */
-static float j2b_hardness(const uint8_t *in, int sw, int sh) {
-  long dups = 0, tot = 0;
-  for (int y = 0; y < sh; y++)
-    for (int x = 0; x < sw; x++) {
-      float a[4];
-      raw_pm(in, sw, sh, x, y, a);
-      if (x + 1 < sw) {
-        float b[4];
-        raw_pm(in, sw, sh, x + 1, y, b);
-        dups += dist4_pm(a, b) < 1e-6f;
-        tot++;
-      }
-      if (y + 1 < sh) {
-        float b[4];
-        raw_pm(in, sw, sh, x, y + 1, b);
-        dups += dist4_pm(a, b) < 1e-6f;
-        tot++;
-      }
-    }
-  return tot > 0 ? (float)dups / (float)tot : 0.f;
-}
-
-/* Auto-tune mode: pick the jinc2 (WB, STR) pair that best reconstructs this
-   image, using the same self-supervised 2x-downscale validation proxy as
-   autoblur.  Downscale the input 2x, upscale it back with every candidate
-   (WB, STR) pair and score with
-       score = MSE * (1 + LAM * hardness * STR)
-   STR is the bilateral strength -- the knob whose high values re-quantise
-   hard-pixel-art edges onto the output lattice (the stepladder).  WB is left
-   to the MSE (its 0.88 default is fine and low WB degrades quality).
-   hardness ~ 0 on natural gradients -> plain MSE (sharpest wins); hardness
-   ~.85 on pixel art -> low STR (measured best: jump95 .146->.063 with best
-   MAE) is preferred.  Among near-best candidates we prefer lower STR then
-   lower WB.  WA and AR stay at their defaults. */
-static void auto_tune_j2b(const uint8_t *in, int sw, int sh) {
-  int tw = sw / 2, th = sh / 2;
-  if (tw < 8 || th < 8) { /* proxy too small: keep defaults */
-    fprintf(stderr, "jinc2_auto: image too small for the 2x proxy; using defaults\n");
-    return;
-  }
-  uint8_t *train = downsample_pm_box(in, sw, sh, tw, th);
-  uint8_t *recon = malloc((size_t)sw * sh * 4);
-  if (!train || !recon) {
-    free(train);
-    free(recon);
-    return;
-  }
-  /* Candidate window B values: the shader default .88 and the smoother
-     staircase-killing values toward .72. */
-  static const float WBs[] = {.72f, .76f, .80f, .84f, .88f};
-  /* Bilateral strength candidates: 1.0 default down to the low-stepladder .1. */
-  static const float STRs[] = {.10f, .20f, .40f, .70f, 1.0f};
-  const int NW = (int)(sizeof WBs / sizeof WBs[0]);
-  const int NS = (int)(sizeof STRs / sizeof STRs[0]);
-  double scores[5][5];
-  double best = 1e300;
-  int best_w = 0, best_s = 0;
-  float hard = j2b_hardness(in, sw, sh);
-  for (int i = 0; i < NW; i++)
-    for (int j = 0; j < NS; j++) {
-      jinc2_render(train, tw, th, recon, sw, sh, j2b_wa, WBs[i], STRs[j],
-                   j2b_ar);
-      double mse = image_pm_mse(recon, in, sw, sh, 2);
-      /* Staircase-aware: penalise high bilateral strength on hard sources. */
-      double score = mse * (1. + 2.5 * hard * STRs[j]);
-      scores[i][j] = score;
-      if (score < best) {
-        best = score;
-        best_w = i;
-        best_s = j;
-      }
-    }
-  if (getenv("CELUP_J2B_DBG"))
-    for (int i = 0; i < NW; i++)
-      for (int j = 0; j < NS; j++)
-        fprintf(stderr, "  j2b cand WB=%.2f STR=%.2f score %.8g (MSE %.8g "
-                        "hard %.2f)\n",
-                WBs[i], STRs[j], scores[i][j],
-                scores[i][j] / (1. + 2.5 * hard * STRs[j]), hard);
-  /* Smoothness prior among near-best (within 8% of best score): prefer the
-     lowest STR then lowest WB -- the low-stepladder direction. */
-  double thr = best * 1.08;
-  int bw = best_w, bs = best_s;
-  for (int i = 0; i < NW; i++)
-    for (int j = 0; j < NS; j++)
-      if (scores[i][j] <= thr) {
-        if (STRs[j] < STRs[bs] - 1e-6f ||
-            (fabsf(STRs[j] - STRs[bs]) <= 1e-6f && WBs[i] < WBs[bw])) {
-          bw = i;
-          bs = j;
-        }
-      }
-  j2b_wb = WBs[bw];
-  j2b_str = STRs[bs];
-  fprintf(stderr,
-          "jinc2_auto selected WB=%.2f STR=%.2f (hardness %.2f; score %.8g "
-          "MSE %.8g)\n",
-          j2b_wb, j2b_str, hard, best,
-          best / (1. + 2.5 * hard * STRs[best_s]));
-  free(train);
-  free(recon);
-}
-
-static int upscale_xbr(const uint8_t *in, int sw, int sh, uint8_t *out,
-
-/* xBR / xBRZ pixel art upscalers */
-static int upscale_xbr(const uint8_t *in, int sw, int sh, uint8_t *out,
-                       int dw, int dh) {
-  int f = (int)roundf((float)dw / (float)sw);
-  return xbr_scale(in, sw, sh, out, dw, dh, f) == 0;
-}
-
-static int upscale_xbrz(const uint8_t *in, int sw, int sh, uint8_t *out,
-                        int dw, int dh) {
-  int f = (int)roundf((float)dw / (float)sw);
-  return xbrz_scale(in, sw, sh, out, dw, dh, f) == 0;
-}
-
-/* Supersampled smooth mode - 4x4 area avg of triangle */
-static void upscale_smooth(const uint8_t *in, int sw, int sh, uint8_t *out,
-                           int dw, int dh) {
-  float spread = 1.f;
-  if (blur_radius_set) spread = clampf(blur_radius, 0.5f, 3.f);
-  int SS = spread > 1.8f ? 4 : (spread > 1.2f ? 3 : 2);
-  float inv = 1.f / (float)(SS * SS);
-  for (int y = 0; y < dh; y++) {
-    for (int x = 0; x < dw; x++) {
-      float acc[4] = {0,0,0,0};
-      for (int sy_sub = 0; sy_sub < SS; sy_sub++) {
-        for (int sx_sub = 0; sx_sub < SS; sx_sub++) {
-          float ox = (sx_sub + 0.5f) / (float)SS;
-          float oy = (sy_sub + 0.5f) / (float)SS;
-          float ox_eff = 0.5f + (ox - 0.5f) * spread;
-          float oy_eff = 0.5f + (oy - 0.5f) * spread;
-          float sx = ((float)x + ox_eff) * (float)sw / dw - 0.5f;
-          float sy = ((float)y + oy_eff) * (float)sh / dh - 0.5f;
-          int ix = (int)floorf(sx), iy = (int)floorf(sy);
-          float fx = sx - ix, fy = sy - iy;
-          float p[4][4], l[4];
-          for (int j = 0; j < 2; j++)
-            for (int i = 0; i < 2; i++) {
-              int k = j * 2 + i;
-              raw_pm(in, sw, sh, ix + i, iy + j, p[k]);
-              l[k] = .2126f * p[k][0] + .7152f * p[k][1] + .0722f * p[k][2] + .5f * p[k][3];
-            }
-          float gx = l[1] + l[3] - l[0] - l[2], gy = l[2] + l[3] - l[0] - l[1];
-          const float *a,*b,*c;
-          float wa,wb,wc;
-          if (gx * gy < 0) {
-            if (fx >= fy) { a=p[0]; b=p[1]; c=p[3]; wa=1-fx; wb=fx-fy; wc=fy; }
-            else { a=p[0]; b=p[2]; c=p[3]; wa=1-fy; wb=fy-fx; wc=fx; }
-          } else {
-            if (fx + fy <= 1) { a=p[0]; b=p[1]; c=p[2]; wa=1-fx-fy; wb=fx; wc=fy; }
-            else { a=p[3]; b=p[2]; c=p[1]; wa=fx+fy-1; wb=1-fx; wc=1-fy; }
-          }
-          for (int k = 0; k < 4; k++)
-            acc[k] += inv * (wa * a[k] + wb * b[k] + wc * c[k]);
-        }
-      }
-      put(out + 4 * ((size_t)y * dw + x), acc[0], acc[1], acc[2], acc[3]);
-    }
-  }
-}
-
 /* Intelligent multi-class classifier for hybrid mode */
 typedef enum {
   IMG_TYPE_PIXEL_ART = 0,
@@ -7904,8 +5885,6 @@ typedef enum {
 static image_type_t classify_image_type(const uint8_t *in, int sw, int sh) {
   size_t n_pixels = (size_t)sw * sh;
   size_t sample_step = n_pixels / 50000 + 1;
-
-  /* 1. Unique color count */
   uint32_t unique_colors[512];
   int num_unique = 0;
   for (size_t i = 0; i < n_pixels; i += sample_step) {
@@ -7914,55 +5893,35 @@ static image_type_t classify_image_type(const uint8_t *in, int sw, int sh) {
                  ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
     int found = 0;
     for (int k = 0; k < num_unique; k++) {
-      if (unique_colors[k] == c) {
-        found = 1;
-        break;
-      }
+      if (unique_colors[k] == c) { found = 1; break; }
     }
     if (!found) {
-      if (num_unique < 512)
-        unique_colors[num_unique++] = c;
-      else {
-        num_unique = 513;
-        break;
-      }
+      if (num_unique < 512) unique_colors[num_unique++] = c;
+      else { num_unique = 513; break; }
     }
   }
-
-  /* Hard pixel art check */
-  if (num_unique <= 256 && sw <= 512 && sh <= 512) {
+  if (num_unique <= 256 && sw <= 512 && sh <= 512)
     return IMG_TYPE_PIXEL_ART;
-  }
-
-  /* 2. Structure tensor directional edge coherence check */
   class_map_t cm;
   if (build_class_map(in, sw, sh, &cm)) {
     double sum_edge = 0.0, sum_coh = 0.0;
     size_t count = 0;
     for (size_t k = 0; k < n_pixels; k += sample_step) {
-      float e = cm.w_edge[k];
-      float c = cm.w_checker[k];
+      float e = cm.w_edge[k], c = cm.w_checker[k];
       sum_edge += e;
       if (e > 0.10f && c < 0.3f) {
         float gx = cm.edge_gx[k], gy = cm.edge_gy[k];
         float g2 = gx * gx + gy * gy;
-        if (g2 > 0.002f) {
-          sum_coh += e;
-        }
+        if (g2 > 0.002f) sum_coh += e;
       }
       count++;
     }
     free_class_map(&cm);
-
     double avg_edge = sum_edge / (count ? count : 1);
     double avg_coh = sum_coh / (count ? count : 1);
-
-    /* Line art has clear directional contours */
-    if (avg_coh > 0.0005 || avg_edge > 0.005) {
+    if (avg_coh > 0.0005 || avg_edge > 0.005)
       return IMG_TYPE_LINE_ART;
-    }
   }
-
   return IMG_TYPE_NATURAL_PHOTO;
 }
 
@@ -7983,9 +5942,7 @@ static int upscale_hybrid(const uint8_t *in, int sw, int sh, uint8_t *out,
     return upscale_autodeblur(in, sw, sh, out, dw, dh);
   }
 }
-
 int main(int ac, char **av) {
-
   const char *mode = "cubic";
   int mode_explicit = 0;
   for (int i = 1; i < ac; i++)
@@ -8000,11 +5957,6 @@ int main(int ac, char **av) {
     return 2;
   }
   for (int i = 4; i < ac;) {
-    if (!strcmp(av[i], "--no-safety-gates") || !strcmp(av[i], "--disable-gates")) {
-      disable_safety_gates = 1;
-      i++;
-      continue;
-    }
     if (!strcmp(av[i], "--auto-blurcompress") ||
         !strcmp(av[i], "--auto-tune") || !strcmp(av[i], "-a")) {
       auto_blurcompress = 1;
@@ -8119,22 +6071,6 @@ int main(int ac, char **av) {
         fprintf(stderr, "edge-goal must be in [0,8] (src px; 0=off)\n");
         return 2;
       }
-    } else if (!strcmp(av[i], "--j2b-wa") || !strcmp(av[i], "--j2b-wb") ||
-               !strcmp(av[i], "--j2b-str") || !strcmp(av[i], "--j2b-ar")) {
-      char *e;
-      float v = strtof(av[i + 1], &e);
-      if (*e || v < 0.f || v > 1.f) {
-        fprintf(stderr, "%s must be in [0,1]\n", av[i]);
-        return 2;
-      }
-      if (!strcmp(av[i], "--j2b-wa"))
-        j2b_wa = v;
-      else if (!strcmp(av[i], "--j2b-wb"))
-        j2b_wb = v;
-      else if (!strcmp(av[i], "--j2b-str"))
-        j2b_str = v;
-      else
-        j2b_ar = v;
     } else if (!strcmp(av[i], "--deblur-steepness") || !strcmp(av[i], "-g")) {
       char *e;
       deblur_steepness = strtof(av[i + 1], &e);
@@ -8153,18 +6089,10 @@ int main(int ac, char **av) {
       else if (!strcmp(av[i + 1], "push"))
         deblur_method = 2;
       else if (!strcmp(av[i + 1], "compress2x2") ||
-               !strcmp(av[i + 1], "analytical") ||
-               !strcmp(av[i + 1], "linear"))
+               !strcmp(av[i + 1], "analytical"))
         deblur_method = 3;
       else {
         fprintf(stderr, "Unknown deblur method: %s\n", av[i + 1]);
-        return 2;
-      }
-    } else if (!strcmp(av[i], "--texgain") || !strcmp(av[i], "-T")) {
-      char *e;
-      deblur_texgain = strtof(av[i + 1], &e);
-      if (*e || deblur_texgain < 0.f || deblur_texgain > 1.f) {
-        fprintf(stderr, "texgain must be in [0,1]\n");
         return 2;
       }
     } else if (!strcmp(av[i], "--max-mib") || !strcmp(av[i], "-M")) {
@@ -8180,9 +6108,7 @@ int main(int ac, char **av) {
     }
     i += 2;
   }
-  if (strcmp(mode, "hybrid") && strcmp(mode, "smart") && strcmp(mode, "auto") &&
-      strcmp(mode, "xbrz") && strcmp(mode, "xbr") && strcmp(mode, "smooth") &&
-      strcmp(mode, "nearest") && strcmp(mode, "bilinear") &&
+  if (strcmp(mode, "nearest") && strcmp(mode, "bilinear") &&
       strcmp(mode, "linear") && strcmp(mode, "cubic") && strcmp(mode, "mitchell") &&
       strcmp(mode, "lanczos2") && strcmp(mode, "lanczos3") &&
       strcmp(mode, "compress") && strcmp(mode, "safecompress") &&
@@ -8247,20 +6173,20 @@ int main(int ac, char **av) {
                     !strcmp(mode, "hourglasscompress") ||
                     !strcmp(mode, "adaptive");
     int classified = iterative || !strcmp(mode, "classmap") ||
-                     !strcmp(mode, "sdf") || !strcmp(mode, "msdf") ||
-                     !strcmp(mode, "dsdf");
+                     !strcmp(mode, "sdf") || !strcmp(mode, "msdf") || !strcmp(mode, "dsdf");
     double in_bytes =
         (double)w * h * (classified ? 96.0 : (!strcmp(mode, "autoblur") ||
-                                        !strcmp(mode, "autodeblur")) ? 24.0
+                                        !strcmp(mode, "autodeblur") &&
+      strcmp(mode, "jinc2_bilateral") && strcmp(mode, "jinc2_auto")) ? 24.0
                                                                       : 4.0);
     double out_bytes =
         (double)ow * oh * (iterative          ? 36.0
-                           : !strcmp(mode, "sdf") ? 36.0 + 40.0 /* adaptive +
+                           : !strcmp(mode, "sdf") || !strcmp(mode, "msdf") || !strcmp(mode, "dsdf") ? 36.0 + 40.0 /* adaptive +
                                                        SDF delta/blur buffers */
                            : !strcmp(mode, "autoblur") ? 8.0
                            : !strcmp(mode, "autodeblur")
-                               ? 8.0 + 116.0 /* A f16 + DEL f16 + PF f72
-                                                + LOH 8 + dst 4 */
+                               ? 8.0 + 84.0 /* A f16 + DEL f16 + PF f40
+                                               + LOH 8 + dst 4 */
                                                        : 4.0);
     double estimated =
         (in_bytes + out_bytes + 32.0 * 1024 * 1024) / (1024.0 * 1024.0);
@@ -8289,27 +6215,7 @@ int main(int ac, char **av) {
     return 1;
   }
   int ok = 1;
-  if (!strcmp(mode, "hybrid") || !strcmp(mode, "smart") || !strcmp(mode, "auto"))
-    ok = upscale_hybrid(in, w, h, out, ow, oh, (float)scale);
-  else if (!strcmp(mode, "xbrz")) {
-    int f = (int)roundf((float)scale);
-    if (fabsf((float)scale - f) < 1e-4f && f >= 2 && f <= 6)
-      ok = upscale_xbrz(in, w, h, out, ow, oh);
-    else {
-      fprintf(stderr, "xbrz: scale %.2f not integer in [2,6]; fallback to bilinear\n", scale);
-      upscale_bilinear(in, w, h, out, ow, oh);
-    }
-  } else if (!strcmp(mode, "xbr")) {
-    int f = (int)roundf((float)scale);
-    if (fabsf((float)scale - f) < 1e-4f && f >= 2 && f <= 4)
-      ok = upscale_xbr(in, w, h, out, ow, oh);
-    else {
-      fprintf(stderr, "xbr: scale %.2f not integer in [2,4]; fallback to bilinear\n", scale);
-      upscale_bilinear(in, w, h, out, ow, oh);
-    }
-  } else if (!strcmp(mode, "smooth"))
-    upscale_smooth(in, w, h, out, ow, oh);
-  else if (!strcmp(mode, "nearest"))
+  if (!strcmp(mode, "nearest"))
     upscale_nearest(in, w, h, out, ow, oh);
   else if (!strcmp(mode, "bilinear"))
     upscale_bilinear(in, w, h, out, ow, oh);
@@ -8353,7 +6259,8 @@ int main(int ac, char **av) {
     upscale_scale2x(in, w, h, out, ow, oh);
   else if (!strcmp(mode, "autoblur"))
     ok = upscale_autoblur(in, w, h, out, ow, oh);
-  else if (!strcmp(mode, "autodeblur"))
+  else if (!strcmp(mode, "autodeblur") &&
+      strcmp(mode, "jinc2_bilateral") && strcmp(mode, "jinc2_auto"))
     ok = upscale_autodeblur(in, w, h, out, ow, oh);
   else if (!strcmp(mode, "sdf"))
     ok = upscale_sdf(in, w, h, out, ow, oh);
@@ -8361,12 +6268,6 @@ int main(int ac, char **av) {
     ok = upscale_msdf(in, w, h, out, ow, oh);
   else if (!strcmp(mode, "dsdf"))
     ok = upscale_dsdf(in, w, h, out, ow, oh);
-  else if (!strcmp(mode, "jinc2_bilateral"))
-    upscale_jinc2_bilateral(in, w, h, out, ow, oh);
-  else if (!strcmp(mode, "jinc2_auto")) {
-    auto_tune_j2b(in, w, h);
-    upscale_jinc2_bilateral(in, w, h, out, ow, oh);
-  }
   if (!ok) {
     fprintf(stderr, "Allocation failed\n");
     free(out);
@@ -8393,26 +6294,19 @@ int main(int ac, char **av) {
     static const char *names[] = {"lowpass", "bilinear", "nearest",
                                   "mitchell", "scale2x", "auto"};
     printf(", checker-policy=%s", names[checker_policy]);
-  } else if (!strcmp(mode, "autoblur") || !strcmp(mode, "autodeblur")) {
+  } else if (!strcmp(mode, "autoblur") || !strcmp(mode, "autodeblur") &&
+      strcmp(mode, "jinc2_bilateral") && strcmp(mode, "jinc2_auto")) {
     printf(", kernel=%s sigma=%.2f curve=%s param=%.2f",
            kernel_name(fitted_kernel), fitted_sigma, curve_name(fitted_curve),
            fitted_cp);
-    if (!strcmp(mode, "autodeblur")) {
-      printf(", method=%s", last_deblur_method == 2 ? "push" : (last_deblur_method == 3 ? "compress2x2" : "remap"));
-      if (last_deblur_k > 0.f) {
+    if (!strcmp(mode, "autodeblur") &&
+      strcmp(mode, "jinc2_bilateral") && strcmp(mode, "jinc2_auto")) {
+      printf(", method=%s", last_deblur_method == 2 ? "push" : "remap");
+      if (last_deblur_k > 0.f)
         printf(", steepness=%.2f%s", last_deblur_k,
                deblur_steepness > 0.f ? "(manual)" : "");
-        if (adb_keff_w > 0.0) {
-          double eff = adb_keff_sum / adb_keff_w;
-          if (eff < last_deblur_k - .005)
-            printf(", effective-k=%.2f..%.2f avg %.2f",
-                   eff < 1.0 ? 1.0 : eff, (double)adb_keff_max, eff);
-        } else
-          printf(", effective-k=none (all steepening gated off)");
-      } else
+      else
         printf(", steepness=adaptive(-e %.2f)", edge_goal);
-      if (deblur_texgain > 0.f)
-        printf(", texgain=%.2f", deblur_texgain);
     }
   }
   printf("\n");
