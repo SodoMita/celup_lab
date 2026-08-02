@@ -4,13 +4,11 @@
 - **Branch Name**: `origin/arena/019fc1ba-celup-lab`
 - **Task Group**: Group 1 — Analytical Deblur Mode (`-D analytic` / `method == 3`)
 - **Base / Merge-Base**: Direct descendant of `origin/master` (`f6466c9b5d5e49e6ea6dd70ba8b674f4bb102094`)
-- **Total Commits Ahead of Master**: 1 unique commit (`20ad551d783590e660bb233fcc115d76101346b8`)
-- **File Diff Summary**: 9 files changed, 937 insertions(+), 7 deletions(-)
+- **Total Commits Ahead of Master**: 2 unique commits (`20ad551d783590e660bb233fcc115d76101346b8`, `8c0247d759d6e4695e1ee38cfbb65bb6d0c242c0`)
+- **File Diff Summary**: 16 files changed, 1163 insertions(+), 7 deletions(-)
   - `celup_lab.c`: +303 lines (full-image gradient field narrowing engine)
-  - `tests/test_analytic_deblur.py`: +217 lines (automated test suite for analytic deblur)
-  - `tests/autodeblur_regression.py`: +230 lines (numeric fingerprint harness)
-  - `tests/metrics.py`: +46 lines (smiley metrics helper)
-  - `README_lab.md`, `AUTODEBLUR_NOTES.md`, `handoff.md`, `MANIFEST.txt`: Complete documentation
+  - `make_analytic_sheets.py` & `comparison_sheets/`: Adds 5.6 MB of lossless WebP comparison sheets (`sheet_analytic_methods_smiley.webp`, etc.) in commit `8c0247d`.
+  - `tests/test_analytic_deblur.py`, `autodeblur_regression.py`, `metrics.py`: Comprehensive test suites.
 - **Primary Domain**: Adding an opt-in full-image gradient narrowing mode (`-D analytic`, `method == 3`) that traces transitions along their 4D structure-tensor normal to plateau colors `P0, P1` and narrows the ramp mathematically with zero hull violations.
 
 ---
@@ -22,12 +20,9 @@
    - Calculates a 4D structure-tensor normal `(NX, NY)` and gradient magnitude for every pixel in a single pass.
    - For every transitioning pixel, traces a global, adaptive walk along `+-normal` (up to `maxR = 16` steps) until the color saturates to a plateau on each side.
    - Extracts two 4-channel premultiplied RGBA plateau colors `P0` and `P1` from the saturated tails, along with the pixel's normalized blend coordinate `U[idx]` in `[0, 1]`.
-   - **Why this is unique**: Unlike per-pixel 2x2 or 6x6 local windows (which only see local neighborhood curvature), this global walk traces a wide blurred ramp end-to-end so even tail pixels see both plateaus and get correctly narrowed.
 
 2. **PHASE 2 (Edit — Inverted Steepness / Alpha Retention)**:
-   - Implements the requested inverted `-g` steepness semantics:
-     - `K = 1`: Maximum deblur (collapse gradient to a single step = quantize).
-     - `K > 1`: Progressively less deblur (`K -> infinity` is identity).
+   - Implements inverted `-g` steepness semantics (`1 = max deblur / quantize`, larger K = less deblur).
    - Formulates the retention factor `alpha = (K - 1) / K`:
      ```c
      float up;
@@ -42,45 +37,40 @@
      ```c
      v[c] = o[c] + w * (P0[c] + up * (P1[c] - P0[c]) - o[c]);
      ```
-   - **Zero Hull Violations**: Because `out` is strictly a convex combination of two real sampled colors `P0` and `P1`, color-space invariant #1 holds by construction (measured **0 hull violations** on `cornerstar48`, compared to 57 violations in standard remap).
-
-4. **Automated Test Suite (`tests/test_analytic_deblur.py`)**:
-   - Added a 217-line unit test verifying monotone steepening, exact quantization at `K=1`, identity convergence at large `K`, zero hull violations, and flat-region preservation.
-   - Verified that `check_corners`, `check_stairs`, and all 204 `test_scales` sweeps remain unchanged and pass.
+   - **Zero Hull Violations**: Because `out` is strictly a convex combination of two real sampled colors `P0` and `P1`, color-space invariant #1 holds by construction (measured 0 hull violations on `cornerstar48`).
 
 ---
 
-## 3. Head-to-Head Comparison with Similar Branches (Task Group 1)
+## 3. Why `019fc1ba` Produces More Artifacts Than `019fba18` (The Grey Test Evidence)
 
-This branch is compared directly against **`origin/arena/019fbf78-celup-lab`** (which used a local 2x2 bilinear projection) and **`origin/arena/019fbfb9-celup-lab`** (which added CLI boilerplate and comparison-sheet auto-splitting).
+While `019fc1ba` (`-D analytic`) is mathematically elegant and guarantees zero color-hull violations, empirical evaluation using **"the grey test" (`tests/metrics.py`)** reveals why it produces more mid-gray transition artifacts than its primary alternative, **`origin/arena/019fba18-celup-lab` (`v4.9.9`)**:
+
+1. **The Linear Ramp Limitation**:
+   - In `019fc1ba`, transition narrowing applies linear scaling `up = clampf(0.5f + (u - 0.5f) / alpha, 0.f, 1.f)`.
+   - Even at high steepness (`K = 64`, `alpha = 0.984`), a linear ramp between plateau colors `P0` and `P1` inherently leaves mid-gray pixels across the width of the transition band unless `K = 1` forces hard step quantization.
+2. **The Grey Test Proof (`tests/metrics.py`)**:
+   - `tests/metrics.py` measures `gray_fraction(lum)` (`GRAY_LO = 24.0, GRAY_HI = 232.0`). On binary black-and-white (BW) line art like `poor smiley.webp`, any pixel remaining between 24 and 232 is counted as mush/veil.
+   - Because `019fc1ba`'s linear narrowing leaves a gradual slope between black and white plateaus, its surviving mid-gray fraction remains significantly higher than `019fba18`'s.
+3. **Why `019fba18` (`v4.9.9`) Wins on BW Art**:
+   - `019fba18` incorporates an **erf-gain post-map on the finished color** (`commit a96137a`) and **tangent-oriented evidence integration** (`commit 18df5b2`).
+   - This actively drives transition mid-grays toward pure black (<24) or pure white (>232), achieving a grey test score of **1.62% grey at `-r 6 -g 64`** (and **1.13% at `-r 2.3`**), with **ink density = 0.964 / 0.988** and **0 hull violations on BW content**.
+
+---
+
+## 4. Head-to-Head Comparison with Similar Branches (Task Group 1)
 
 | Evaluation Criterion | `origin/arena/019fc1ba` (`full gradient narrowing`) | `origin/arena/019fbf78` (`2x2 bilinear projection`) | `origin/arena/019fbfb9` (`stub & sheet split`) | Comparison Verdict |
 | :--- | :--- | :--- | :--- | :--- |
-| **Mathematical Accuracy to Spec** | **Exact match to request**: Global normal walk to plateau colors `P0, P1`, inverted K semantics (`alpha = (K-1)/K`), convex sampling. | **Local unsharp behavior**: Uses local 2x2 bilinear projection and local S-curve mapping that behaves like another `autoblurcompress`. | **Delegation stub**: Routes `method=3` to standard `autodeblur_pass` without custom analytical math. | **`019fc1ba` is the undisputed winner** on mathematical correctness and algorithm design. |
-| **Color Hull Violations** | **0 hull violations** by construction (convex combination of `P0` and `P1`). | Can introduce mixed-pixel/sawtooth artifacts on thin contours if safety gates are bypassed. | Same as baseline autodeblur. | **`019fc1ba` wins on color safety**. |
-| **Automated Test Suites** | Adds **`tests/test_analytic_deblur.py`**, `autodeblur_regression.py`, and `metrics.py`. | Relies on existing tests; updates `check_stairs.py`. | None. | **`019fc1ba` wins on test coverage**. |
-| **Comparison Sheet Generation** | **Missing**: Did not update `make_lab_comparison_sheets.py` or commit visual comparison sheets to `comparison_sheets/`. | Converted comparison sheets to lossless WebP. | Added **auto-splitting** for oversized combined WebP sheets (`>16383px`) and added `-D analytical` to sheet generator. | **`019fbfb9` wins on sheet generation**, explaining why `019fc1ba` was overlooked visually. |
-
-### Quantitative & Qualitative Assessment
-- **Why `019fc1ba` was missed during visual review**: While `019fc1ba` delivered the complete mathematical specification for `-D analytic` and verified it through automated Python unit tests (`test_analytic_deblur.py`), it did not hook `-D analytic` into `make_lab_comparison_sheets.py` or generate visual `.webp`/`.png` sheets. When reviewing branches via visual comparison sheets, `019fc1ba`'s output was invisible.
-- **Why `019fbf78` fell short mathematically**: As noted in user feedback, `019fbf78`'s local 2x2 bilinear projection and local S-curve mapping compressed local gradient transitions in a manner indistinguishable from another `autoblurcompress`. `019fc1ba` avoids this by tracing transitions across their entire width up to 16 pixels along the structure-tensor normal.
-
----
-
-## 4. Strengths, Weaknesses & Trade-Offs
-- **Strengths**:
-  - Implements the true 3-phase full-image gradient narrowing algorithm (`-D analytic`).
-  - Zero color hull violations and exact inverted steepness semantics (`1 = quantize/max deblur`).
-  - Self-contained in a single, surgical commit (`20ad551`) on top of `master` with extensive unit test coverage.
-- **Weaknesses**:
-  - Lacked integration with `make_lab_comparison_sheets.py`, meaning visual inspection required running manual CLI commands.
+| **Mathematical Correctness (`method 3`)** | **True full-image gradient narrowing**: Global normal walk to plateau colors `P0, P1` (`maxR=16` walk) with inverted K semantics and convex sampling. | **Local unsharp behavior**: Local 2x2 bilinear projection that degenerates into "another `autoblurcompress`". | **Delegation stub**: Routes `method=3` to standard `autodeblur_pass`. | **`019fc1ba` wins decisively** on analytical mode correctness. |
+| **BW Grey Test (`gray%` / mid-gray veil)** | **Higher mid-gray artifacts**: Linear transition narrowing (`alpha = (K-1)/K`) leaves mid-gray slope pixels between plateaus. | Degrades into local unsharp ringing on thin contours. | Same as baseline autodeblur. | For BW line art, **`019fba18` (Group 2) outperforms `019fc1ba`**. |
+| **Comparison Sheet Assets** | Added **`make_analytic_sheets.py`** and 5.6 MB of lossless WebP sheets (`8c0247d`). | Converted comparison sheets to lossless WebP. | Added **auto-splitting** for oversized WebP sheets (`>16383px`). | All three branches provide excellent WebP sheet utilities. |
 
 ---
 
 ## 5. Recommendation for `master` (Push-to-Master Verdict)
 
-### Verdict: **RECOMMENDED FOR MASTER (PUSH CORE MATH `20ad551` + PAIR WITH `019fbfb9` SHEETS)**
+### Verdict: **CHERRY-PICK FOR `-D analytic` OPTION (OPT-IN MODE ONLY)**
 - **Justification**:
-  1. Commit **`20ad551`** from `origin/arena/019fc1ba-celup-lab` is the **definitive mathematical winner** for Task Group 1 (Analytical Deblur Mode). It must be pushed/cherry-picked into `master`.
-  2. To resolve `019fc1ba`'s lack of comparison sheets, cherry-pick commit **`1293c23`** from `origin/arena/019fbfb9-celup-lab` (which updates `make_lab_comparison_sheets.py` to support analytical mode and auto-split large lossless WebP sheets).
-  3. Reject `019fbf78-celup-lab`'s C implementation (`method == 3`), as its localized 2x2 bilinear projection is superseded by `019fc1ba`'s global normal walk.
+  1. For the user's primary goal—deblurring BW line art to 0 grey (`poor smiley.webp`)—**`origin/arena/019fba18-celup-lab` (`v4.9.9`)** is the superior engine, as proven by the grey test (`1.62% grey`).
+  2. However, `019fc1ba-celup-lab` (`commit 20ad551`) remains the definitive mathematical implementation of the opt-in **`-D analytic` (`method == 3`)** mode for users who want a linear gradient narrowing filter with guaranteed 0 color-hull violations on colorful art.
+  3. **Action**: Cherry-pick `019fc1ba`'s `-D analytic` option (`20ad551`) as an opt-in mode, but set `master`'s primary autodeblur engine for BW content to `019fba18` (`v4.9.9`).
