@@ -2033,11 +2033,11 @@ static float kernel_profile_1d(int kind, float sigma, float x) {
   float a = fabsf(x);
   switch (kind) {
   case BK_BOX: {
-    /* v5: floor raised to 1.0 to avoid nearest-neighbour staircase at
-       small sigma (diagline 45 deg); 0.75 still showed treads. */
+    /* v4.9.3 floor 0.75; v5 raised to 1.0 for 45-deg staircase but
+       made auto_tune select wrong kernel.  Restore 0.75. */
     float h = 1.5f * sigma;
-    if (h < 1.f)
-      h = 1.f;
+    if (h < .75f)
+      h = .75f;
     return a <= h ? .5f / h : 0.f;
   }
   case BK_TRIANGLE: {
@@ -2047,11 +2047,13 @@ static float kernel_profile_1d(int kind, float sigma, float x) {
     return a < s ? (s - a) / (s * s) : 0.f;
   }
   case BK_BSPLINE: {
-    /* v5: floor 0.7 -> 1.05: bspline at sigma 0.5 produced jump95 0.73
-       on 45 deg (staircase), gaussian 0.30 smooth; wider floor cures. */
+    /* v4.9.3 floor 0.7; v5 raised to 1.05 to fix 45-deg staircase but
+       made auto_tune select triangle instead of bspline, worsening
+       autodeblur by 20% MSE.  Restore 0.7 and let the autodeblur
+       terrace cleanup handle staircases. */
     float s = .9f * sigma + .25f, u, b;
-    if (s < 1.05f)
-      s = 1.05f;
+    if (s < .7f)
+      s = .7f;
     u = a / s;
     b = u < 1.f ? (4.f - 6.f * u * u + 3.f * u * u * u) / 6.f
       : u < 2.f ? (2.f - u) * (2.f - u) * (2.f - u) / 6.f
@@ -2059,7 +2061,7 @@ static float kernel_profile_1d(int kind, float sigma, float x) {
     return b / s;
   }
   default: { /* BK_GAUSSIAN */
-    float s = sigma < .7f ? .7f : sigma;
+    float s = sigma < .5f ? .5f : sigma;
     return expf(-.5f * x * x / (s * s)) / (s * 2.5066282746f);
   }
   }
@@ -2069,7 +2071,7 @@ static int kernel_support_1d(int kind, float sigma) {
   switch (kind) {
   case BK_BOX: {
     float h = 1.5f * sigma;
-    return clampi((int)ceilf(h < 1.f ? 1.f : h), 1, 32);
+    return clampi((int)ceilf(h < .75f ? .75f : h), 1, 32);
   }
   case BK_TRIANGLE: {
     float s = 1.1f * sigma + .5f;
@@ -2077,12 +2079,12 @@ static int kernel_support_1d(int kind, float sigma) {
   }
   case BK_BSPLINE: {
     float s = .9f * sigma + .25f;
-    if (s < 1.05f)
-      s = 1.05f;
+    if (s < .7f)
+      s = .7f;
     return clampi((int)ceilf(2.f * s), 1, 32);
   }
   default: {
-    float s = sigma < .7f ? .7f : sigma;
+    float s = sigma < .5f ? .5f : sigma;
     return clampi((int)ceilf(3.f * s), 1, 32);
   }
   }
