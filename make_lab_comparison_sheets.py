@@ -29,26 +29,10 @@ Z = N * S
 MODE_SPECS = (
     ("nearest", "nearest", ()),
     ("bilinear", "bilinear", ()),
-    ("triangle", "triangle", ()),
-    ("scale2x", "scale2x", ()),
-    ("cubic", "cubic", ()),
-    ("mitchell", "mitchell", ()),
-    ("lanczos2", "lanczos2", ()),
-    ("lanczos3", "lanczos3", ()),
-    ("dehourglass", "dehourglass", ()),
-    ("blur", "blur", ()),
-    ("compress", "compress", ()),
-    ("safecompress s4", "safecompress", ("--strength", "4")),
-    ("hourglassfix", "consistentcompress", ("--strength", "4")),
-    ("blurcompress s4", "blurcompress", ("--strength", "4")),
-    ("safeblurcompress s4", "safeblurcompress", ("--strength", "4")),
-    ("edgecompress s4", "edgecompress", ("--strength", "4")),
-    ("deblurcompress s4", "deblurcompress", ("--strength", "4", "--blur-radius", ".7")),
     ("adaptive", "adaptive", ()),
-    ("adaptive auto", "adaptive", ("--checker-policy", "auto")),
-    ("adaptive s2x", "adaptive", ("--checker-policy", "scale2x")),
-    ("autoblur", "autoblur", ()),
     ("autodeblur", "autodeblur", ()),
+    ("compress2x2 g1", "autodeblur", ("-D", "compress2x2", "-g", "1")),
+    ("compress2x2 g5", "autodeblur", ("-D", "compress2x2", "-g", "5")),
     ("sdf", "sdf", ()),
 )
 MODE_LABELS = tuple(label for label, _, _ in MODE_SPECS)
@@ -334,8 +318,8 @@ def main():
         run_mode(low_webp, cm_path, CLASSMAP_SPEC[1])
         classmap_img = Image.open(cm_path).convert("RGBA")
         sheet = make_sheet_for_scene(name, truth, low, outputs, metrics, classmap_img)
-        sheet_path = SHEET_DIR / f"comparison_{name}.png"
-        sheet.save(sheet_path)
+        sheet_path = SHEET_DIR / f"comparison_{name}.webp"
+        sheet.save(sheet_path, lossless=True)
         panels.append((name, sheet))
 
     # Combined sheet with a title row for each scene.
@@ -346,7 +330,7 @@ def main():
         y = i * row_h
         d.text((6, y + 5), f"{name}: procedural source -> 96x96 premultiplied-linear box -> celup_lab 4x", fill="black")
         combined.paste(panel, (0, y + 26))
-    combined.save(SHEET_DIR / "comparison_sheet.png")
+    combined.save(SHEET_DIR / "comparison_sheet.webp", lossless=True)
 
     # Compact source overview.
     overview = Image.new("RGB", (len(SCENES) * Z, Z + 42), "white")
@@ -355,7 +339,7 @@ def main():
         low = Image.open(EXAMPLE_DIR / f"{name}_source_96.png").convert("RGBA")
         d.text((i * Z + 5, 4), name + " source x4", fill="black")
         overview.paste(checker_composite(low.resize((Z, Z), Image.Resampling.NEAREST)), (i * Z, 42))
-    overview.save(SHEET_DIR / "example_sources.png")
+    overview.save(SHEET_DIR / "example_sources.webp", lossless=True)
 
     # Markdown summary of MAE numbers.
     lines = ["# celup_lab generated comparison sheets", "", "Metric: mean absolute error in premultiplied-linear RGBA, excluding 4px border; lower is better.", ""]
@@ -363,11 +347,11 @@ def main():
     lines.append("|---|" + "---|" * len(MODE_LABELS))
     for name, metrics in summary_rows:
         lines.append("| " + name + " | " + " | ".join(f"{metrics[m]:.5f}" for m in MODE_LABELS) + " |")
-    lines += ["", "Generated files:", "", "- `comparison_sheets/comparison_sheet.png`", "- `comparison_sheets/example_sources.png`", "- `comparison_sheets/comparison_<case>.png`", "- `examples/*_source_96.webp` and matching mode outputs"]
+    lines += ["", "Generated files:", "", "- `comparison_sheets/comparison_sheet.webp`", "- `comparison_sheets/example_sources.webp`", "- `comparison_sheets/comparison_<case>.webp`", "- `examples/*_source_96.webp` and matching mode outputs"]
     (ROOT / "comparison_sheets.md").write_text("\n".join(lines) + "\n")
 
-    print("Wrote", SHEET_DIR / "comparison_sheet.png")
-    print("Wrote", SHEET_DIR / "example_sources.png")
+    print("Wrote", SHEET_DIR / "comparison_sheet.webp")
+    print("Wrote", SHEET_DIR / "example_sources.webp")
     print("Wrote", ROOT / "comparison_sheets.md")
 
 
