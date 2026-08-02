@@ -54,3 +54,29 @@
   smiley (poor smiley x4), cat (x2) and pikachu (x2).  Outputs lossless WebP
   (or PNG when a sheet exceeds WebP's 16383px limit) into comparison_sheets/,
   plus a combined `sheet_all_four` panel.
+
+## v4.9.11 (2026-08-01): jinc2_bilateral stepladder tuning knobs
+
+Exposed all four shader parameters as both CLI flags and env vars so the
+stepladder on flat / gradient-free (hard pixel-art) images can be tuned:
+
+    --j2b-wa A   window A   [0,1] default .50   CELUP_J2B_WA
+    --j2b-wb B   window B   [0,1] default .88   CELUP_J2B_WB
+    --j2b-str S  bilateral  [0,1] default 1.0   CELUP_J2B_STR
+    --j2b-ar R   anti-ring  [0,1] default 1.0   CELUP_J2B_AR
+
+Cause of the stepladder: the bilateral range term snaps each output pixel
+onto the nearest source colour, re-quantising the edge to the output
+lattice.  Two effective fixes, measured on the 45-degree diagline fixture:
+
+  - Lower --j2b-wb toward ~0.80: the strongest single knob.
+    diagline jump95: 2x 0.034->0.021, 4x 0.146->0.027, 8x 0.219->0.042
+    (up to ~5x less staircase).  WB=0.825 is the shader-documented
+    "kills dithering" value.
+  - Lower --j2b-str toward ~0.2: also reduces staircase and is the best
+    overall-MAE knob (beats lanczos3 on diag/curves/axis/shallow/corner/
+    parallel in evaluate_upscalers).
+
+Note WA is *inverted* from intuition for staircase: raising WA increases
+blur but also increases the negative-lobe ringing that re-quantises edges,
+so raising WA makes the staircase *worse*.  Use WB or STR instead.
