@@ -213,3 +213,17 @@ WHERE TO LOOK:
   (pass 1 fit -> pass 1.5 consensus -> pass 2 delta smooth + hull clamp).
   lsq_profile = the linear+erf fit.  CELUP_DBG=x,y env prints per-pixel
   fit internals; keep it working.
+
+NOTE on the SECOND deblur (-D analytic, agent add):
+  autodeblur_analytic_pass is a deliberately different, opt-in deblur.  It
+  does NOT use autodeblur_pass's per-pixel erf fit + trust gates; instead it
+  produces a full-image gradient field (4D structure-tensor normal per pixel,
+  each transition traced along its normal to its two plateau colours P0/P1),
+  edits it by narrowing every transition
+  (u' = clamp(0.5 + (u-0.5)/alpha, 0, 1), alpha = (K-1)/K), and samples from
+  it (out = P0 + u'*(P1-P0)).  Output is a convex combo of two real sampled
+  colours => invariant #1 holds by construction (0 hull violations measured,
+  vs remap's 57 on cornerstar48).  Its -g semantics are INVERTED vs remap/push:
+  K=1 = max deblur (collapse to a point = quantize), larger K = less deblur,
+  K=0 = auto.  It is gated by tests/test_analytic_deblur.py and is not part
+  of the -D auto proxy.  remap/push and all other gates are byte-identical.

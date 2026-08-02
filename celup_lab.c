@@ -5153,6 +5153,271 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
   return 1;
 }
 
+/* autodeblur_analytic_pass -- the "analytical" deblur (method 3).
+
+   A second, deliberately different deblur that does NOT use the per-pixel
+   local-window erf fit + trust gates of autodeblur_pass.  It follows the
+   analytic prescription literally: PRODUCE a full-image gradient field,
+   EDIT it, then SAMPLE from it.
+
+   1. PRODUCE the full-image gradient field.  The autoblur base is loaded into
+      a premultiplied-linear RGBA field A; a 4D structure-tensor pass gives
+      every pixel its gradient normal (nx,ny) and magnitude MAG (the full-image
+      gradient).  For each pixel the colour TRANSITION (the lobe) it sits in is
+      then traced ALONG ITS NORMAL across its whole extent -- an adaptive walk
+      that keeps going until the colour saturates to a plateau on each side and
+      stops there (its length is set by the assumed blur, NOT a fixed 2x2/6x6
+      tap, so a wide blurred ramp is traced end to end while a crisp one stops
+      after a couple of samples).  The lobe is thus reconstructed as a gradient
+      between TWO 4-channel colours P0, P1 (the farthest pair found along the
+      trace), and the pixel records its blend coordinate u in [0,1] on the
+      P0->P1 segment.
+
+   2. EDIT the gradient field.  Push the start (u=0, P0) and end (u=1, P1) of
+      every gradient towards each other: a retention alpha in (0,1] narrows
+      each transition by
+                      u' = clamp(0.5 + (u - 0.5) / alpha, 0, 1).
+      Mid-ramp pixels are driven to the nearer plateau -> the ramp steepens;
+      at alpha -> 0 the whole lobe collapses to one point and the colour
+      quantizes to P0 or P1.  The remap is symmetric about u=0.5, so it is
+      independent of which endpoint is P0 -- only the steepness changes.
+
+   3. SAMPLE from the edited gradient: out = P0 + u' * (P1 - P0), blended in by
+      a contrast weight so genuine flats (|P1-P0| ~ 0) are left untouched.
+      The output is a convex combination of two REAL sampled colours, so it
+      never leaves their hull -- no ringing vocabulary (invariant #1), no hue
+      inversion, premultiplied-safe.
+
+   Strength semantics differ from remap/push: here 1 is the MAXIMUM (collapse
+   to one point = quantize) and larger values are LESS deblur, so
+   alpha = (K-1)/K for K >= 1 (K=1 -> alpha 0 -> quantize; K->inf -> alpha 1 ->
+   identity).  K=0 means auto.  (0 is auto because the same -g knob is shared
+   with remap/push, where 0 also means auto.) */
+static int autodeblur_analytic_pass(uint8_t *out, int dw, int dh, float scale) {
+  size_t n = (size_t)dw * dh;
+  float *A = malloc(n * 4 * sizeof *A);   /* premultiplied-linear RGBA field */
+  float *NX = malloc(n * sizeof *NX);     /* gradient normal x              */
+  float *NY = malloc(n * sizeof *NY);     /* gradient normal y              */
+  float *MAG = malloc(n * sizeof *MAG);   /* |grad I| (the full-image grad) */
+  float *SEG = malloc(n * 8 * sizeof *SEG); /* P0[4], P1[4] per pixel       */
+  float *U = malloc(n * sizeof *U);       /* blend coordinate in [0,1]      */
+  float *WGT = malloc(n * sizeof *WGT);   /* lobe validity (0=flat/no grad) */
+  uint8_t *dst = malloc(n * 4);
+  if (!A || !NX || !NY || !MAG || !SEG || !U || !WGT || !dst) {
+    free(A);
+    free(NX);
+    free(NY);
+    free(MAG);
+    free(SEG);
+    free(U);
+    free(WGT);
+    free(dst);
+    return 0;
+  }
+
+  /* Load the autoblur base render into a linear premultiplied field. */
+  for (int y = 0; y < dh; y++)
+    for (int x = 0; x < dw; x++) {
+      float q[4];
+      raw_pm(out, dw, dh, x, y, q);
+      size_t k = 4 * ((size_t)y * dw + x);
+      A[k] = q[0];
+      A[k + 1] = q[1];
+      A[k + 2] = q[2];
+      A[k + 3] = q[3];
+    }
+
+  /* --- PHASE 1a: full-image gradient + structure-tensor normal (one pass) */
+  for (int y = 0; y < dh; y++)
+    for (int x = 0; x < dw; x++) {
+      size_t idx = (size_t)y * dw + x;
+      int xl = x > 0 ? x - 1 : 0, xr = x + 1 < dw ? x + 1 : dw - 1,
+          yu = y > 0 ? y - 1 : 0, yd = y + 1 < dh ? y + 1 : dh - 1;
+      float Jxx = 0.f, Jxy = 0.f, Jyy = 0.f;
+      for (int c = 0; c < 4; c++) {
+        float gx = A[4 * ((size_t)yu * dw + xr) + c] +
+                   2 * A[4 * ((size_t)y * dw + xr) + c] +
+                   A[4 * ((size_t)yd * dw + xr) + c] -
+                   A[4 * ((size_t)yu * dw + xl) + c] -
+                   2 * A[4 * ((size_t)y * dw + xl) + c] -
+                   A[4 * ((size_t)yd * dw + xl) + c],
+              gy = A[4 * ((size_t)yd * dw + xl) + c] +
+                   2 * A[4 * ((size_t)yd * dw + x) + c] +
+                   A[4 * ((size_t)yd * dw + xr) + c] -
+                   A[4 * ((size_t)yu * dw + xl) + c] -
+                   2 * A[4 * ((size_t)yu * dw + x) + c] -
+                   A[4 * ((size_t)yu * dw + xr) + c];
+        gx *= 1.f / 16.f;
+        gy *= 1.f / 16.f;
+        Jxx += gx * gx;
+        Jxy += gx * gy;
+        Jyy += gy * gy;
+      }
+      float trh = .5f * (Jxx - Jyy), root = sqrtf(trh * trh + Jxy * Jxy),
+            lam = .5f * (Jxx + Jyy) + root;
+      MAG[idx] = lam; /* gradient magnitude ~= top eigenvalue of the tensor */
+      float nx = 1.f, ny = 0.f;
+      if (lam > 1e-12f) {
+        float vx = Jxy, vy = lam - Jxx;
+        if (vx * vx + vy * vy < 1e-18f) {
+          vx = lam - Jyy;
+          vy = Jxy;
+        }
+        float vl = vx * vx + vy * vy;
+        if (vl > 1e-18f) {
+          float inv = 1.f / sqrtf(vl);
+          nx = vx * inv;
+          ny = vy * inv;
+        }
+      }
+      NX[idx] = nx;
+      NY[idx] = ny;
+    }
+
+  /* The assumed blur sizes the trace length so it spans a whole lobe end to
+     end (global), not a fixed 2x2/6x6 tap.  Capped; early termination keeps
+     crisp ramps and flats cheap. */
+  float sref0 = adb_assumed_sigma > 0.f ? adb_assumed_sigma : fitted_sigma;
+  float sref = sref0 > 1.f ? sref0 : 1.f;
+  int maxR = clampi((int)(3.5f * scale * sref + 6.f), 8, 64);
+  const float moveThresh = 1.0e-3f; /* per-step plateau detection threshold */
+  int dbg = 0, dbg_x = 96, dbg_y = 96;
+  {
+    const char *e = getenv("CELUP_DBG");
+    if (e) {
+      dbg = 1;
+      sscanf(e, "%d,%d", &dbg_x, &dbg_y);
+    }
+  }
+
+  /* --- PHASE 1b: trace each pixel's lobe along its normal (global) ---
+     Walk +-normal until the colour saturates to a plateau on each side (an
+     adaptive, potentially many-pixel walk -- NOT a fixed 2x2/6x6 tap), and
+     read the two plateau colours straight off the saturated tails.  The walk
+     is global: a wide blurred ramp is traced end to end so even its tail
+     pixels see both plateaus and get narrowed, while a crisp ramp stops after
+     a couple of samples (early termination).  Every pixel is traced -- the
+     early-termination keeps flats cheap, and the lobe's OWN proven contrast
+     decides validity (no per-pixel magnitude skip, no 2x2/6x6 confidence). */
+  for (int y = 0; y < dh; y++)
+    for (int x = 0; x < dw; x++) {
+      size_t idx = (size_t)y * dw + x;
+      float nx = NX[idx], ny = NY[idx];
+      float *P0 = SEG + 8 * idx, *P1 = P0 + 4;
+      U[idx] = 0.f;
+      WGT[idx] = 0.f;
+      float c0[4];
+      sample_f4(A, dw, dh, (float)x, (float)y, c0);
+      /* Walk each side; the plateau colour is the mean of the saturated tail
+         (>= STAB consecutive sub-threshold steps), or the farthest sample
+         reached if the lobe is wider than maxR. */
+      float plat[2][4];
+      for (int s = 0; s < 2; s++) {
+        float dir = s ? -1.f : 1.f;
+        float prev[4], lastc[4];
+        memcpy(prev, c0, sizeof prev);
+        memcpy(lastc, c0, sizeof lastc);
+        float sum[4] = {0, 0, 0, 0};
+        int ns = 0, stab = 0;
+        for (int t = 1; t <= maxR; t++) {
+          float C[4];
+          sample_f4(A, dw, dh, (float)x + dir * (float)t * nx,
+                    (float)y + dir * (float)t * ny, C);
+          memcpy(lastc, C, sizeof lastc);
+          if (dist4_pm(C, prev) > moveThresh) { /* still transitioning */
+            stab = 0;
+            ns = 0;
+            for (int c = 0; c < 4; c++)
+              sum[c] = 0.f;
+          } else { /* saturated: accumulate the plateau tail */
+            stab++;
+            for (int c = 0; c < 4; c++)
+              sum[c] += C[c];
+            ns++;
+          }
+          memcpy(prev, C, sizeof prev);
+          if (stab >= 3)
+            break; /* plateau confirmed on this side */
+        }
+        if (ns >= 2)
+          for (int c = 0; c < 4; c++)
+            plat[s][c] = sum[c] / (float)ns;
+        else
+          memcpy(plat[s], lastc, sizeof plat[s]);
+      }
+      for (int c = 0; c < 4; c++) {
+        P0[c] = plat[0][c];
+        P1[c] = plat[1][c];
+      }
+      float L2 = dist4_pm(P0, P1); /* |P1 - P0|^2 */
+      if (L2 < 6.4e-5f) { /* no real transition -> inert (flat) */
+        for (int c = 0; c < 4; c++)
+          P0[c] = P1[c] = A[4 * idx + c];
+        continue;
+      }
+      /* Blend coordinate of THIS pixel on the P0->P1 segment. */
+      float dot = 0.f;
+      for (int c = 0; c < 4; c++)
+        dot += (c0[c] - P0[c]) * (P1[c] - P0[c]);
+      U[idx] = clampf(dot / L2, 0.f, 1.f);
+      /* Validity: the lobe's own proven contrast (no 2x2/6x6 confidence). */
+      WGT[idx] = ramp01(L2, 4e-4f, 3e-2f);
+      if (dbg && y == dbg_y && abs(x - dbg_x) <= 16 && (x & 3) == 0)
+        fprintf(stderr,
+                "DBGA %d,%d maxR=%d L2=%.5f u=%.3f wgt=%.3f P0=%.3f P1=%.3f "
+                "mag=%.5f\n",
+                x, y, maxR, L2, U[idx], WGT[idx], P0[0], P1[0], MAG[idx]);
+    }
+
+  /* --- PHASE 2 + 3: edit (narrow) + sample ---
+     K semantics: 0 = auto, 1 = max (collapse to a point = quantize), larger =
+     less deblur.  alpha = (K-1)/K is the transition retention. */
+  float K;
+  if (deblur_steepness > 0.f)
+    K = deblur_steepness;
+  else
+    K = clampf(2.2f - 0.012f * (compress_strength - 1.f), 1.05f, 2.5f);
+  last_deblur_k = K;
+  float alpha = K <= 1.0001f ? 0.f : (K - 1.f) / K;
+  fprintf(stderr,
+          "autodeblur analytic K=%.3f (1=max/quantize, higher=less) "
+          "alpha=%.3f maxR=%d\n",
+          K, alpha, maxR);
+  for (int y = 0; y < dh; y++)
+    for (int x = 0; x < dw; x++) {
+      size_t idx = (size_t)y * dw + x;
+      const float *P0 = SEG + 8 * idx;
+      const float *P1 = P0 + 4;
+      float o[4];
+      for (int c = 0; c < 4; c++)
+        o[c] = A[4 * idx + c];
+      float w = WGT[idx];
+      if (w <= 1e-4f) { /* flat / no proven gradient -> keep base colour */
+        put(dst + 4 * idx, o[0], o[1], o[2], o[3]);
+        continue;
+      }
+      float u = U[idx], up;
+      if (alpha <= 1e-4f) /* K = 1: collapse the gradient to one point */
+        up = u < 0.5f ? 0.f : (u > 0.5f ? 1.f : 0.5f);
+      else
+        up = clampf(0.5f + (u - 0.5f) / alpha, 0.f, 1.f);
+      float v[4];
+      for (int c = 0; c < 4; c++)
+        v[c] = o[c] + w * (P0[c] + up * (P1[c] - P0[c]) - o[c]);
+      put(dst + 4 * idx, v[0], v[1], v[2], v[3]);
+    }
+  memcpy(out, dst, n * 4);
+  free(dst);
+  free(WGT);
+  free(U);
+  free(SEG);
+  free(MAG);
+  free(NY);
+  free(NX);
+  free(A);
+  return 1;
+}
+
 static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
                               int dw, int dh) {
   /* v6.4 photo detection: if image is photo-like (not pixel-art, many soft links, many colours), reduce deblur strength to avoid plateau quantization */
@@ -5201,6 +5466,13 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
   if (!upscale_autoblur(in, sw, sh, out, dw, dh))
     return 0;
   int method = deblur_method;
+  if (method == 3) {
+    /* analytical deblur: opt-in global gradient-field ramp narrowing.  It has
+       its own pass (full-image gradient, not the per-pixel erf fit) and its
+       own inverted -g semantics, so it is not part of the auto proxy. */
+    last_deblur_method = 3;
+    return autodeblur_analytic_pass(out, dw, dh, (float)dw / sw);
+  }
   if (method)
     fprintf(stderr, "autodeblur method %s (manual)\n",
             method == 1 ? "remap" : (method == 2 ? "push" : "compress2x2"));

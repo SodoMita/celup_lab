@@ -303,7 +303,6 @@
   - Regenerated 20-mode visual comparison sheets (`poor_smiley_comparison.png`, `staircase_comparison.png`, `staircase_diag45_comparison.png`).
   - All regression tests pass (`check_stairs.py` PASS, `check_corners.py` PASS, `test_scales.py` PASS, `test_celup3.py` 23.57 baseline PASS).
 
-# v4.9.2 update (2026-07-31): `-D remake` alias; crosshatch delta root-caused
 
 - `-D remake` is now accepted as an alias of `remap` (the user's own
   miya recipe log spells it that way; previously a hard "Unknown
