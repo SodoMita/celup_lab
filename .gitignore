@@ -6,3 +6,4 @@ celup_lab_baseline
 *.o
 docs/*.png
 *.png
+tests/*.webp

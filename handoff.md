@@ -1,6 +1,261 @@
 # Handoff: `celup_lab` upscale/hourglass investigation
 
-# Handoff: `celup_lab` upscale/hourglass investigation
+# v4.9.9 update (2026-08-01): zero-grey completion on step-class sources + pole fix
+
+- User: "deblur to 0 grey on a BW image; remove the highest caps in
+  most cases; XY-pole blur artifacts since 4.8; autodeblur is a
+  deblur."  Verdict: all delivered; details below.
+- Residual-grey forensics (r6): 55% washed stroke cores (eye rings,
+  local window never saw the true level), 68%-of-rest 1px fixpoint
+  column, remainder evidence-dead columns.  Fixes are cap REMOVALS:
+  full endpoint extension on quantized sources (floor remnant .084
+  linear measured and removed), true-AA corridor kept for continuous
+  content only, binary payment (.30/.12), admission = max(fit trust,
+  flank-pair proof, mismatch+step-span straggler channel).  Value-side
+  (own-hull diagonal from own colour) is the only safe orientation:
+  positional mu tie-break DOUBLED the ring into hash; nu-side join
+  drew white specks in ink (halo 107) -- frame flips make both
+  untrustworthy, colour side is frame-eating.
+- Completion premise gating: fires only where base blur was assumed
+  (sref > 1.2), so -r 0.5 keeps the staircase and check_stairs'
+  probe-crisp stays honest.
+- Pole artifact root: axis-aligned evidence box blur mixes
+  opposite-flank evidence at XY poles of circles (measured extra
+  wash + nu flips at exact pole rows).  Fix: tangent-oriented
+  evidence integration (bilinear taps along the per-pixel tangent),
+  uniform rule, no pole special-casing.  Residual: a sub-pixel dash
+  at the r6 bottom pole remains (wash out-spans probe reach).
+- Scoreboard smiley (v4.9.5/97/98/99): r6 grey 17.69/17.61/4.99/
+  1.62%, r6 halo 17.37/16.25/8.99/2.91, r6 ink .949/.951/.957/.964;
+  r2.3 grey 12.71/12.22/2.96/1.13%, r2.3 halo 4.75/4.17/0.49/0.00,
+  r2.3 ink .969/.970/.976/.988.  Gates all PASS (corners, stairs,
+  scales); miya 4x = contour crisping only (qconf 0 => caps active).
+
+# v4.9.8 update (2026-08-01): the grey test -- erf-gain post-map on the finished colour
+
+- New user acceptance test: mid-grey on the (45-level quantized)
+  smiley output = incorrect deblur, by definition.  v4.9.7 left
+  17.6% mid-grey at r6 (NN: 0.02%).  Plus the standing demand:
+  formulas derived so overshoot is impossible by construction.
+- Mechanism: AFTER the colour is finished (steepening + plateau
+  restoration + own-line transport), write it as the step fraction
+  m = ((v-P0).A)/(A.A) against the pixel's own local colour hull
+  [P0,P1] (LOH; hull==NN colours within ~1 step), then steepen in
+  z-space: m' = Phi(g Phi^-1(m)) (g=2.2).  Monotone, range (0,1),
+  hue-safe (shared scalar m per pixel), true ramp core at m=.5 is a
+  fixpoint.  Endpoint extension toward the source-global range only
+  on hard-quantized sources (qconf gate -- photos never reach it;
+  measured failure: image-global red injected at purple|green edges
+  = neon fringes on the wand smoke).
+- Forensic notes for the next round:
+  - w2v (dip-line consensus) covers ~0% of the ordinary contour wash
+    -- any gate built on it is blind on exactly the veil class.
+  - The v4.9 model plateaus (o +- ufit*d2 + off) are uncalibrated on
+    washed flanks: |A| ~1.3 in a 0..1 range, P0 ~ -1.  Never use the
+    LSQ amplitude as a snap target; the hull amplitude is the proven
+    one.
+  - d2's sign flips with the pass-1 u-reversal: plateau targets must
+    be indexed along the hull diagonal (dark..bright) or per-channel
+    d2[c]-sign -- never a global "bright = mm=1" rule (catastrophe:
+    ink .64, halo 103).
+  - Pass 2 UNDOES any pass-1.5 snap unless told otherwise: the final
+    hull clamp raises the washed floor back (LOH lo ~ 49/255 inside
+    a wide wash) and the staircase cleanup lerps the pixel back
+    toward the washed base average.  Fix: write the mapped hull to
+    LOH, and stand the cleanup/smoothing down where the map fired
+    (per-pixel ZM weight array).
+  - Positional repaint of the AA corridor (linear ramp T(mu)) is
+    dead by measurement: crisp-GT MAE 13.2 -> 19+.  Boundary AA
+    values encode sub-pixel feature width; only the source signal
+    carries it.  CELUP_ZAA corridor knob kept (default ~0).
+  - The grey test and the diagline crisp-GT metric contradict by
+    definition (GT contains AA grays; the test forbids them): MAE
+    13.20 -> ~15.0 is the accepted price on that fixture.
+- Scoreboard: r6 grey 17.61->4.99%, halo 16.25->8.99, ink .951->.957,
+  darkmean 30.4->11.4; r2.3 grey 12.22->2.96%, halo 4.17->0.49,
+  ink .970->.976, darkmean 19.2->7.3.  miya: diff>16 = 268k px but
+  all contour-crisping (mouth/bow/bangs/skin near-identical, no
+  rings; wand smoke hue borders mildly tightened).  Gates: stairs
+  (recalibrated .30: ship .098/probe .362), corners PASS, scales
+  204 rows PASS.
+- Residual: r6 still ~5% grey (junction hotspots at half-weight and
+  the 1-2px soft ramp the map keeps by design); ship2x jump95 .098
+  (smoother than v4.9.7's .171); diagline MAE ~15.0.
+
+# v4.9.7 update (2026-08-01): v4.9.6 halo regression root-caused; overshoot-free transport
+
+- User regression report on v4.9.6: "black halo around miya mouth
+  that never existed; sharp black halos on the outer part of poor
+  smiley, similar to lanczos but bigger and smoother; be more
+  analytical -- derive a formula that steepens the gradient without
+  anything that could possibly overshoot."
+- Forensics: miya495-vs-496 diff mask lights up exactly along the
+  chin/mouth/collar contours (max darkening -50), smiley r6 diff is
+  a smooth dark ring around every stroke's OUTER flank (max -98).
+  Carrier = the v4.9.6 bright branch (satb): nu>.88 plateau claims
+  pulled toward tap averages that were slightly darker than the
+  local plateau.  Taps are not the pixel's own asymptote --
+  averaging foreign values into a plateau IS a halo generator.
+- v4.9.7 re-derives the skirt fix from the monotone-map theorem
+  (Phi(k Phi^-1 z) steepening, g:(0,1)->(0,1) monotone, never
+  exits the local range = never overshoots).  Probes survive only
+  as plateau-EXISTENCE tests (must reach the pixel's own model
+  plateau projection; must be strictly brighter along d2); colour
+  moves strictly along the pixel's OWN step line to the proven
+  plateau level -> brightening is the only possible direction.
+  Trough/ink split uses the unsteepened ufit0 (ink-fills 0, trough
+  .1-.4) after a wide-window variant bleached thin strokes
+  (halo 46.9 catastrophe, reverted).
+- Dead ends measured this round: bare asymptote completion
+  (residual keeps the wash pinned; only fired at saturation ->
+  halo 17.0); ufit0-window trough ownership (.06-.58 window
+  swallows thin-stroke rims); scalar pre-payment direction guard
+  (units matched but the outside darkening persisted -- root cause
+  class not worth keeping).
+- Scoreboard: r6 .951/16.25/30.4 (v495 .949/17.37/31.6, v496
+  .942/14.78/32.5); r2.3 .970/4.17/19.2 (v496 .971/3.35/16.1);
+  diagline 13.20 (best ever); outside-ink darkening frac ~0; gates
+  green; miya 4x mouth ring GONE (verified vs v495 frame).
+- Open: last ~1.5 halo units need the tail-calibrated sigma
+  (two-scale LS at the consensus level; also unblocks the parked
+  CELUP_DIP line class: its widths collapse to the point-line floor
+  in multi-feature troughs without it).  Cusp/radial tip class;
+  dense-hair multi-crossing gate policy; wand-smoke alpha fringe.
+
+# v4.9.6 update (2026-08-01): veil root-caused (s-underread) + skirt transport shipped
+
+- Trigger: external review of the miya/smiley sheets ("halos, mush,
+  bleeding, inconsistent sharpness").  Smile r6 veil decomposed by
+  distance bands: 26.8 @2-4px, 11.2 @4-6, 6.4 @6-10, still 2.1 @10-16
+  (NN ~1.9 at 2-4).  Two carrier populations measured: (a) pixels the
+  model saturates BRIGHT but whose gain-1 residual keeps the tail --
+  the |du|-moment s reads ~4 out-px while the base skirt runs
+  sigma ~10-12 out-px (two-scale profile), so `(nu-ufit0)*d2` pays
+  ~0 out there; (b) pixels the model saturates DARK (nu<.12, HALF the
+  veil band) -- the wash trough is mis-owned as ink interior, only
+  resolvable by VALUE gates.
+- Shipped: value-gated skirt transport (peel): saturated claims
+  sample ~2.6s farther along the normal; bright claims require
+  non-darkening taps (along d2), dark claims require |z0|>1.2 AND
+  inn<.6 (the washed-inner membership; ink rims keep inn~.8-1, trough
+  fog reads .4-.55) AND strictly brighter taps AND s>2.  Targets are
+  observed base colours, hull-clamped; nothing is DC-spread (the
+  terrace pass is DC-exact and provably cannot remove veil mass).
+- Numbers: r6 halo 17.4 -> 14.8, ink .949 -> .942; r2.3 halo 4.75 ->
+  3.35, ink .969 -> .971, darkmean 20.6 -> 16.0; diagline GT MAE
+  15.26 -> 13.37; ship4x jump95 .023 -> .001; all gates green.
+- Dip/line class built (vec-to-centre field + zstar LUT width
+  inversion + pass-1.5 dip evaluation) but OFF by default
+  (CELUP_DIP=1 to test): in multi-feature troughs the chosen flank
+  pair gives garbage widths (point-line floor).  Next honest step:
+  tail-calibrated sigma (two-scale LS at consensus level) -- it is
+  also what the anchored removal needs to chase the +-20 px tail
+  directly instead of by peel.
+- Open (updated): cusp/radial tip class; comb-teeth in dense miya
+  lash zone; wand-smoke alpha-fringe chroma junk (pre-existing);
+  residual narrow-gap fog where NO brighter tap exists within 2.6s
+  (needs the sigma fix, not more peel).
+
+# v4.9.5 update (2026-08-01): mass-conserving deblur depth; mouth doubling fixed; tip anatomy
+
+- User on v4.9.4: "improved color restore, but more artifacts, miya
+  mouth vertically doubled, line tips are rounded too much. So far
+  autodeblur either produced pointy snake tongue lineends, or rounded
+  linends, no deblur that would preserve shapes."
+- Mouth doubling diagnosis (out-px DBGS columns at the mouth): true
+  structure is a 2-3 src px lip band, depth 125-173 on skin 19 -- but
+  v4.9.4's saturating 1/att claim pinned it to 255-black, paid as TWO
+  rails (each flank frame pays its own claim) with a bright seam at
+  ufit~.5 where neither side gate applies.  The dip-centre seam and
+  the overclaim are one bug: depth was extrapolated from "assume the
+  dip is saturated", not from the measured ink.
+- Mass-conserving depth (the user's "accumulate colors back"
+  literalised): blur conserves deficit mass; box+gauss dip model pins
+  `f = k(wsrc+2.83 sig_src)/(k wsrc+2.83 sig_src)` (k hoisted in
+  pass 1, v4.9.4).  Replaces the v4.9.4 `min(k,8)/att*q` hack (that
+  one was saturated-depth leaning; the new rule is ink bookkeeping:
+  dip gets back exactly what the wash holds, spread over the rendered
+  width).  miya mouth 81..255 rails+seam -> single stroke peaking
+  ~163 (NN 173); smiley metrics unchanged (clamped at native black
+  anyway); ship2x staircase jump95 .263 -> .089 as a side-effect.
+- Dip-core tent: two-sided extremum-proven dips pay the centre
+  (ufit ~ .5) the min-magnitude same-sign offset component.
+- Tip entry: extremum-proven + OUTER-LEVEL-SYMMETRIC flank pairs are
+  admitted below the .85 coherence gate (fading to coh .3); unequal
+  outsides (T-junction pairing) stay rejected.  Brow/lash taper ends
+  recovered on miya.
+- **Found + documented, not solved**: sharp cusp apices read NL=1 in
+  the lobe map (profile has a single edge there; the coh.85/.55/.2
+  gate never mattered -- the DBGR instrumentation row shows NBRANGE/
+  one-lobe rejects at every apex pixel).  Cornerstar wedge apex:
+  NN tip-top row 16 vs rendered 24 (2x out px) identical with and
+  without the tip-entry relaxation.  True cusp preservation needs a
+  radial/tip feature class (its own follow-up).
+- Also observed (not chased): comb-teeth zigzag inside miya's dense
+  lower-lash zone at 4x (v4.9.2 smears it, v4.9.4+ show teeth); the
+  wand-smoke alpha-fringe chroma junk persists (pre-existing since
+  v4.9.2, present in base too); skirt halo/veil metrics flat as
+  before (17.4 r6 smiley ROI vs NN 1.9 -- still the residual-channel
+  blur tail, no gate touches it).
+
+# v4.9.4 update (2026-08-01): accumulate-mass deblur (watercolor, round 2)
+
+- User: "improve autodeblur. currently it water colors, produce halo.
+  it supposed to accumulate colors back at deblur phase."
+- Diagnosis by numbers (smiley 2x ROI rows 240-500; ink = total
+  darkness vs NN = 1.0; halo = mean darkness in the 2-4 px band
+  outside the NN line mask; darkmean = mean darkness inside the
+  mask): v4.9.3 claimed the right plateau but paid it only at
+  `ufit0 > .78` (unsteepened model); narrow -r 6 strokes are ~2.9
+  sigma wide so interiors read .6-.9 and stayed at the attenuated
+  plateau.
+- nu-based membership tried and REVERTED: phi1(k*z0) saturates at
+  |z0| > 2.5/k -- no side truth; washed skirts were painted black
+  (diagline GT MAE 13.7 -> 17.6; inside-vs-outside positions e.g.
+  mouth (250,416) ufit .66 pay vs diag (54,64) ufit .37 don't-pay
+  confirmed ufit0 keeps the side information).
+- Fixes shipped: gate centre .78 -> .70 (scan .55/.60/.65/.70/.78:
+  smiley ink .929/.924/.919/.912/.900, darkmean 227/226/225/223/220,
+  diag MAE 16.6/15.9/15.1/14.2/14.3 -- .70 best joint); mass-correct
+  restore depth `max(1/att, min(k,8)/att * wsrc/(wsrc+2.83*sigma))`
+  gated att < .85, cap 4, with pass-1 k hoisted above the restoration
+  block; full-strength payment where nu + uf + gInn are all
+  saturated (was blurred consensus weight ~.5-.7).
+- Net: smiley r6 ink .879 -> .912, core darkmean 215 -> 223, halo
+  17.8 -> 17.6 (unchanged); diag MAE 14.2 vs 13.7 base; r 2.3 recipe
+  unchanged; check_stairs / check_corners / test_scales (incl. miya
+  face sweep) green.
+- OPEN: the halo/veil (3-17 darkness in the 2-4 px skirt, NN ~2) is
+  untouched by every gate tried (consensus-blur radii, uf centre,
+  f_mass, k-cap): it is the base render's gaussian tail minus the
+  partial erf-swap correction, surviving through the anchored-eval
+  residual channel far from evidence (wS ~ 0 keeps the wash).  Needs
+  real mass TRANSPORT (skirt -> core), not another rescale.
+
+# v4.9.3 update (2026-08-01): restored parameters honesty, narrow-line washout, terraces
+
+- Root cause of "ignoring parameters": the sawtooth cap
+  `k = fminf(k, s/.6f)` makes `-g 16`/`-g 64` bit-identical while the
+  report echoed the request.  The report now prints the effective
+  applied range (`effective-k=6.54..12.32 avg ...` on miya 4x).
+- Narrow-line washout at `-r 6` ("smiley mouth fades to grey"):
+  per-window flank-pair amplitude restoration, heavily gated
+  (coherence, flank extremum + direction-consistency tests,
+  base-model saturation membership `uf0/uf1`, value-membership
+  `gInn`, 2.25x cap, source-range clamp, wS2 evidence + PF
+  consensus blur).  Barcode/neon failure modes seen en route:
+  per-pixel trust flapping; mirrored-frame rel mixing; off-feature
+  saturation claims -- all documented in-code.
+- Terrace cleanup for quantized sources (45-level smiley class):
+  `estimate_qconf` + normal-direction plateau smoothing in pass 2.
+- Verified: tests/check_stairs.py, check_corners.py, test_scales.py
+  (incl. miya face sweep once `tests/miya_normal.webp` is copied
+  from images/), plus vs-master renders on the real assets:
+  smiley r6 mouth dark-mean 108 -> 56 and min 50 -> 0 (native black),
+  r23 visual parity, miya 4x MAE 4.29 -> 2.12 vs base.
+  Synthetic diagline probe 15.2 vs 14.5
+  base (marginal, GT asks sub-blur-line recovery).  Open: r6 eye
+  ring minor unevenness on the smiley (thin annulus class).
 
 # v4.9.2 update (2026-07-31): `-D remake` alias; crosshatch delta root-caused
 

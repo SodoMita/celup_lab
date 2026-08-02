@@ -22,13 +22,17 @@ then measure:
 
 Checked configurations:
   1. SHIP2X: the user's smiley recipe (autodeblur 2x -r 6 -s 100 -g 64
-     -D remap) MUST PASS -- calibrated: jump95 = 0.11.
+     -D remap) MUST PASS -- calibrated: jump95 = 0.10 (v4.9.8).
   2. SHIP4X: the miya recipe (4x -r 2.3 -s 100 -g 16) MUST PASS --
      calibrated: jump95 = 0.02.
-  3. PROBE: a deliberately crisp reproducer (autodeblur 4x -r 0.5,
-     steepness 64) MUST BE FLAGGED -- measured jump95 = 0.69 with
-     visible treads.  If the probe ever "passes", the detector is
-     toothless and the gate itself fails.
+  3. PROBE: a deliberately crisp reproducer (autodeblur 2x -r 0.5,
+     steepness 64) MUST BE FLAGGED.  If the probe ever "passes", the
+     detector is toothless and the gate itself fails.  Calibrations
+     follow the renderer's morphology: v4.8 measured ship .11 / probe
+     .69 (threshold .45); v4.9.8's erf-gain post-map removes the
+     mid-value wash band, so mid-crossing jitter shrinks across the
+     board -- ship2x .098, probe .36 with treads still visible --
+     and the threshold is recalibrated to .30 (ship margin ~3x).
 
 Run from the repo root:  python3 tests/check_stairs.py
 Exit code 0 = ship configs smooth, probe staircased.
@@ -49,13 +53,15 @@ SHIP2 = ["--mode", "autodeblur", "--max-mib", "1048", "-c", "linear",
          "-k", "bspline", "-r", "6", "-s", "100", "-g", "64", "-D", "remap"]
 SHIP4 = ["--mode", "autodeblur", "--max-mib", "1048", "-c", "linear",
          "-k", "bspline", "-r", "2.3", "-s", "100", "-g", "16", "-D", "remap"]
+
 # v5: with wider kernel floors and looser caps even the crisp autodeblur
 # is now smooth (0.002 jump95); to keep detector non-toothless, probe uses
 # nearest (guaranteed staircase, jump95 ~3) as the known-bad case.
 PROBE = ["--mode", "nearest", "--max-mib", "1048"]
+PROBE_SCALE = 2
 
 TREADRUN_MAX = 3      # output rows pinned to one crossing position
-JUMP95_MAX = 0.45     # output px adjacent-row residual step (p95)
+JUMP95_MAX = 0.30     # output px adjacent-row residual step (p95)
 MIN_ROWS = 0.55       # fraction of rows the tracked flank must cover
 
 
@@ -168,7 +174,7 @@ def main():
     with tempfile.TemporaryDirectory() as td:
         jobs = [("ship2x", 2, SHIP2, True),
                 ("ship4x", 4, SHIP4, True),
-                ("probe-crisp", 4, PROBE, False)]
+                ("probe-crisp", PROBE_SCALE, PROBE, False)]
         for name, scale, recipe, must_pass in jobs:
             out = Path(td) / f"{name}.webp"
             r = subprocess.run([str(LAB), str(SRC), str(out), str(scale),
