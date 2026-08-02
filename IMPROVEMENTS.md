@@ -80,3 +80,27 @@ lattice.  Two effective fixes, measured on the 45-degree diagline fixture:
 Note WA is *inverted* from intuition for staircase: raising WA increases
 blur but also increases the negative-lobe ringing that re-quantises edges,
 so raising WA makes the staircase *worse*.  Use WB or STR instead.
+
+## v4.9.12 (2026-08-01): jinc2_auto mode
+
+New `--mode jinc2_auto`: jinc2_bilateral with WB/STR auto-tuned per image by
+a self-supervised 2x-downscale validation proxy (same approach as autoblur).
+
+The proxy MSE alone would always pick the sharpest reconstruction (WB .88,
+STR 1.0), which on flat / gradient-free (hard pixel-art) sources re-quantises
+edges onto the output lattice -- the stepladder.  So the objective is
+
+    score = MSE * (1 + 2.5 * hardness * STR)
+
+where hardness = fraction of exact-duplicate adjacent source pixels (a proxy
+for pixel-art / quantized line art; diagline48 .85, smiley .84, miya .07,
+cat .14) and STR is the bilateral strength whose high values cause the
+lattice re-snap.  On natural gradients hardness ~ 0 => plain MSE; on hard
+pixel art low STR wins (measured: diagline jump95 .146 -> .063 with the best
+overall MAE).  WB is left to the MSE (0.88 default is fine); among
+near-best candidates the lowest STR then lowest WB is preferred.
+
+Measured: MAE beats jinc2_bilateral default on diag/curves/gradient/shallow/
+corner/parallel/alpha; hourglass HG lower on crosshatch/diag/corner;
+diagline staircase 2x/4x/8x = .030/.063/.139 vs default .034/.146/.219;
+scale-sweep 1.5x..24x all step 0.000.
