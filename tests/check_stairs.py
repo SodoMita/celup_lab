@@ -171,6 +171,8 @@ def main():
     with tempfile.TemporaryDirectory() as td:
         jobs = [("ship2x", 2, SHIP2, True),
                 ("ship4x", 4, SHIP4, True),
+                ("compress2x2_g1", 2, ["--mode", "autodeblur", "--max-mib", "1048", "-c", "linear", "-k", "bspline", "-r", "6", "-D", "compress2x2", "-g", "1"], True),
+                ("compress2x2_g5", 2, ["--mode", "autodeblur", "--max-mib", "1048", "-c", "linear", "-k", "bspline", "-r", "6", "-D", "compress2x2", "-g", "5"], True),
                 ("probe-crisp", PROBE_SCALE, PROBE, False)]
         for name, scale, recipe, must_pass in jobs:
             out = Path(td) / f"{name}.webp"
