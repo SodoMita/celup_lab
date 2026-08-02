@@ -2507,6 +2507,7 @@ static void sample_pm(const uint8_t *img, int w, int h, float x, float y,
 /* deblur method: 0 = auto (validation proxy picks), 1 = monotone slope
    remap, 2 = Anime4K-style gradient push. */
 static int deblur_method = 0;
+static int disable_safety_gates = 0;
 static float deblur_steepness = 0.f; /* <=0: auto (-e adaptive or -s formula) */
 /* v4.9.3 texture-residual gain (AUTODEBLUR_NOTES queue #1): opt-in hull-
    clamped crispening of lattice detail in model-off, directed windows.
@@ -2878,7 +2879,7 @@ static void sample_fn(const float *img, int w, int h, int nc, float x,
     }
 }
 static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
-                           int method) {
+                           int method, const uint8_t *in, int sw, int sh) {
   size_t n = (size_t)dw * dh;
   float *A = malloc(n * 4 * sizeof *A);
   float *DEL = malloc(n * 4 * sizeof *DEL);  /* flat + model colour delta */
@@ -2920,6 +2921,8 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
       adb_noamp = 1;
     if (getenv("CELUP_NOTER"))
       adb_noter = 1;
+    if (getenv("CELUP_NOGATES"))
+      disable_safety_gates = 1;
   }
   /* sref = ASSUMED source blur (window sizing, shading gate).  When the
      reconstruction sigma was decoupled (v4.9) the assumed value is kept
@@ -3042,7 +3045,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
       /* Gate band tuned so long blurred arcs (rings/corner torture,
          face contours) keep full tangential averaging and only genuine
          junctions/tips (rho >= ~.3 on a 3x3 tensor) lose it. */
-      float coh = 1.f - ss01((rho - .10f) * (1.f / .20f));
+      float coh = (disable_safety_gates || method == 3) ? 1.f : (1.f - ss01((rho - .10f) * (1.f / .20f)));
       float dirx = 1.f, diry = 0.f;
       if (lam > 1e-12f) {
         float vx = Jxy, vy = lam - Jxx;
@@ -3827,12 +3830,46 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
               }
               float z0 = (0.f - (float)mu) / s;
               float ufit0 = phi1(z0), nu;
-              if (method == 2 && k > 1.f)
+              if (method == 3) {
+                float k_ana = k;
+                if (deblur_steepness > 0.f) {
+                  float K = deblur_steepness;
+                  if (K <= 1.0001f) {
+                    k_ana = 1e5f;
+                  } else {
+                    k_ana = 1.f + 3.6f / (K - 1.f);
+                  }
+                }
+                if (k_ana > 1e4f) {
+                  if (ufit0 < 0.5f) nu = 0.f;
+                  else if (ufit0 > 0.5f) nu = 1.f;
+                  else nu = 0.5f;
+                } else {
+                  nu = phi1(k_ana * z0);
+                }
+              } else if (method == 2 && k > 1.f)
                 nu = phi1(z0 + (ufit0 - .5f) * (k - 1.f) * 1.5f);
               else
                 nu = phi1(k * z0);
               nu = clampf(nu, 0.f, 1.f);
               wS = ss01((sb - s) / (sb - sa));
+              if (disable_safety_gates) {
+                wS = 1.f;
+              } else if (method == 3) {
+                float lmed = .5f * (ul + ur);
+                int side = 0, cross = 0;
+                for (int j = 0; j < NS; j++) {
+                  if (side <= 0 && u[j] > lmed + .02f) {
+                    cross += side < 0;
+                    side = 1;
+                  } else if (side >= 0 && u[j] < lmed - .02f) {
+                    cross += side > 0;
+                    side = -1;
+                  }
+                }
+                wS *= 1.f - ss01(((float)cross - 2.25f) / 2.5f);
+                wS *= ss01((rng - 0.05f) / 0.10f);
+              } else {
               /* Fit-trust: RMSE of the erf fit over the full lobe,
                  |du| weights (the weights concentrate the check on the
                  lobe core, which is what the steepening actually
@@ -4227,7 +4264,24 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
            so only model-u separates the interior from the rim;
            without this the offset paints a neon band +-1.5 flanks
            wide around narrow lines. */
-        if (method == 2 && k > 1.f)
+        if (method == 3) {
+          float k_ana = k;
+          if (deblur_steepness > 0.f) {
+            float K = deblur_steepness;
+            if (K <= 1.0001f) {
+              k_ana = 1e5f;
+            } else {
+              k_ana = 1.f + 3.6f / (K - 1.f);
+            }
+          }
+          if (k_ana > 1e4f) {
+            if (ufit0 < 0.5f) nu = 0.f;
+            else if (ufit0 > 0.5f) nu = 1.f;
+            else nu = 0.5f;
+          } else {
+            nu = phi1(k_ana * z0);
+          }
+        } else if (method == 2 && k > 1.f)
           nu = phi1(z0 + (ufit0 - .5f) * (k - 1.f) * 1.5f);
         else
           nu = phi1(k * z0);
@@ -4508,6 +4562,58 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
         float vv[4] = {0.f, 0.f, 0.f, 0.f},
               vblo[4] = {0.f, 0.f, 0.f, 0.f},
               vbhi[4] = {0.f, 0.f, 0.f, 0.f};
+        float bil_delta[4] = {0.f, 0.f, 0.f, 0.f};
+        if (method == 3) {
+          float sy = ((float)y + 0.5f) / scale - 0.5f;
+          float sx = ((float)x + 0.5f) / scale - 0.5f;
+          int ix = (int)floorf(sx), iy = (int)floorf(sy);
+          float fx = sx - (float)ix, fy = sy - (float)iy;
+          float p_colors[4][4], q_bil[4] = {0.f, 0.f, 0.f, 0.f};
+          for (int j = 0; j < 2; j++)
+            for (int i = 0; i < 2; i++) {
+              int k_cell = 2 * j + i;
+              float ww = (i ? fx : 1.f - fx) * (j ? fy : 1.f - fy);
+              raw_pm(in, sw, sh, ix + i, iy + j, p_colors[k_cell]);
+              for (int c = 0; c < 4; c++)
+                q_bil[c] += ww * p_colors[k_cell][c];
+            }
+          int ai = 0, bi = 1;
+          float best_dist = -1.f;
+          for (int a = 0; a < 4; a++)
+            for (int b = a + 1; b < 4; b++) {
+              float d_dist = 0.f;
+              for (int c = 0; c < 4; c++) {
+                float z = p_colors[b][c] - p_colors[a][c];
+                d_dist += z * z;
+              }
+              if (d_dist > best_dist) {
+                best_dist = d_dist;
+                ai = a;
+                bi = b;
+              }
+            }
+          if (best_dist > 1e-6f) {
+            float dot = 0.f;
+            for (int c = 0; c < 4; c++)
+              dot += (q_bil[c] - p_colors[ai][c]) * (p_colors[bi][c] - p_colors[ai][c]);
+            float t_val = clampf(dot / best_dist, 0.f, 1.f);
+            
+            float u_val = 0.f;
+            float K = deblur_steepness > 0.f ? deblur_steepness : (k > 1.0001f ? 1.f + 3.6f / (k - 1.f) : 1e6f);
+            if (K < 1.f) K = 1.f;
+            if (K <= 1.0001f) {
+              if (t_val < 0.5f) u_val = 0.f;
+              else if (t_val > 0.5f) u_val = 1.f;
+              else u_val = 0.5f;
+            } else {
+              u_val = clampf((t_val - 0.5f) / (1.f - 1.f / K) + 0.5f, 0.f, 1.f);
+            }
+            
+            for (int c = 0; c < 4; c++) {
+              bil_delta[c] = (u_val - t_val) * (p_colors[bi][c] - p_colors[ai][c]);
+            }
+          }
+        }
         float zg = CELUP_ZG_DEF, zaa = CELUP_ZAA_DEF, zmw = 0.f,
               zrmp = 0.f;
         int zno = 0;
@@ -4563,12 +4669,17 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           float t0 = off0e[c], t1 = off1e[c], tc = 0.f;
           if (t0 * t1 > 0.f)
             tc = fabsf(t0) < fabsf(t1) ? t0 : t1;
-          float v = clampf(o[c] + w * ((nu - ufit0) * d2[c]) +
+          float v;
+          if (method == 3) {
+            v = clampf(o[c] + w * bil_delta[c], blo, bhi);
+          } else {
+            v = clampf(o[c] + w * ((nu - ufit0) * d2[c]) +
                                vr * (uf0 * (1.f - nu) * off0e[c] +
                                      uf1 * nu * off1e[c]) +
                                w2v * gInn * uft * tc,
                            blo, bhi);
-          if (wpeel > 0.f)
+          }
+          if (method != 3 && wpeel > 0.f)
             v = clampf(v + wpeel * (atap[c] - v), blo, bhi);
           vv[c] = v;
           vblo[c] = blo;
@@ -5090,7 +5201,7 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
   int method = deblur_method;
   if (method)
     fprintf(stderr, "autodeblur method %s (manual)\n",
-            method == 1 ? "remap" : "push");
+            method == 1 ? "remap" : (method == 2 ? "push" : "compress2x2"));
   if (!method) {
     /* Auto-choice over the implemented deblur methods with the same
        self-supervised 2x-downscale proxy the blur fit uses: whichever
@@ -5102,15 +5213,15 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
       uint8_t *recon = malloc((size_t)sw * sh * 4);
       double bs = 1e300;
       if (train && recon)
-        for (int m = 1; m <= 2; m++) {
+        for (int m = 1; m <= 3; m++) {
           if (!render_soft(train, tw, th, recon, sw, sh, fitted_kernel,
                            fitted_sigma, fitted_curve, fitted_cp))
             continue;
-          if (!autodeblur_pass(recon, sw, sh, (float)sw / tw, m))
+          if (!autodeblur_pass(recon, sw, sh, (float)sw / tw, m, train, tw, th))
             continue;
           double s = image_pm_mse(recon, in, sw, sh, 2);
           fprintf(stderr, "autodeblur method %s proxy MSE %.8g\n",
-                  m == 1 ? "remap" : "push", s);
+                  m == 1 ? "remap" : (m == 2 ? "push" : "compress2x2"), s);
           if (s < bs) {
             bs = s;
             method = m;
@@ -5119,11 +5230,11 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
       free(train);
       free(recon);
       fprintf(stderr, "autodeblur auto-selected %s\n",
-              method == 1 ? "remap" : "push");
+              method == 1 ? "remap" : (method == 2 ? "push" : "compress2x2"));
     }
   }
   last_deblur_method = method;
-  return autodeblur_pass(out, dw, dh, (float)dw / sw, method);
+  return autodeblur_pass(out, dw, dh, (float)dw / sw, method, in, sw, sh);
 }
 
 /* ---------------------------------------------------------------------------
@@ -7087,14 +7198,17 @@ static void print_help(const char *argv0) {
       "                            autoblur fit toward enough blur for smooth\n"
       "                            edges, and adapts autodeblur steepness\n"
       "                            per edge\n"
-      "  -D, --deblur-method M     autodeblur method auto|remap|push\n"
+      "  -D, --deblur-method M     autodeblur method auto|remap|push|compress2x2\n"
       "                            (v4.9.2: 'remake' accepted as alias;\n"
       "                            default auto = 2x proxy picks per image);\n"
       "                            remap = evaluate the slope-steepened\n"
       "                            profile fit at the pixel's own position,\n"
       "                            push = evaluate the original fit at a\n"
       "                            position displaced toward the nearer\n"
-      "                            plateau (Anime4K push)\n"
+      "                            plateau (Anime4K push),\n"
+      "                            compress2x2 = reconstruct image as linear\n"
+      "                            gradients of 4 colors pushing starts and\n"
+      "                            ends toward each other (max deblur = 1)\n"
       "  -g, --deblur-steepness K  autodeblur slope multiplier FLOAT 1..64\n"
       "                            (default 0=auto); overrides -s and -e\n"
       "                            per-edge adaptation; anchored evaluation\n"
@@ -7130,7 +7244,7 @@ static void print_help(const char *argv0) {
       "                                                 = R/min(K,8) (v4.9)\n"
       "  curve        validation-proxy fit              -c (any value but auto)\n"
       "  curve param  fit                               -p P\n"
-      "  method       2x-downscale proxy MSE            -D remap|push\n"
+      "  method       2x-downscale proxy MSE            -D remap|push|compress2x2\n"
       "  steepness    -s formula, or -e per edge        -g K (exact float,\n"
       "                                                 1..64)\n"
       "  Only the unpinned parameters are fitted.  Every effective value is\n"
@@ -7595,6 +7709,11 @@ int main(int ac, char **av) {
     return 2;
   }
   for (int i = 4; i < ac;) {
+    if (!strcmp(av[i], "--no-safety-gates") || !strcmp(av[i], "--disable-gates")) {
+      disable_safety_gates = 1;
+      i++;
+      continue;
+    }
     if (!strcmp(av[i], "--auto-blurcompress") ||
         !strcmp(av[i], "--auto-tune") || !strcmp(av[i], "-a")) {
       auto_blurcompress = 1;
@@ -7742,6 +7861,10 @@ int main(int ac, char **av) {
         deblur_method = 1;
       else if (!strcmp(av[i + 1], "push"))
         deblur_method = 2;
+      else if (!strcmp(av[i + 1], "compress2x2") ||
+               !strcmp(av[i + 1], "analytical") ||
+               !strcmp(av[i + 1], "linear"))
+        deblur_method = 3;
       else {
         fprintf(stderr, "Unknown deblur method: %s\n", av[i + 1]);
         return 2;
@@ -7984,7 +8107,7 @@ int main(int ac, char **av) {
            kernel_name(fitted_kernel), fitted_sigma, curve_name(fitted_curve),
            fitted_cp);
     if (!strcmp(mode, "autodeblur")) {
-      printf(", method=%s", last_deblur_method == 2 ? "push" : "remap");
+      printf(", method=%s", last_deblur_method == 2 ? "push" : (last_deblur_method == 3 ? "compress2x2" : "remap"));
       if (last_deblur_k > 0.f) {
         printf(", steepness=%.2f%s", last_deblur_k,
                deblur_steepness > 0.f ? "(manual)" : "");
