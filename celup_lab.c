@@ -3547,14 +3547,21 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
               float z0 = (0.f - (float)mu) / s;
               float ufit0 = phi1(z0), nu;
               if (method == 3) {
-                float K = deblur_steepness > 0.f ? deblur_steepness : (k > 1.0001f ? 1.f + 3.6f / (k - 1.f) : 1e6f);
-                if (K < 1.f) K = 1.f;
-                if (K <= 1.0001f) {
+                float k_ana = k;
+                if (deblur_steepness > 0.f) {
+                  float K = deblur_steepness;
+                  if (K <= 1.0001f) {
+                    k_ana = 1e5f;
+                  } else {
+                    k_ana = 1.f + 3.6f / (K - 1.f);
+                  }
+                }
+                if (k_ana > 1e4f) {
                   if (ufit0 < 0.5f) nu = 0.f;
                   else if (ufit0 > 0.5f) nu = 1.f;
                   else nu = 0.5f;
                 } else {
-                  nu = clampf((ufit0 - 0.5f) / (1.f - 1.f / K) + 0.5f, 0.f, 1.f);
+                  nu = phi1(k_ana * z0);
                 }
               } else if (method == 2 && k > 1.f)
                 nu = phi1(z0 + (ufit0 - .5f) * (k - 1.f) * 1.5f);
@@ -3562,8 +3569,22 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 nu = phi1(k * z0);
               nu = clampf(nu, 0.f, 1.f);
               wS = ss01((sb - s) / (sb - sa));
-              if (disable_safety_gates || method == 3) {
+              if (disable_safety_gates) {
                 wS = 1.f;
+              } else if (method == 3) {
+                float lmed = .5f * (ul + ur);
+                int side = 0, cross = 0;
+                for (int j = 0; j < NS; j++) {
+                  if (side <= 0 && u[j] > lmed + .02f) {
+                    cross += side < 0;
+                    side = 1;
+                  } else if (side >= 0 && u[j] < lmed - .02f) {
+                    cross += side > 0;
+                    side = -1;
+                  }
+                }
+                wS *= 1.f - ss01(((float)cross - 2.25f) / 2.5f);
+                wS *= ss01((rng - 0.05f) / 0.10f);
               } else {
               /* Fit-trust: RMSE of the erf fit over the full lobe,
                  |du| weights (the weights concentrate the check on the
@@ -3932,14 +3953,21 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
            without this the offset paints a neon band +-1.5 flanks
            wide around narrow lines. */
         if (method == 3) {
-          float K = deblur_steepness > 0.f ? deblur_steepness : (k > 1.0001f ? 1.f + 3.6f / (k - 1.f) : 1e6f);
-          if (K < 1.f) K = 1.f;
-          if (K <= 1.0001f) {
+          float k_ana = k;
+          if (deblur_steepness > 0.f) {
+            float K = deblur_steepness;
+            if (K <= 1.0001f) {
+              k_ana = 1e5f;
+            } else {
+              k_ana = 1.f + 3.6f / (K - 1.f);
+            }
+          }
+          if (k_ana > 1e4f) {
             if (ufit0 < 0.5f) nu = 0.f;
             else if (ufit0 > 0.5f) nu = 1.f;
             else nu = 0.5f;
           } else {
-            nu = clampf((ufit0 - 0.5f) / (1.f - 1.f / K) + 0.5f, 0.f, 1.f);
+            nu = phi1(k_ana * z0);
           }
         } else if (method == 2 && k > 1.f)
           nu = phi1(z0 + (ufit0 - .5f) * (k - 1.f) * 1.5f);
