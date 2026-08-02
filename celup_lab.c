@@ -2595,6 +2595,9 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
      #1: no ringing vocabulary), and it only fires where the deblur step
      model itself abstained (clean edges, shaded ramps, flats are untouched).
      CELUP_TEXGAIN = gain (0 disables; ~0.20 recovers crosshatch). */
+  float capfloor = 0.6f;
+  { const char *e = getenv("CELUP_CAPFLOOR");
+    if (e) capfloor = strtof(e, 0); }
   float texgain = deblur_texgain;
   {
     const char *e = getenv("CELUP_TEXGAIN");
@@ -2974,7 +2977,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 float st = fmaxf(.6f, edge_goal * scale / 2.5f);
                 k = clampf(s / st, 1.f, 16.f);
               }
-              k = fminf(k, s / .6f);
+              k = fminf(k, s / capfloor);
               /* Anchored evaluation (v4.8): the steepened fit is
                  evaluated at the pixel's GEOMETRIC position on the
                  normal (t = 0), and the pixel's own residual to the
@@ -3179,7 +3182,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           float st = fmaxf(.6f, edge_goal * scale / 2.5f);
           k = clampf(s / st, 1.f, 16.f);
         }
-        k = fminf(k, s / .6f);
+        k = fminf(k, s / capfloor);
         /* Anchored evaluation (v4.8) on the consensus fit. */
         float z0 = (0.f - mu) / s;
         float ufit0 = phi1(z0), nu;
