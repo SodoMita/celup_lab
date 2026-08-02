@@ -1,17 +1,59 @@
 # v2 improvement plan (from handoff.md "Recommended next direction")
 
-1. Unified 5x5 patch classifier: edge / checker-Nyquist / junction-crossing / smooth / texture
+- [x] 1. Unified 5x5 patch classifier: edge / checker-Nyquist / junction-crossing / smooth / texture
    - single pass stats -> class map (per source pixel), reusable by all improved modes
    - diagnostic `classmap` mode renders the classification as RGB
-2. New flagship `--mode adaptive`
+- [x] 2. New flagship `--mode adaptive`
    - checker cells -> explicit `--checker-policy lowpass|bilinear|nearest|mitchell|scale2x|auto`
    - coherent edges -> fitted edge model sharpening (gated)
    - junctions -> conservative bilinear/lowpass mix
    - base -> bounded Mitchell
-3. scale2x policy for pixel-art checker regions (hard, invents no colours)
-4. Gated deblurcompress: precomputed per-cell weights (edge gated backprojection,
+- [x] 3. scale2x policy for pixel-art checker regions (hard, invents no colours)
+- [x] 4. Gated deblurcompress: precomputed per-cell weights (edge gated backprojection,
    edge-gated unsharp) -> fewer soft hourglasses + big speedup
-5. Gated dehourglass: hourglass basis removal focused by checker confidence
-6. Evaluation: baseline vs v2 MAE + new checker/crosshatch torture scenes with
+- [x] 5. Gated dehourglass: hourglass basis removal focused by checker confidence
+- [x] 6. Evaluation: baseline vs v2 MAE + new checker/crosshatch torture scenes with
    quantitative hourglass-amplitude metric + visual sheets incl. classmap
-7. Docs: README_lab.md, handoff.md, MANIFEST, rezip v2 archive
+- [x] 7. Docs: README_lab.md, handoff.md, MANIFEST, rezip v2 archive
+
+---
+
+# v4.9.4 Status & Future Directions
+
+## Completed in v4.9.4
+1. **C1-continuous 3x3 Consensus DSDF (`--mode dsdf`)**:
+   - Diagnosed why `dsdf` produced spikes at integer pixel boundaries and offset edge caps 1 pixel away from circle/curve centers at arbitrarily high upscales.
+   - Root-caused to single-cell Voronoi evaluation: neighbor background cells (1 pixel outside the true edge) had their 5x5 window mean `t0 ~ 0.3` and drew false contours 1 pixel away.
+   - Replaced single-cell Voronoi lookup with C1-continuous Gaussian-kernel consensus across the 3x3 neighborhood around `(sx, sy)`, filtering false seeds by `fabsf(t0 - .5f) <= .65f * mag`.
+   - Verified 100% pass across all upscales 1.5x..24x (`tests/test_scales.py`): circle profiles are monotonic, continuous, and free of offset caps.
+2. **ARM64 / Android Segmentation Fault Fix for `sdf`, `msdf`, and `dsdf`**:
+   - Diagnosed and fixed the segmentation fault reported on ARM phones when executing `--mode sdf`, `--mode msdf`, and `--mode dsdf`.
+   - Root-caused to `suppress_speckle_pm(hr, dw, dh, ...)`, which is called by `upscale_adaptive` (invoked as the base renderer by all three SDF modes).
+   - In `suppress_speckle_pm`, Pass 2 (the domino pair pass) iterated `for (int vert = 0; vert < 2; vert++) for (int y = 1; y + 1 < dh; y++) for (int x = 1; x + 1 < dw; x++)`.
+   - For a horizontal pair (`vert = 0`), the 3x4 bounding box around the pair needs `j` up to `+2`, which accessed `y + 2` at `y = dh - 2` (`dh` -> out of bounds by 1 row). For a vertical pair (`vert = 1`), the 4x3 bounding box around the pair needs `i` up to `+2`, which accessed `x + 2` at `x = dw - 2` (`dw` -> out of bounds by 1 column).
+   - On ARM Linux/Android (including Android's default Scudo allocator), reads 4 bytes past heap allocation limits trap immediately with `SIGSEGV` (segmentation fault).
+   - Fixed by correcting loop bounds to `for (int vert = 0; vert < 2; vert++) for (int y = 1; y + 2 - vert < dh; y++) for (int x = 1; x + 1 + vert < dw; x++)`.
+   - Verified zero AddressSanitizer / UndefinedBehaviorSanitizer (`-fsanitize=address,undefined`) heap-buffer overflows or memory errors across all modes.
+
+# v4.9.3 Status & Future Directions
+
+## Completed in v4.9.3
+1. **Parameter Override Fixes**:
+   - In `autodeblur_pass`, explicit `--deblur-steepness K` (`-g K`) now bypasses the `.6 px` ramp clamp (`fminf(k, s / .6f)`).
+   - In `auto_tune_soft_params`, `--blur-radius R` (`-r R`) is now evaluated directly across all kernels/curves instead of skipping when `R` is not in `.15, .30, .50, .75, 1.10, 1.60`.
+2. **3x3 Checkerboard Confirmation (Staircase Removal)**:
+   - Added `checker3x3_at_pm` to require 3x3 pattern confirmation (`A B A / B A B / A B A`) before overriding cubic/Lanczos samples with bilinear. Eliminates false-positive checkerboard detections along 45-degree diagonal lines (`diagline48_src.webp`: 0 false positives vs 61 previously), removing diamond-shaped staircase treads while preserving 100% detection on true checkerboards (`pixelart_src.webp`: 1596 cells).
+3. **Advanced Python & C Library Benchmarks**:
+   - Extended `evaluate_upscalers.py` and `hourglass_metric.py` to support standard Pillow (`pil:bicubic`, `pil:lanczos`) and advanced external upscalers:
+     - `cv2:lanczos4` (OpenCV 8x8 Lanczos4 window)
+     - `scipy:spline5` (SciPy 5th-order quintic C4-continuous B-spline)
+     - `py:edgedir` (Python Edge-Directed Super-Resolution / Anime4K-style directional sharpening)
+   - Comparison sheets generated by `make_smiley_staircase_sheets.py` across 18 modes.
+
+## Recommended Next Experiments
+1. **Segmented Soft-Alpha Junction Model**:
+   - Currently, junctions fall back to bilinear interpolation. Replace with an oriented multi-lobe alpha-blended reconstruction to sharpen line crossings and corners without inventing colors.
+2. **Lossy Block-Boundary Cleanup**:
+   - Source images with JPEG or WebP block compression inherit 8x8/16x16 block boundaries that sharpeners amplify. Add an optional `--block-clean T` pre-filter to smooth across low-contrast block edges.
+3. **Codebase Modularization**:
+   - Split `celup_lab.c` into separate compile units (`filter.c`, `classifier.c`, `autoblur.c`, `autodeblur.c`, `sdf.c`) to simplify maintenance and compile times.

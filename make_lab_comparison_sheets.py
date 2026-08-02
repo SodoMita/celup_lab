@@ -45,6 +45,8 @@ MODE_SPECS = (
     ("autoblur", "autoblur", ()),
     ("autodeblur", "autodeblur", ()),
     ("sdf", "sdf", ()),
+    ("msdf", "msdf", ()),
+    ("dsdf", "dsdf", ()),
 )
 MODE_LABELS = tuple(label for label, _, _ in MODE_SPECS)
 # Classifier visualization is not a MAE candidate; appended to sheets as a

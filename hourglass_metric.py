@@ -21,6 +21,9 @@ S, N = 4, 96
 
 
 def candidate(spec):
+    prefix = spec.lower().split(':', 1)[0]
+    if prefix in ('pil', 'cv2', 'scipy', 'py'):
+        return (prefix, spec.split(':', 1)[1].lower() if ':' in spec else 'default', [])
     p = Path(spec); mode = None
     if ':' in spec:
         left, right = spec.rsplit(':', 1)
@@ -35,6 +38,8 @@ def candidate(spec):
 
 def cname(c):
     exe, mode, extra = c
+    if isinstance(exe, str):
+        return f"{exe}:{mode}"
     return exe.name + ((':' + mode) if mode else '') + ((' ' + ' '.join(extra)) if extra else '')
 
 
@@ -165,6 +170,65 @@ def checker_cells(low_pm):
 
 def run_candidate(c, inp, out):
     exe, mode, extra = c
+    if isinstance(exe, str):
+        im = Image.open(inp)
+        w, h = im.size
+        dw, dh = w * 4, h * 4
+        if exe == 'pil':
+            res = {'nearest': Image.Resampling.NEAREST, 'bilinear': Image.Resampling.BILINEAR,
+                   'bicubic': Image.Resampling.BICUBIC, 'lanczos': Image.Resampling.LANCZOS}.get(mode, Image.Resampling.BICUBIC)
+            im.resize((dw, dh), res).save(out)
+        elif exe == 'cv2':
+            import cv2
+            arr = np.asarray(im)
+            inter = {'nearest': cv2.INTER_NEAREST, 'bilinear': cv2.INTER_LINEAR,
+                     'cubic': cv2.INTER_CUBIC, 'lanczos4': cv2.INTER_LANCZOS4}.get(mode, cv2.INTER_CUBIC)
+            Image.fromarray(cv2.resize(arr, (dw, dh), interpolation=inter), im.mode).save(out)
+        elif exe == 'scipy':
+            from scipy.ndimage import zoom
+            arr = np.asarray(im, dtype=np.float32)
+            order = 5 if mode == 'spline5' else (3 if mode == 'spline3' else 1)
+            Image.fromarray(np.clip(zoom(arr, (4, 4, 1), order=order), 0, 255).astype(np.uint8), im.mode).save(out)
+        elif exe == 'py':
+            import cv2
+            arr = np.asarray(im)
+            base = cv2.resize(arr, (dw, dh), interpolation=cv2.INTER_LANCZOS4).astype(np.float32)
+            if mode == 'edgedir':
+                lum = base[:, :, :3].mean(axis=2)
+                gx = cv2.Sobel(lum, cv2.CV_32F, 1, 0, ksize=3); gy = cv2.Sobel(lum, cv2.CV_32F, 0, 1, ksize=3)
+                mag = np.sqrt(gx**2 + gy**2) + 1e-6
+                nx = gx / mag; ny = gy / mag
+                yy, xx = np.mgrid[0:dh, 0:dw]
+                xx_push = np.clip(xx - nx * 0.8, 0, dw - 1).astype(np.float32)
+                yy_push = np.clip(yy - ny * 0.8, 0, dh - 1).astype(np.float32)
+                pushed = cv2.remap(base, xx_push, yy_push, cv2.INTER_LINEAR)
+                wt = np.clip((mag - 10.0) / 40.0, 0.0, 0.7)[:, :, None]
+                base = base * (1.0 - wt) + pushed * wt
+            elif mode == 'vector':
+                base = cv2.resize(np.asarray(im), (dw, dh), interpolation=cv2.INTER_CUBIC).astype(np.float32)
+                lum = base[:, :, :3].mean(axis=2)
+                gx = cv2.Sobel(lum, cv2.CV_32F, 1, 0, ksize=3); gy = cv2.Sobel(lum, cv2.CV_32F, 0, 1, ksize=3)
+                mag = np.sqrt(gx**2 + gy**2) + 1e-6
+                nx = gx / mag; ny = gy / mag
+                tx = -ny; ty = nx
+                yy, xx = np.mgrid[0:dh, 0:dw]
+                acc = base.copy()
+                w_tot = np.ones((dh, dw, 1), dtype=np.float32)
+                for step in [-2.0, -1.0, 1.0, 2.0]:
+                    wt = np.exp(-0.5 * (step / 1.5)**2)
+                    xs = np.clip(xx + tx * step, 0, dw - 1).astype(np.float32)
+                    ys = np.clip(yy + ty * step, 0, dh - 1).astype(np.float32)
+                    acc += wt * cv2.remap(base, xs, ys, cv2.INTER_LINEAR)
+                    w_tot += wt
+                smoothed = acc / w_tot
+                shift = 0.6
+                xx_push = np.clip(xx - nx * shift, 0, dw - 1).astype(np.float32)
+                yy_push = np.clip(yy - ny * shift, 0, dh - 1).astype(np.float32)
+                pushed = cv2.remap(smoothed, xx_push, yy_push, cv2.INTER_LINEAR)
+                wt_mag = np.clip((mag - 5.0) / 30.0, 0.0, 0.85)[:, :, None]
+                base = smoothed * (1.0 - wt_mag) + pushed * wt_mag
+            Image.fromarray(np.clip(base, 0, 255).astype(np.uint8), im.mode).save(out)
+        return
     cmd = [str(exe), str(inp), str(out), '4']
     if mode: cmd += ['--mode', mode]
     cmd += extra

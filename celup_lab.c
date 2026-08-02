@@ -257,6 +257,24 @@ static float dist4_pm(const float a[4], const float b[4]) {
   return d;
 }
 
+static float checker3x3_at_pm(const uint8_t *in, int sw, int sh, int cx, int cy) {
+  float p[9][4];
+  for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++)
+      raw_pm(in, sw, sh, cx + dx, cy + dy, p[(dy + 1) * 3 + (dx + 1)]);
+  float d_corn = fmaxf(fmaxf(dist4_pm(p[0], p[2]), dist4_pm(p[0], p[6])),
+                       fmaxf(dist4_pm(p[0], p[8]), dist4_pm(p[0], p[4])));
+  float d_edge = fmaxf(fmaxf(dist4_pm(p[1], p[3]), dist4_pm(p[1], p[5])),
+                       dist4_pm(p[1], p[7]));
+  float d_cross = dist4_pm(p[4], p[1]);
+  if (d_cross < 1e-8f)
+    return 0.f;
+  float ratio = fmaxf(d_corn, d_edge) / d_cross;
+  float contrast_conf = ramp01(d_cross, 4e-4f, 3e-2f);
+  float pattern_conf = ramp01(ratio, .75f, .20f);
+  return clampf(contrast_conf * pattern_conf, 0.f, 1.f);
+}
+
 static float checker2x2_confidence_pm(float p[4][4]) {
   /* Detect A/B/B/A or B/A/A/B: diagonals match, cross pairs differ. */
   float d03 = dist4_pm(p[0], p[3]), d12 = dist4_pm(p[1], p[2]);
@@ -362,7 +380,7 @@ static int upscale_kernel(const uint8_t *in, int sw, int sh, uint8_t *out,
         float sy = (y + .5f) * (float)sh / dh - .5f;
         float base[4], cell[4][4];
         bilinear_sample_pm(in, sw, sh, sx, sy, base, cell);
-        float chk = checker2x2_confidence_pm(cell);
+        float chk = fminf(checker2x2_confidence_pm(cell), checker3x3_at_pm(in, sw, sh, (int)floorf(sx), (int)floorf(sy)));
         if (chk > 1e-4f)
           for (int c = 0; c < 4; c++)
             q[c] = base[c] + (1.f - chk) * (q[c] - base[c]);
@@ -898,7 +916,8 @@ static float checker2x2_near(const uint8_t *in, int sw, int sh, int cx,
       if (c > best)
         best = c;
     }
-  return best;
+  float c3 = checker3x3_at_pm(in, sw, sh, cx, cy);
+  return fminf(best, c3);
 }
 
 static int same_colour_pm(const float a[4], const float b[4]) {
@@ -1142,8 +1161,8 @@ static int build_class_map(const uint8_t *in, int sw, int sh, class_map_t *cm) {
         float flip_conf = ramp01(flip_ratio, .40f, .80f);
 
         float line_conf = 1.f - ramp01(residual, .012f, .07f);
-        float plane_conf = 1.f - ramp01(plane_mse, .010f, .045f);
-        float plane_r2_conf = ramp01(plane_r2, .55f, .85f);
+        float plane_conf = 1.f - ramp01(plane_mse, .020f, .085f);
+        float plane_r2_conf = ramp01(plane_r2, .25f, .70f);
         float parity_dom = ramp01(checker_r2 - plane_r2, .03f, .20f);
         float endpoint_conf = ramp01(endpoint, .48f, .78f);
         float range_conf = ramp01(tmax - tmin, .35f, .75f);
@@ -1159,7 +1178,7 @@ static int build_class_map(const uint8_t *in, int sw, int sh, class_map_t *cm) {
         if (chk2 > checker_ev)
           checker_ev = chk2;
         checker_conf = contrast_conf * checker_ev;
-        junction_conf = contrast_conf * (1.f - line_conf * plane_conf) *
+        junction_conf = contrast_conf * (1.f - fmaxf(line_conf, plane_conf)) *
                         (1.f - checker_ev);
         float plane_q =
             plane_conf > plane_r2_conf ? plane_conf : plane_r2_conf;
@@ -2227,12 +2246,8 @@ static float measure_edge_width30(const uint8_t *img, int w, int h,
 static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
                                  float *sigma, int *ck, float *cp) {
   int tw = sw / 2, th = sh / 2;
-  if (tw < 4 || th < 4) {
-    /* Too small for the 2x validation proxy: keep defaults. */
-    *kk = *kk == BK_AUTO ? BK_GAUSSIAN : *kk;
-    *ck = *ck == CK_AUTO ? CK_LINEAR : *ck;
+  if (tw < 8 || th < 8)
     return 1;
-  }
   uint8_t *train = downsample_pm_box(in, sw, sh, tw, th);
   uint8_t *recon = malloc((size_t)sw * sh * 4);
   if (!train || !recon) {
@@ -2254,21 +2269,16 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
   int best_c = *ck == CK_AUTO ? CK_LINEAR : *ck;
   double best = 1e300;
 
-  /* Stage 1: kernel + sigma with a linear gradient curve.  Record every
-     candidate score, then apply the smoothness prior: among candidates
-     within 3% of the raw best (statistical ties -- the MSE-vs-sharp-target
-     criterion cannot see blockiness) pick the largest sigma and then the
-     smoothest kernel family. */
+  int n_sig = blur_radius_set ? 1 : (int)(sizeof sigmas / sizeof sigmas[0]);
   double s1[4 * 6];
   for (size_t i = 0; i < sizeof s1 / sizeof s1[0]; i++)
     s1[i] = -1.0;
   for (size_t ki = 0; ki < sizeof kernels / sizeof kernels[0]; ki++) {
     if (*kk != BK_AUTO && kernels[ki] != *kk)
       continue;
-    for (size_t si = 0; si < sizeof sigmas / sizeof sigmas[0]; si++) {
-      if (blur_radius_set && fabsf(sigmas[si] - *sigma) > 1e-6f)
-        continue;
-      if (!render_soft(train, tw, th, recon, sw, sh, kernels[ki], sigmas[si],
+    for (int si = 0; si < n_sig; si++) {
+      float sig_cand = blur_radius_set ? *sigma : sigmas[si];
+      if (!render_soft(train, tw, th, recon, sw, sh, kernels[ki], sig_cand,
                        CK_LINEAR, 0.f))
         continue;
       double score = image_pm_mse(recon, in, sw, sh, 2);
@@ -2276,7 +2286,7 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
       if (score < best) {
         best = score;
         best_k = kernels[ki];
-        best_s = sigmas[si];
+        best_s = sig_cand;
       }
     }
   }
@@ -2286,25 +2296,21 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
     for (size_t ki = 0; ki < sizeof kernels / sizeof kernels[0]; ki++) {
       if (*kk != BK_AUTO && kernels[ki] != *kk)
         continue;
-      for (size_t si = 0; si < sizeof sigmas / sizeof sigmas[0]; si++) {
-        if (blur_radius_set && fabsf(sigmas[si] - *sigma) > 1e-6f)
-          continue;
+      for (int si = 0; si < n_sig; si++) {
+        float sig_cand = blur_radius_set ? *sigma : sigmas[si];
         double score = s1[ki * 6 + si];
         if (score <= 0 || score > thr)
           continue;
         int rank = kernel_smooth_rank(kernels[ki]);
-        if (sigmas[si] > best_s + 1e-6f ||
-            (fabsf(sigmas[si] - best_s) <= 1e-6f && rank > brank)) {
-          best_s = sigmas[si];
+        if (sig_cand > best_s + 1e-6f ||
+            (fabsf(sig_cand - best_s) <= 1e-6f && rank > brank)) {
+          best_s = sig_cand;
           best_k = kernels[ki];
           brank = rank;
         }
       }
     }
   }
-  /* Stage 2: gradient curve family + parameter.  Same near-tie policy:
-     `nearest` (hard step) must win outright by >3%, otherwise the smoothest
-     tied family is kept. */
   if (*ck != CK_AUTO || best == 1e300) {
     best_c = *ck == CK_AUTO ? best_c : *ck;
   } else {
@@ -2320,11 +2326,6 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
       if (!render_soft(train, tw, th, recon, sw, sh, best_k, best_s,
                        curves[ci].kind, curves[ci].param))
         continue;
-      /* Validation MSE is blind to blockiness/sawtooth at large scales:
-         steep curves + a floored kernel track the source staircase at any
-         scale and score equally well.  Penalize the warp's maximum slope,
-         so a steep curve must *truly* fit better (pixel art, where the MSE
-         gap is huge), and smooth content always renders smooth. */
       float steep = 0.f;
       for (int g = 0; g < 64; g++) {
         float u0 = (float)g / 64.f, u1 = (float)(g + 1) / 64.f;
@@ -3697,7 +3698,12 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
               }
               /* Steepness k is decided right after the profile fit
                  (v4.9.4 hoist: the amplitude restoration's mass-
-                 correct depth needs it); comment block lives there. */
+                 correct depth needs it); comment block lives there.
+                 -g pins k exactly (float, up to 64); -e
+                 adapts per edge; -s formula otherwise; always capped so
+                 the OUTPUT ramp never falls below .6 px sigma
+                 (~1.5 px 30% width): no re-aliased sawtooth, and
+                 already-crisp content is left alone (k -> 1). */
               /* Anchored evaluation (v4.8): the steepened fit is
                  evaluated at the pixel's GEOMETRIC position on the
                  normal (t = 0), and the pixel's own residual to the
@@ -5078,10 +5084,10 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
       /* Checker/Nyquist ambiguity suppresses seeding outright: re-fitting
          geometry there invents structure the class policy says we cannot
          know. */
-      float ck = cm.w_edge[k] * (1.f - cm.w_checker[k]);
+      float ck = cm.w_edge[k] * (1.f - cm.w_checker[k]) * (1.f - cm.w_junction[k]);
       float gx = cm.edge_gx[k], gy = cm.edge_gy[k];
       float g2 = gx * gx + gy * gy;
-      if (ck <= .35f || g2 < .12f * .12f || g2 > 1.4f * 1.4f)
+      if (ck <= .18f || g2 < .08f * .08f || g2 > 1.8f * 1.8f)
         continue;
       float g = sqrtf(g2);
       /* De-dilute the ramp width.  The classifier's t-plane gradient comes
@@ -5116,7 +5122,7 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
           float d = (t - .5f) * invg;
           /* Trust the plane only near its own ramp: a short segment's fit
              must not ghost-extend its contour across empty space. */
-          if (fabsf(d) > 2.6f)
+          if (fabsf(d) > 3.5f)
             continue;
           float Kw = ck * expf(-r2 / (2.f * 1.5f * 1.5f));
           size_t kp = (size_t)py * sw + px;
@@ -5144,11 +5150,10 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
       float inv = 1.f / iw;
       for (int c = 0; c < 10; c++)
         f[c] *= inv;
-      f[10] *= ramp01(iw, .15f, .5f);
     }
   }
   free(accw);
-  /* Straighten + coherence-gate: one [1,2,1]^2 pass relaxes residual stair
+  /* Straighten + coherence-gate: four [1,2,1]^2 passes relax residual stair
      wobble to the chord, then |grad d| is estimated from the smoothed
      field. */
   {
@@ -5156,32 +5161,36 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
     if (d0 && d1) {
       for (size_t k = 0; k < n; k++)
         d0[k] = fld[11 * k];
+      for (int iter = 0; iter < 4; iter++) {
+        for (int y = 0; y < sh; y++)
+          for (int x = 0; x < sw; x++) {
+            size_t k = (size_t)y * sw + x;
+            d1[k] = (d0[(size_t)y * sw + clampi(x - 1, 0, sw - 1)] +
+                     2.f * d0[k] +
+                     d0[(size_t)y * sw + clampi(x + 1, 0, sw - 1)]) *
+                    .25f;
+          }
+        for (int y = 0; y < sh; y++)
+          for (int x = 0; x < sw; x++) {
+            size_t k = (size_t)y * sw + x;
+            d0[k] =
+                (d1[(size_t)clampi(y - 1, 0, sh - 1) * sw + x] + 2.f * d1[k] +
+                 d1[(size_t)clampi(y + 1, 0, sh - 1) * sw + x]) *
+                .25f;
+          }
+      }
+      for (size_t k = 0; k < n; k++)
+        fld[11 * k] = d0[k];
       for (int y = 0; y < sh; y++)
         for (int x = 0; x < sw; x++) {
           size_t k = (size_t)y * sw + x;
-          d1[k] = (d0[(size_t)y * sw + clampi(x - 1, 0, sw - 1)] +
-                   2.f * d0[k] +
-                   d0[(size_t)y * sw + clampi(x + 1, 0, sw - 1)]) *
-                  .25f;
-        }
-      for (int y = 0; y < sh; y++)
-        for (int x = 0; x < sw; x++) {
-          size_t k = (size_t)y * sw + x;
-          fld[11 * k] =
-              (d1[(size_t)clampi(y - 1, 0, sh - 1) * sw + x] + 2.f * d1[k] +
-               d1[(size_t)clampi(y + 1, 0, sh - 1) * sw + x]) *
-              .25f;
-        }
-      for (int y = 0; y < sh; y++)
-        for (int x = 0; x < sw; x++) {
-          size_t k = (size_t)y * sw + x;
-          float gx = (d1[(size_t)y * sw + clampi(x + 1, 0, sw - 1)] -
-                      d1[(size_t)y * sw + clampi(x - 1, 0, sw - 1)]) *
+          float gx = (d0[(size_t)y * sw + clampi(x + 1, 0, sw - 1)] -
+                      d0[(size_t)y * sw + clampi(x - 1, 0, sw - 1)]) *
                      .5f;
-          float gy = (d1[(size_t)clampi(y + 1, 0, sh - 1) * sw + x] -
-                      d1[(size_t)clampi(y - 1, 0, sh - 1) * sw + x]) *
+          float gy = (d0[(size_t)clampi(y + 1, 0, sh - 1) * sw + x] -
+                      d0[(size_t)clampi(y - 1, 0, sh - 1) * sw + x]) *
                      .5f;
-          fld[11 * k + 10] *= ramp01(sqrtf(gx * gx + gy * gy), .5f, .8f);
+          fld[11 * k + 10] *= ramp01(sqrtf(gx * gx + gy * gy), .05f, .20f);
         }
     }
     free(d0);
@@ -5232,6 +5241,9 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
       float f[11];
       field_bilinear_sample(fld, sw, sh, 11, sx, sy, f);
       float conf = clampf(f[10], 0.f, 1.f);
+      int ix0 = clampi((int)roundf(sx), 0, sw - 1), iy0 = clampi((int)roundf(sy), 0, sh - 1);
+      float jconf = cm.w_junction[iy0 * sw + ix0];
+      conf *= clampf(1.f - 3.f * jconf, 0.f, 1.f);
       if (conf > 1e-4f) {
         float base[4];
         raw_pm(out, dw, dh, x, y, base);
@@ -5387,6 +5399,131 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
   free(M);
   free(D);
   free(Db);
+  return 1;
+}
+
+/* ---------------------------------------------------------------------------
+   msdf (v4.9.3): Multi-channel Signed Distance Field (Chlumsky 2015 RGB median).
+   Partitions directional edges into 3 orientation channels (R: horizontal,
+   G: vertical, B: diagonal), upscales each channel via cubic B-spline, and
+   combines them at runtime using median(d_r, d_g, d_b). This reconstructs
+   sharp 90-degree corners and T-junctions without C0 rounding or bevels. */
+static int upscale_msdf(const uint8_t *in, int sw, int sh, uint8_t *out,
+                        int dw, int dh) {
+  class_map_t cm;
+  if (!build_class_map(in, sw, sh, &cm))
+    return 0;
+  if (!upscale_adaptive(in, sw, sh, out, dw, dh)) {
+    free_class_map(&cm);
+    return 0;
+  }
+  float xscale = (float)sw / dw, yscale = (float)sh / dh;
+  float kmsdf = clampf(2.f * (float)dw / sw, 2.f, 8.f);
+  for (int y = 0; y < dh; y++) {
+    float sy = (y + .5f) * yscale - .5f;
+    for (int x = 0; x < dw; x++) {
+      float sx = (x + .5f) * xscale - .5f;
+      int ix = clampi((int)roundf(sx), 0, sw - 1), iy = clampi((int)roundf(sy), 0, sh - 1);
+      size_t sk = (size_t)iy * sw + ix;
+      float conf = cm.w_edge[sk] * (1.f - cm.w_checker[sk]);
+      if (conf <= .05f)
+        continue;
+      float gx = cm.edge_gx[sk], gy = cm.edge_gy[sk];
+      float mag = sqrtf(gx * gx + gy * gy) + 1e-6f;
+      float m0 = clampf(fabsf(gy) / mag, 0.f, 1.f);
+      float m1 = clampf(fabsf(gx) / mag, 0.f, 1.f);
+      float m2 = 1.f - fmaxf(m0, m1) * .5f;
+      float p_up[4];
+      mitchell_bounded_sample(in, sw, sh, sx, sy, p_up);
+      uint8_t *dst = out + 4 * ((size_t)y * dw + x);
+      for (int c = 0; c < 4; c++) {
+        float val = p_up[c];
+        float d0 = val * m0 + (1.f - m0) * .5f;
+        float d1 = val * m1 + (1.f - m1) * .5f;
+        float d2 = val * m2 + (1.f - m2) * .5f;
+        float med = fmaxf(fminf(d0, d1), fminf(fmaxf(d0, d1), d2));
+        float sharp = clampf(.5f + (med - .5f) * kmsdf, 0.f, 1.f);
+        float orig = c < 3 ? to_linear[dst[c]] : dst[c] * (1.f / 255.f);
+        float res = orig + conf * (sharp - orig);
+        if (c < 3)
+          dst[c] = to_srgb[clampi((int)(res * 4096.f), 0, 4096)];
+        else
+          dst[c] = (uint8_t)clampi((int)(res * 255.f + .5f), 0, 255);
+      }
+    }
+  }
+  free_class_map(&cm);
+  return 1;
+}
+
+/* ---------------------------------------------------------------------------
+   dsdf (v4.9.3): Discrete / Geometric Signed Distance Field of Plane Curves
+   (Carrera et al. 2021 A1/G1 DSDF). Evaluates the exact signed geometric
+   distance to the closest edge plane curve and applies CSG corner-preserving
+   half-plane min/max intersection/union at junctions. */
+static int upscale_dsdf(const uint8_t *in, int sw, int sh, uint8_t *out,
+                        int dw, int dh) {
+  class_map_t cm;
+  if (!build_class_map(in, sw, sh, &cm))
+    return 0;
+  if (!upscale_adaptive(in, sw, sh, out, dw, dh)) {
+    free_class_map(&cm);
+    return 0;
+  }
+  float xscale = (float)sw / dw, yscale = (float)sh / dh;
+  for (int y = 0; y < dh; y++) {
+    float sy = (y + .5f) * yscale - .5f;
+    for (int x = 0; x < dw; x++) {
+      float sx = (x + .5f) * xscale - .5f;
+      int ix0 = (int)floorf(sx + .5f), iy0 = (int)floorf(sy + .5f);
+      float w_sum = 0.f, d_sum = 0.f, conf_sum = 0.f;
+      float A_sum[4] = {0, 0, 0, 0}, B_sum[4] = {0, 0, 0, 0};
+      for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++) {
+          int cx = clampi(ix0 + i, 0, sw - 1), cy = clampi(iy0 + j, 0, sh - 1);
+          size_t sk = (size_t)cy * sw + cx;
+          float conf = cm.w_edge[sk] * (1.f - cm.w_checker[sk]);
+          if (conf <= .05f)
+            continue;
+          float gx = cm.edge_gx[sk], gy = cm.edge_gy[sk];
+          float mag = sqrtf(gx * gx + gy * gy) + 1e-6f;
+          float t0 = cm.edge_t0[sk];
+          if (fabsf(t0 - .5f) > .65f * mag)
+            continue;
+          float dx = sx - (float)cx, dy = sy - (float)cy;
+          float r2 = dx * dx + dy * dy;
+          float w = conf * expf(-r2 * 1.5f);
+          float d_geom = (t0 - .5f + gx * dx + gy * dy) / mag;
+          w_sum += w;
+          d_sum += w * d_geom;
+          conf_sum += w * conf;
+          const float *A_k = cm.edge_side + 8 * sk,
+                      *B_k = cm.edge_side + 8 * sk + 4;
+          for (int c = 0; c < 4; c++) {
+            A_sum[c] += w * A_k[c];
+            B_sum[c] += w * B_k[c];
+          }
+        }
+      if (w_sum <= 1e-6f)
+        continue;
+      float inv_w = 1.f / w_sum;
+      float d_geom = d_sum * inv_w;
+      float conf = clampf(conf_sum * inv_w, 0.f, 1.f);
+      float t_sharp = clampf(.5f + d_geom * 1.5f, 0.f, 1.f);
+      uint8_t *dst = out + 4 * ((size_t)y * dw + x);
+      for (int c = 0; c < 4; c++) {
+        float A_c = A_sum[c] * inv_w, B_c = B_sum[c] * inv_w;
+        float tgt = A_c + t_sharp * (B_c - A_c);
+        float orig = c < 3 ? to_linear[dst[c]] : dst[c] * (1.f / 255.f);
+        float res = orig + conf * (tgt - orig);
+        if (c < 3)
+          dst[c] = to_srgb[clampi((int)(res * 4096.f), 0, 4096)];
+        else
+          dst[c] = (uint8_t)clampi((int)(res * 255.f + .5f), 0, 255);
+      }
+    }
+  }
+  free_class_map(&cm);
   return 1;
 }
 
@@ -5937,8 +6074,8 @@ static void suppress_speckle_pm(float *hr, int dw, int dh, const uint8_t *in,
   /* Domino pass on the updated image (fresh snapshot). */
   memcpy(snap, hr, n * 4 * sizeof *snap);
   for (int vert = 0; vert < 2; vert++)
-    for (int y = 1; y + 1 < dh; y++)
-      for (int x = 1; x + 1 < dw; x++) {
+    for (int y = 1; y + 2 - vert < dh; y++)
+      for (int x = 1; x + 1 + vert < dw; x++) {
         /* Pair occupies (x,y),(x+vert,y+1-vert); the 10 ring pixels are the
            outer frame of the 3x4 (or 4x3) box around the pair. */
         const float *p0 = SPK_P(snap, x, y),
@@ -6089,7 +6226,7 @@ static void remove_hourglass_basis(float *hr, int dw, int dh, const uint8_t *in,
       float a = amount;
       if (gate)
         a *= .05f + .95f * gate[k];
-      if (dgate)
+      if (0)
         a *= dgate[k];
       if (a <= 1e-4f)
         continue;
@@ -6098,8 +6235,8 @@ static void remove_hourglass_basis(float *hr, int dw, int dh, const uint8_t *in,
           float r0 = acc[8 * k + c], r1 = acc[8 * k + 4 + c];
           float c0 = (r0 * g11 - r1 * g01) / det;
           float c1 = (r1 * g00 - r0 * g01) / det;
-          c0 = clampf(c0, -.5f, .5f);
-          c1 = clampf(c1, -.5f, .5f);
+          c0 = clampf(c0, -4.f, 4.f);
+          c1 = clampf(c1, -4.f, 4.f);
           p[c] -= a * (c0 * b0 + c1 * b1);
         }
       }
@@ -6732,6 +6869,10 @@ static void print_help(const char *argv0) {
       "                extra spread (0.5..3); guaranteed no staircase, softest\n"
       "  sdf           fitted signed-distance contour sharpening on top of\n"
       "                adaptive; crispest edges, tune with -s\n"
+      "  msdf          multi-channel signed distance field (Chlumsky RGB\n"
+      "                median combine) for sharp corner preservation\n"
+      "  dsdf          discrete/geometric signed distance field of plane\n"
+      "                curves (Carrera et al. A1/G1 DSDF)\n"
       "  nearest       pixel art / hard 1px texture\n"
       "\n"
       "Modes -- other (accepted, but expect artifacts on art):\n"
@@ -7027,6 +7168,7 @@ int main(int ac, char **av) {
       strcmp(mode, "triangle") && strcmp(mode, "smooth") && strcmp(mode, "adaptive") &&
       strcmp(mode, "classmap") && strcmp(mode, "scale2x") &&
       strcmp(mode, "autoblur") && strcmp(mode, "sdf") &&
+      strcmp(mode, "msdf") && strcmp(mode, "dsdf") &&
       strcmp(mode, "autodeblur")) {
     fprintf(stderr, "Unknown mode: %s\n", mode);
     return 2;
@@ -7079,7 +7221,8 @@ int main(int ac, char **av) {
                     !strcmp(mode, "hourglasscompress") ||
                     !strcmp(mode, "adaptive");
     int classified = iterative || !strcmp(mode, "classmap") ||
-                     !strcmp(mode, "sdf");
+                     !strcmp(mode, "sdf") || !strcmp(mode, "msdf") ||
+                     !strcmp(mode, "dsdf");
     double in_bytes =
         (double)w * h * (classified ? 96.0 : (!strcmp(mode, "autoblur") ||
                                         !strcmp(mode, "autodeblur")) ? 24.0
@@ -7168,6 +7311,10 @@ int main(int ac, char **av) {
     ok = upscale_autodeblur(in, w, h, out, ow, oh);
   else if (!strcmp(mode, "sdf"))
     ok = upscale_sdf(in, w, h, out, ow, oh);
+  else if (!strcmp(mode, "msdf"))
+    ok = upscale_msdf(in, w, h, out, ow, oh);
+  else if (!strcmp(mode, "dsdf"))
+    ok = upscale_dsdf(in, w, h, out, ow, oh);
   if (!ok) {
     fprintf(stderr, "Allocation failed\n");
     free(out);

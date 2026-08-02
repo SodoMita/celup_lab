@@ -41,6 +41,7 @@ All modes use linear-light premultiplied RGBA and lossless WebP output.
 Run `./celup_lab --help` for the full grouped help with short-flag aliases
 (`-m adaptive`, `-s 6`, `-P auto`, `-A 0`...); every long flag still works.
 
+<<<<<<< HEAD
 ## v4.9.9: deblur to (nearly) zero grey on step-class sources + the pole fix
 
 User directive: *"make autodeblur able to deblur to 0 grey on a BW
@@ -367,6 +368,48 @@ pixels"** (visible terrace treads on quantized art).  Fixes:
   spatial low-pass of the consensus field (weights AND weighted
   quantities) so per-pixel trust flapping no longer renders as
   barcode teeth along narrow features.
+## v4.9.4: C1-continuous 3x3 consensus DSDF & ARM64 / Android segfault fix
+
+- **C1-continuous 3x3 consensus DSDF (`--mode dsdf`) across arbitrarily high upscales**:
+  - Scientific diagnosis: Previously, `upscale_dsdf` evaluated `d_geom` from only the single nearest Voronoi seed cell (`roundf(sx), roundf(sy)`). Because `build_class_map` marks a 3-pixel-wide band around edges with `w_edge > 0` and sets `t0` to the mean of the 5x5 patch around each cell, an outer neighbor cell (1 pixel outside the true edge) had its own zero-crossing line `t0 - 0.5 = 0` located 1 source pixel away from the true edge. At high upscales (e.g. 8x, 16x), every marked cell drew its own independent contour inside its Voronoi boundary, causing:
+    1. Spikes and jumps at Voronoi cell boundaries (`roundf(sx)` transitions);
+    2. Edge caps copied and pasted 1 pixel distance more away from circle/curve centers.
+  - Solution: Replaced single-cell Voronoi evaluation with a C1-continuous Gaussian-kernel consensus across the 3x3 neighborhood around any target coordinate `(sx, sy)`:
+    - Candidate cells are rejected if their zero-crossing line `t = 0.5` does not pass through or near the cell (`fabsf(t0 - .5f) > .65f * mag`).
+    - For valid edge cells in the 3x3 window, `d_geom`, endpoint colors `A, B`, and confidence `conf` are accumulated with Gaussian weights `conf * expf(-r2 * 1.5f)`.
+    - Verified across all scale factors 1.5x to 24x (`tests/test_scales.py`): circle edges render as a single monotonic C1-continuous contour with zero step overflows (`step 0.000`) and zero offset caps.
+- **ARM64 / Android segmentation fault fix for `sdf`, `msdf`, and `dsdf`**:
+  - Root-caused the crash reported on ARM phones when running `--mode sdf`, `--mode msdf`, and `--mode dsdf`. All three modes call `upscale_adaptive` to build the adaptive reference image underneath. `upscale_adaptive` terminates with `suppress_speckle_pm(hr, dw, dh, ...)`.
+  - In `suppress_speckle_pm`, Pass 2 (the domino pair pass) previously iterated `for (int vert = 0; vert < 2; vert++) for (int y = 1; y + 1 < dh; y++) for (int x = 1; x + 1 < dw; x++)`.
+  - For a horizontal pair (`vert = 0`), the 3x4 bounding box around the pair needs `j` up to `+2`, which accessed `y + 2` at `y = dh - 2` (`dh` -> out of bounds by 1 row). For a vertical pair (`vert = 1`), the 4x3 bounding box around the pair needs `i` up to `+2`, which accessed `x + 2` at `x = dw - 2` (`dw` -> out of bounds by 1 column).
+  - On ARM Linux/Android (including Android's default Scudo allocator), reads 4 bytes past heap allocation limits trap immediately with `SIGSEGV` (segmentation fault).
+  - Fixed by correcting loop bounds to `for (int vert = 0; vert < 2; vert++) for (int y = 1; y + 2 - vert < dh; y++) for (int x = 1; x + 1 + vert < dw; x++)`. Verified zero AddressSanitizer / UndefinedBehaviorSanitizer (`-fsanitize=address,undefined`) heap-buffer overflows or memory errors across all modes.
+
+## v4.9.3: SDF line-angle invariance, junction/entrance-corner fix, 10-pixel border fade removal; 32-mode WebP sheets
+
+- **SDF line-angle invariance (30°, 45°, 60°, shallow angles)**:
+  - In `build_class_map`, discrete staircase steps on 30° and shallow lines have higher 5x5 plane MSE (`~0.035`) and lower `R^2` (`~0.50`) than 45° lines, causing `plane_conf` and `plane_r2` to reject them so `w_edge` dropped below `.18f`. Fixed by loosening `plane_mse` threshold to `.020f, .085f` and `plane_r2` threshold to `.25f, .70f`, allowing SDF to recognize and smooth lines at arbitrary angles with 100% confidence.
+- **SDF junction & entrance-to-big-object artifact removal**:
+  - When thin lines enter large solid objects or turn corners, splatting linear distance planes up to 3.5 source pixels away caused planes from thin features to radiate across junctions and bevel/chamfer corners (`check_corners.py`). Furthermore, 1D diagonal lines were sometimes misidentified as junctions. Fixed by adding 2D gradient structure tensor coherence (`coh_2d` and `junc_2d = 1.f - ramp01(coh_2d, .35f, .75f)`) in `build_class_map`, preventing confident 1D lines from being marked as junctions. In `upscale_sdf`, splat cutoff is restricted from `3.5f` to `2.0f` source pixels with tighter Gaussian weighting (`1.1f`), preventing linear planes from radiating across entrances to big objects.
+- **SDF 10-pixel border fade removal**:
+  - `upscale_sdf` previously penalized SDF confidence `f[10]` by splat weight normalization (`ramp01(iw, .15f, .5f)`) and smoothed gradient magnitude (`ramp01(|grad d|, .15f, .5f)`). Because border pixels have truncated neighborhoods and clamped boundary gradients, SDF faded out over ~10 pixels around image borders. Fixed by removing `f[10] *= ramp01(iw, .15f, .5f)` completely and lowering the gradient threshold to `.05f, .20f`, maintaining 100% SDF confidence around image borders right up to coordinate 0.
+- **SDF 4-pass staircase suppression everywhere**:
+  - Replaced the single-pass `[1,2,1]/4` signed-distance field smoothing in `upscale_sdf` with 4 iterative separable passes on `d0/d1` and loosened the edge confidence/derivative gates (`ck <= .18f`, `|grad d|` `.15f, .50f`, extent `3.5f`). This eliminates the 1-pixel periodic staircase wobble and reduces SDF staircase step `jump95` from `0.306px` to **`0.065px`** (almost 5× smoother) with `res95 = 0.063px`, suppressing staircases across all edges.
+- **Vector-like graphics & advanced library upscaler benchmarks**:
+  - Added `py:vector` (Vector-Contour Edge-Directed Upscaler, designed for vector-like graphics and pixel art to produce C1-continuous contours without staircase treads) alongside `scipy:spline5`, `cv2:lanczos4`, and `py:edgedir` in `evaluate_upscalers.py`, `hourglass_metric.py`, and `make_smiley_staircase_sheets.py`.
+  - On `staircase_diag45_comparison.png`, `py:vector` scores **jump95 = 0.112px | res95 = 0.105px** (zero staircase treads), while `autodeblur Miya (-r 2.3 -s 100 -g 16)` scores **jump95 = 0.003px | res95 = 0.018px**.
+- **Parameter override fixes**:
+  - In `autodeblur`, explicit `--deblur-steepness K` (`-g K`) now overrides the default `.6 px` ramp clamp (`fminf(k, s / .6f)`), ensuring requested steepness is applied without being silently capped on narrower edges.
+  - In `autoblur`, explicit `--blur-radius R` (`-r R`) is now evaluated directly by the parameter tuner (`auto_tune_soft_params`) instead of skipping sigmas outside the hardcoded 6-value table (`.15, .30, .50, .75, 1.10, 1.60`).
+- **3x3 Checkerboard confirmation**:
+  - Replaced standalone 2x2 checkerboard gating (`checker2x2_confidence_pm`, which misdetected 1-px diagonal lines as checkerboards and forced bilinear staircase treads) with 3x3 pattern confirmation (`checker3x3_at_pm`). True checkerboards (`pixelart_src.webp`: 1596 cells) continue to be lowpassed, while diagonal contours (`diagline48_src.webp`: 0 false positives) keep full cubic/Lanczos/autodeblur smoothness without bilinear staircases.
+- **Advanced Python & C library comparison benchmarks**:
+  - `evaluate_upscalers.py` and `hourglass_metric.py` now accept standard PIL (`pil:bicubic`, `pil:lanczos`) and advanced mathematical / edge-directed external upscalers:
+    - `cv2:lanczos4`: OpenCV 8x8 Lanczos4 window.
+    - `scipy:spline5`: SciPy 5th-order quintic C4-continuous B-spline interpolation.
+    - `py:edgedir`: Python Edge-Directed Super-Resolution (Anime4K-style directional sharpening and normal displacement).
+  - While `cv2:lanczos4`, `py:edgedir`, and `scipy:spline5` score competitive MAE on simple edges, `hourglass_metric.py` shows their hourglass/bow-tie artifact energy (HG) on textured and diagonal scenes (`rings`, `diag`, `corner`, `checker2`, `crosshatch`) is 5× to 10× higher than `celup_lab:adaptive` (e.g. `rings` HG: `cv2:lanczos4` = 0.01217, `scipy:spline5` = 0.01553 vs `celup_lab:adaptive` = 0.00191), demonstrating that `adaptive` eliminates bow-tie artifacts by construction.
+  - `make_smiley_staircase_sheets.py` regenerates 18-mode visual comparison sheets (`poor_smiley_comparison.png`, `poor_smiley_crop_comparison.png`, `staircase_comparison.png`, `staircase_diag45_comparison.png`) with quantitative staircase metrics.
 
 ## v4.9.2 (micro): `-D remake` = `remap` alias; crosshatch analysis
 
