@@ -346,7 +346,21 @@ def main():
         y = i * row_h
         d.text((6, y + 5), f"{name}: procedural source -> 96x96 premultiplied-linear box -> celup_lab 4x", fill="black")
         combined.paste(panel, (0, y + 26))
-    combined.save(SHEET_DIR / "comparison_sheet.png")
+    # Save as WebP (lossless). Split into multiple files if the combined sheet is huge.
+    combined_path = SHEET_DIR / "comparison_sheet.webp"
+    try:
+        combined.save(combined_path, "WEBP", lossless=True, quality=100)
+    except Exception:
+        # Fallback: split into 2-3 parts if the single file is too big or encoder fails
+        total_h = combined.height
+        part_h = total_h // 3 + 1
+        for part in range(3):
+            y0 = part * part_h
+            y1 = min((part + 1) * part_h, total_h)
+            part_img = combined.crop((0, y0, combined.width, y1))
+            part_img.save(SHEET_DIR / f"comparison_sheet_part{part+1}.webp", "WEBP", lossless=True, quality=100)
+        combined_path = SHEET_DIR / "comparison_sheet_part1.webp"  # representative
+    print("Wrote", combined_path)
 
     # Compact source overview.
     overview = Image.new("RGB", (len(SCENES) * Z, Z + 42), "white")
@@ -366,7 +380,7 @@ def main():
     lines += ["", "Generated files:", "", "- `comparison_sheets/comparison_sheet.png`", "- `comparison_sheets/example_sources.png`", "- `comparison_sheets/comparison_<case>.png`", "- `examples/*_source_96.webp` and matching mode outputs"]
     (ROOT / "comparison_sheets.md").write_text("\n".join(lines) + "\n")
 
-    print("Wrote", SHEET_DIR / "comparison_sheet.png")
+    print("Wrote", combined_path)
     print("Wrote", SHEET_DIR / "example_sources.png")
     print("Wrote", ROOT / "comparison_sheets.md")
 
