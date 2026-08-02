@@ -7169,6 +7169,267 @@ static void print_help(const char *argv0) {
       argv0);
 }
 
+/* ---------------------------------------------------------------------------
+   Jinc2-Bilateral (Hyllian 2025) -- faithful CPU port.
+
+   This is the jinc2-bilateral-xbr.slang filter: a windowed-jinc 2-lobe
+   reconstruction (space domain) multiplied by a *bilateral* (range-domain)
+   weight that compares each source texel's luma to a guide reconstruction
+   of the output pixel, followed by an anti-ringing clamp to the central 2x2
+   source cell.
+
+     wa = WA*pi, wb = WB*pi   (WA=0.5, WB=0.88: best 2-lobe jinc approx)
+     resampler(d) = sin(d*wa)*sin(d*wb)/(d*d)
+     I(A,B)       = lanczos( luma(|A-B|)*STR + dt, 2 )     (range weight)
+     weight       = resampler(dist) * I(guide, texel)
+     color        = sum(weight * texel) / sum(weight)
+     color        = mix(color, clamp(color, min4(c11,c21,c12,c22),
+                                      max4(c11,c21,c12,c22)), AR)
+
+   Working in the lab's premultiplied-linear RGBA space keeps it consistent
+   with every other mode (and the metrics are computed in that space).  The
+   bilateral term suppresses cross-edge bleed/ringing by downweighting texels
+   on the far side of an edge; the anti-ringing clamp bounds the output to
+   locally observed colours, so no overshoot is possible.  STR (bilateral
+   strength) and AR (anti-ringing) can be tuned via the CELUP_J2B_STR /
+   CELUP_J2B_AR env vars (default 1.0, 1.0 -- the shader defaults).  -s can
+   optionally raise bilateral strength: STR = 1 + (strength-1)*0.05.
+--------------------------------------------------------------------------- */
+static float j2b_sinc(float x) {
+  x = fabsf(x);
+  if (x < 1e-6f)
+    return 1.f;
+  float p = CELUP_PI * x;
+  return sinf(p) / p;
+}
+static float j2b_lanczos(float x, float a) {
+  return j2b_sinc(x) * j2b_sinc(x / a);
+}
+static float j2b_luma(const float c[4]) {
+  return .2126f * c[0] + .7152f * c[1] + .0722f * c[2] + .35f * c[3];
+}
+static float j2b_resampler(float x, float wa, float wb) {
+  /* sin(x*wa)*sin(x*wb)/(x*x) with the x->0 limit wa*wb. */
+  if (x < 1e-6f)
+    return wa * wb;
+  return sinf(x * wa) * sinf(x * wb) / (x * x);
+}
+/* jinc2_bilateral tuning (Hyllian shader slider names).  Exposed as both
+   CLI flags and CELUP_J2B_* env vars.  On flat / gradient-free (hard
+   pixel-art) images the stepladder comes from the bilateral range term
+   snapping each output pixel onto the nearest source colour, re-quantising
+   the edge to the output lattice; lowering STR toward ~0.1-0.3 (and, if
+   needed, WB toward ~0.80) smooths the contour out. */
+static float j2b_wa = .50f, j2b_wb = .88f, j2b_str = 1.0f, j2b_ar = 1.0f;
+/* Parameterised jinc2 render so the auto-tuner can sweep explicit values. */
+static void jinc2_render(const uint8_t *in, int sw, int sh, uint8_t *out,
+                         int dw, int dh, float WA, float WB, float STR,
+                         float AR) {
+  WA = WA < 0.f ? 0.f : (WA > 1.f ? 1.f : WA);
+  WB = WB < 0.f ? 0.f : (WB > 1.f ? 1.f : WB);
+  float wa = WA * CELUP_PI, wb = WB * CELUP_PI;
+  float xscale = (float)sw / dw, yscale = (float)sh / dh;
+  for (int y = 0; y < dh; y++) {
+    float sy = (y + .5f) * yscale - .5f;
+    int iy = (int)floorf(sy);
+    float fy = sy - iy;
+    for (int x = 0; x < dw; x++) {
+      float sx = (x + .5f) * xscale - .5f;
+      int ix = (int)floorf(sx);
+      float fx = sx - ix;
+      float guide[4];
+      bilinear_cell_pm(in, sw, sh, ix, iy, fx, fy, guide);
+      float c[4][4][4], wsum = 0.f, acc[4] = {0.f, 0.f, 0.f, 0.f};
+      float glum = j2b_luma(guide);
+      for (int j = 0; j < 4; j++)      /* source y = iy-1+j */
+        for (int i = 0; i < 4; i++) {  /* source x = ix-1+i  */
+          int px = ix - 1 + i, py = iy - 1 + j;
+          raw_pm(in, sw, sh, px, py, c[j][i]);
+          float dx = sx - (float)px, dy = sy - (float)py;
+          float dist = sqrtf(dx * dx + dy * dy);
+          float ws = j2b_resampler(dist, wa, wb);
+          float wr = j2b_lanczos(fabsf(glum - j2b_luma(c[j][i])) * STR + 1e-5f,
+                                 2.0f);
+          float ww = ws * wr;
+          wsum += ww;
+          for (int ch = 0; ch < 4; ch++)
+            acc[ch] += ww * c[j][i][ch];
+        }
+      float q[4];
+      if (wsum > 1e-12f) {
+        float inv = 1.f / wsum;
+        for (int ch = 0; ch < 4; ch++)
+          q[ch] = acc[ch] * inv;
+      } else
+        for (int ch = 0; ch < 4; ch++)
+          q[ch] = guide[ch];
+      /* Anti-ringing clamp to the central 2x2 source cell. */
+      {
+        float lo[4] = {1e30f, 1e30f, 1e30f, 1e30f},
+              hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
+        for (int j = 1; j <= 2; j++)
+          for (int i = 1; i <= 2; i++)
+            for (int ch = 0; ch < 4; ch++) {
+              if (c[j][i][ch] < lo[ch])
+                lo[ch] = c[j][i][ch];
+              if (c[j][i][ch] > hi[ch])
+                hi[ch] = c[j][i][ch];
+            }
+        for (int ch = 0; ch < 4; ch++) {
+          float cl = q[ch] < lo[ch] ? lo[ch] : (q[ch] > hi[ch] ? hi[ch] : q[ch]);
+          q[ch] = cl * AR + q[ch] * (1.f - AR);
+        }
+      }
+      put(out + 4 * ((size_t)y * dw + x), q[0], q[1], q[2], q[3]);
+    }
+  }
+}
+
+/* Wrapper: resolves the global/env parameter values then renders. */
+static void upscale_jinc2_bilateral(const uint8_t *in, int sw, int sh,
+                                    uint8_t *out, int dw, int dh) {
+  float WA = j2b_wa, WB = j2b_wb, STR = j2b_str, AR = j2b_ar;
+  {
+    const char *e = getenv("CELUP_J2B_WA");
+    if (e)
+      WA = strtof(e, NULL);
+    e = getenv("CELUP_J2B_WB");
+    if (e)
+      WB = strtof(e, NULL);
+    e = getenv("CELUP_J2B_STR");
+    if (e)
+      STR = strtof(e, NULL);
+    e = getenv("CELUP_J2B_AR");
+    if (e)
+      AR = strtof(e, NULL);
+  }
+  jinc2_render(in, sw, sh, out, dw, dh, WA, WB, STR, AR);
+}
+
+/* Lattice-snap fraction: the fraction of reconstruction pixels that sit
+   (within an epsilon) on one of their four nearest source-neighbour values.
+   This is exactly the mechanism that causes the stepladder on flat /
+   gradient-free art -- the bilateral range term snapping each output pixel
+   onto the source lattice re-quantises the edge to the output grid.  A pure
+   MSE proxy cannot see this (a staircased output reconstructs a hard-
+   quantised source perfectly), so the auto objective is
+       score = MSE * (1 + LAM * snap)
+   which rewards candidates that reconstruct the source WITHOUT re-snapping
+   the lattice.  On natural gradient images both the default and smooth
+   candidates snap little, so the MSE term keeps quality; on hard pixel art
+   the smooth candidate wins. */
+/* Hard-quantisation measure: the fraction of adjacent source pixels that are
+   exact duplicates.  Hard pixel art / quantized line art (the stepladder
+   class) is dominated by exact-duplicate links (diagline48 .85, smiley .84),
+   while natural gradient imagery has few (miya .07, cat .14).  On such hard
+   sources the bilateral range term re-quantises edges onto the output
+   lattice, so the MSE proxy (which prefers the sharpest reconstruction) is
+   blind to the resulting stepladder. */
+static float j2b_hardness(const uint8_t *in, int sw, int sh) {
+  long dups = 0, tot = 0;
+  for (int y = 0; y < sh; y++)
+    for (int x = 0; x < sw; x++) {
+      float a[4];
+      raw_pm(in, sw, sh, x, y, a);
+      if (x + 1 < sw) {
+        float b[4];
+        raw_pm(in, sw, sh, x + 1, y, b);
+        dups += dist4_pm(a, b) < 1e-6f;
+        tot++;
+      }
+      if (y + 1 < sh) {
+        float b[4];
+        raw_pm(in, sw, sh, x, y + 1, b);
+        dups += dist4_pm(a, b) < 1e-6f;
+        tot++;
+      }
+    }
+  return tot > 0 ? (float)dups / (float)tot : 0.f;
+}
+
+/* Auto-tune mode: pick the jinc2 (WB, STR) pair that best reconstructs this
+   image, using the same self-supervised 2x-downscale validation proxy as
+   autoblur.  Downscale the input 2x, upscale it back with every candidate
+   (WB, STR) pair and score with
+       score = MSE * (1 + LAM * hardness * STR)
+   STR is the bilateral strength -- the knob whose high values re-quantise
+   hard-pixel-art edges onto the output lattice (the stepladder).  WB is left
+   to the MSE (its 0.88 default is fine and low WB degrades quality).
+   hardness ~ 0 on natural gradients -> plain MSE (sharpest wins); hardness
+   ~.85 on pixel art -> low STR (measured best: jump95 .146->.063 with best
+   MAE) is preferred.  Among near-best candidates we prefer lower STR then
+   lower WB.  WA and AR stay at their defaults. */
+static void auto_tune_j2b(const uint8_t *in, int sw, int sh) {
+  int tw = sw / 2, th = sh / 2;
+  if (tw < 8 || th < 8) { /* proxy too small: keep defaults */
+    fprintf(stderr, "jinc2_auto: image too small for the 2x proxy; using defaults\n");
+    return;
+  }
+  uint8_t *train = downsample_pm_box(in, sw, sh, tw, th);
+  uint8_t *recon = malloc((size_t)sw * sh * 4);
+  if (!train || !recon) {
+    free(train);
+    free(recon);
+    return;
+  }
+  /* Candidate window B values: the shader default .88 and the smoother
+     staircase-killing values toward .72. */
+  static const float WBs[] = {.72f, .76f, .80f, .84f, .88f};
+  /* Bilateral strength candidates: 1.0 default down to the low-stepladder .1. */
+  static const float STRs[] = {.10f, .20f, .40f, .70f, 1.0f};
+  const int NW = (int)(sizeof WBs / sizeof WBs[0]);
+  const int NS = (int)(sizeof STRs / sizeof STRs[0]);
+  double scores[5][5];
+  double best = 1e300;
+  int best_w = 0, best_s = 0;
+  float hard = j2b_hardness(in, sw, sh);
+  for (int i = 0; i < NW; i++)
+    for (int j = 0; j < NS; j++) {
+      jinc2_render(train, tw, th, recon, sw, sh, j2b_wa, WBs[i], STRs[j],
+                   j2b_ar);
+      double mse = image_pm_mse(recon, in, sw, sh, 2);
+      /* Staircase-aware: penalise high bilateral strength on hard sources. */
+      double score = mse * (1. + 2.5 * hard * STRs[j]);
+      scores[i][j] = score;
+      if (score < best) {
+        best = score;
+        best_w = i;
+        best_s = j;
+      }
+    }
+  if (getenv("CELUP_J2B_DBG"))
+    for (int i = 0; i < NW; i++)
+      for (int j = 0; j < NS; j++)
+        fprintf(stderr, "  j2b cand WB=%.2f STR=%.2f score %.8g (MSE %.8g "
+                        "hard %.2f)\n",
+                WBs[i], STRs[j], scores[i][j],
+                scores[i][j] / (1. + 2.5 * hard * STRs[j]), hard);
+  /* Smoothness prior among near-best (within 8% of best score): prefer the
+     lowest STR then lowest WB -- the low-stepladder direction. */
+  double thr = best * 1.08;
+  int bw = best_w, bs = best_s;
+  for (int i = 0; i < NW; i++)
+    for (int j = 0; j < NS; j++)
+      if (scores[i][j] <= thr) {
+        if (STRs[j] < STRs[bs] - 1e-6f ||
+            (fabsf(STRs[j] - STRs[bs]) <= 1e-6f && WBs[i] < WBs[bw])) {
+          bw = i;
+          bs = j;
+        }
+      }
+  j2b_wb = WBs[bw];
+  j2b_str = STRs[bs];
+  fprintf(stderr,
+          "jinc2_auto selected WB=%.2f STR=%.2f (hardness %.2f; score %.8g "
+          "MSE %.8g)\n",
+          j2b_wb, j2b_str, hard, best,
+          best / (1. + 2.5 * hard * STRs[best_s]));
+  free(train);
+  free(recon);
+}
+
+static int upscale_xbr(const uint8_t *in, int sw, int sh, uint8_t *out,
+
 /* xBR / xBRZ pixel art upscalers */
 static int upscale_xbr(const uint8_t *in, int sw, int sh, uint8_t *out,
                        int dw, int dh) {
@@ -7519,7 +7780,8 @@ int main(int ac, char **av) {
       strcmp(mode, "classmap") && strcmp(mode, "scale2x") &&
       strcmp(mode, "autoblur") && strcmp(mode, "sdf") &&
       strcmp(mode, "msdf") && strcmp(mode, "dsdf") &&
-      strcmp(mode, "autodeblur")) {
+      strcmp(mode, "autodeblur") &&
+      strcmp(mode, "jinc2_bilateral") && strcmp(mode, "jinc2_auto")) {
     fprintf(stderr, "Unknown mode: %s\n", mode);
     return 2;
   }
@@ -7685,6 +7947,12 @@ int main(int ac, char **av) {
     ok = upscale_msdf(in, w, h, out, ow, oh);
   else if (!strcmp(mode, "dsdf"))
     ok = upscale_dsdf(in, w, h, out, ow, oh);
+  else if (!strcmp(mode, "jinc2_bilateral"))
+    upscale_jinc2_bilateral(in, w, h, out, ow, oh);
+  else if (!strcmp(mode, "jinc2_auto")) {
+    auto_tune_j2b(in, w, h);
+    upscale_jinc2_bilateral(in, w, h, out, ow, oh);
+  }
   if (!ok) {
     fprintf(stderr, "Allocation failed\n");
     free(out);
