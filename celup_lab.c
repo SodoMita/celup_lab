@@ -28,15 +28,33 @@
 
 static float to_linear[256];
 static uint8_t to_srgb[4097];
+
+/* celup_config: all tuneable parameters and state, consolidated into
+   a single struct for better compiler optimization.  Formerly scattered
+   file-scope statics -- the compiler couldn't prove they weren't aliased
+   and couldn't eliminate dead code paths.  Now accessed via a single
+   pointer g_cfg, set once in main() to a stack-local struct. */
+typedef struct {
+  float compress_strength, blur_radius, edge_goal, deblur_steepness;
+  int blur_radius_set, auto_blurcompress, checker_policy, adaptive_debug;
+  int blur_kernel_kind, blur_curve_kind, deblur_method;
+  float max_mib, j2b_wa, j2b_wb, j2b_str, j2b_ar, alpha_clean_floor;
+  int fitted_kernel, fitted_curve;
+  float fitted_sigma, fitted_cp;
+  float adb_sigma_div, adb_assumed_sigma, adb_qconf;
+  int adb_noamp, adb_noter, adb_nohull, adb_nospeckle;
+  float adb_srclo[3], adb_srchi[3];
+  float trust_lo, trust_hi;
+  int last_deblur_method;
+  float last_deblur_k;
+} celup_config;
+
+static celup_config *g_cfg;
+
 /* compression exponent: 1 = none, 2 = strong, 4 = very strong */
-static float compress_strength = 2.f;
 /* Gaussian sigma in source-pixel units for blur modes. */
-static float blur_radius = 1.f;
-static int blur_radius_set = 0;
 /* If set, tune blurcompress parameters from the input image itself. */
-static int auto_blurcompress = 0;
 /* Conservative peak-RSS guard; overridden by --max-mib. */
-static float max_mib = 512.f;
 /* Reconstruction policy for checker/Nyquist-ambiguous cells in the adaptive
    mode.  LOWPASS is the natural-image default; SCALE2X is the crisp pixel-art
    option; AUTO picks between those two from global image statistics. */
@@ -48,11 +66,9 @@ enum {
   POLICY_SCALE2X,
   POLICY_AUTO
 };
-static int checker_policy = POLICY_LOWPASS;
 /* Diagnostic bitmask for the adaptive mode: 1 = zero edge weight,
    2 = zero checker weight, 4 = zero junction weight.  Not documented for
    production use; used to attribute error to a specific policy branch. */
-static int adaptive_debug = 0;
 #define CELUP_PI 3.14159265358979323846f
 static inline float smoothstep01(float t) {
   t = t < 0.f ? 0.f : (t > 1.f ? 1.f : t);
@@ -70,9 +86,9 @@ static inline int clampi(int x, int lo, int hi) {
 static inline float compress_curve(float t) {
   /* Symmetric power sigmoid: monotonic for every valid strength and fixes
      the midpoint exactly. It is safer than extrapolating smoothstep. */
-  if (compress_strength <= 1.f)
+  if (g_cfg->compress_strength <= 1.f)
     return t;
-  float a = powf(t, compress_strength), b = powf(1.f - t, compress_strength);
+  float a = powf(t, g_cfg->compress_strength), b = powf(1.f - t, g_cfg->compress_strength);
   return a / (a + b + 1e-20f);
 }
 static void init_luts(void) {
@@ -401,13 +417,13 @@ static int upscale_kernel(const uint8_t *in, int sw, int sh, uint8_t *out,
    genuinely broad transition that can serve as input to a later narrowing
    pass. Sigma is approximately one source pixel. */
 static void blur_pm(const uint8_t *in, int w, int h, int x, int y, float q[4]) {
-  int r = (int)ceilf(3.f * blur_radius);
+  int r = (int)ceilf(3.f * g_cfg->blur_radius);
   if (r < 1)
     r = 1;
   if (r > 32) /* v4.9.3: raised from 12 so large -r pins get full support */
     r = 32;
   q[0] = q[1] = q[2] = q[3] = 0;
-  float sum = 0, inv2 = 1.f / (2.f * blur_radius * blur_radius);
+  float sum = 0, inv2 = 1.f / (2.f * g_cfg->blur_radius * g_cfg->blur_radius);
   for (int j = -r; j <= r; j++)
     for (int i = -r; i <= r; i++) {
       float p[4], ww = expf(-(float)(i * i + j * j) * inv2);
@@ -1526,7 +1542,7 @@ static void scale2x_sample(const uint8_t *in, int sw, int sh, float sx,
 
 /* v7: full 2x Scale2x block for integer 2x, then optional -r blend to bilinear for -r control */
 static void upscale_scale2x_2x(const uint8_t *in, int sw, int sh, uint8_t *out) {
-  int dw = sw*2, dh = sh*2;
+  int dw = sw*2;
   for (int y=0; y<sh; y++) {
     for (int x=0; x<sw; x++) {
       float A[4],B[4],C[4],D[4],E[4],F[4],G[4],H[4],I[4];
@@ -1561,8 +1577,8 @@ static void upscale_scale2x(const uint8_t *in, int sw, int sh, uint8_t *out,
   if (dw == sw*2 && dh == sh*2) {
     upscale_scale2x_2x(in, sw, sh, out);
     /* optional -r smoothing for scale2x: blend with bilinear by amount based on -r */
-    if (blur_radius_set) {
-      float blend = clampf((blur_radius - 0.5f) * 0.35f, 0.f, 0.55f);
+    if (g_cfg->blur_radius_set) {
+      float blend = clampf((g_cfg->blur_radius - 0.5f) * 0.35f, 0.f, 0.55f);
       if (blend > 0.01f) {
         for (int y=0; y<dh; y++) {
           float sy = (y + .5f) * (float)sh / dh - .5f;
@@ -1586,8 +1602,8 @@ static void upscale_scale2x(const uint8_t *in, int sw, int sh, uint8_t *out,
     for (int x = 0; x < dw; x++) {
       float sx = (x + .5f) * (float)sw / dw - .5f, q[4], b[4];
       scale2x_sample(in, sw, sh, sx, sy, q);
-      if (blur_radius_set) {
-        float blend = clampf((blur_radius - 0.5f) * 0.30f, 0.f, 0.50f);
+      if (g_cfg->blur_radius_set) {
+        float blend = clampf((g_cfg->blur_radius - 0.5f) * 0.30f, 0.f, 0.50f);
         if (blend > 0.01f) {
           bilinear_cell_pm(in, sw, sh, (int)floorf(sx), (int)floorf(sy), sx - floorf(sx), sy - floorf(sy), b);
           for (int c=0;c<4;c++) q[c] = q[c]*(1.f-blend) + b[c]*blend;
@@ -1599,7 +1615,7 @@ static void upscale_scale2x(const uint8_t *in, int sw, int sh, uint8_t *out,
 }
 
 static int resolve_policy(const class_map_t *cm) {
-  int p = checker_policy;
+  int p = g_cfg->checker_policy;
   if (p == POLICY_AUTO)
     p = cm->pixel_art ? POLICY_SCALE2X : POLICY_LOWPASS;
   return p;
@@ -1628,7 +1644,7 @@ static void adaptive_tangential_aa(float *hr, int dw, int dh,
   if (!snap) return;
   memcpy(snap, hr, n * 4 * sizeof *snap);
   float xscale = (float)sw / dw, yscale = (float)sh / dh;
-  float spread = blur_radius_set ? clampf(blur_radius / 0.75f, 0.7f, 3.0f) : 1.2f;
+  float spread = g_cfg->blur_radius_set ? clampf(g_cfg->blur_radius / 0.75f, 0.7f, 3.0f) : 1.2f;
   for (int y = 0; y < dh; y++) {
     int cy = (int)((y + 0.5f) * yscale);
     if (cy < 0) cy = 0;
@@ -1667,8 +1683,10 @@ static void adaptive_tangential_aa(float *hr, int dw, int dh,
           for (int i = 0; i < 2; i++) {
             float w = (i ? fx : 1.f - fx) * (j ? fy : 1.f - fy);
             int sx = ix + i, sy = iy + j;
-            if (sx < 0) sx = 0; if (sx >= dw) sx = dw - 1;
-            if (sy < 0) sy = 0; if (sy >= dh) sy = dh - 1;
+            if (sx < 0) sx = 0;
+            if (sx >= dw) sx = dw - 1;
+            if (sy < 0) sy = 0;
+            if (sy >= dh) sy = dh - 1;
             const float *p = snap + 4 * ((size_t)sy * dw + sx);
             for (int c = 0; c < 4; c++) q[c] += w * p[c];
           }
@@ -1705,7 +1723,6 @@ static void adaptive_tangential_aa(float *hr, int dw, int dh,
    correction, followed by a focused hourglass-basis cleanup.  The result
    keeps deblur-like MAE on real edges without the crossing hallucination or
    hourglass build-up of the ungated iteration. */
-static int adb_nohull = 0, adb_nospeckle = 0; /* ablation knobs (forward decl) */
 
 static int upscale_adaptive(const uint8_t *in, int sw, int sh, uint8_t *out,
                             int dw, int dh) {
@@ -1717,7 +1734,7 @@ static int upscale_adaptive(const uint8_t *in, int sw, int sh, uint8_t *out,
   if (policy == POLICY_LOWPASS) {
     /* v5: honour -r for lowpass sigma so -r has visible effect in adaptive;
        default 0.75 remains if not pinned. */
-    float lp_sigma = blur_radius_set ? clampf(blur_radius, 0.1f, 2.5f) : 0.75f;
+    float lp_sigma = g_cfg->blur_radius_set ? clampf(g_cfg->blur_radius, 0.1f, 2.5f) : 0.75f;
     low = alloc_lowpass_pm(in, sw, sh, lp_sigma);
     if (!low) {
       free_class_map(&cm);
@@ -1740,14 +1757,14 @@ static int upscale_adaptive(const uint8_t *in, int sw, int sh, uint8_t *out,
       float wc = cm.w_checker[k], we = cm.w_edge[k], wj = cm.w_junction[k],
             wb = cm.w_base[k], wl = cm.w_line[k], q[4] = {0, 0, 0, 0},
             t4[4];
-      if (adaptive_debug) {
-        if (adaptive_debug & 1)
+      if (g_cfg->adaptive_debug) {
+        if (g_cfg->adaptive_debug & 1)
           we = 0.f;
-        if (adaptive_debug & 2)
+        if (g_cfg->adaptive_debug & 2)
           wc = 0.f;
-        if (adaptive_debug & 4)
+        if (g_cfg->adaptive_debug & 4)
           wj = 0.f;
-        if (adaptive_debug & 8)
+        if (g_cfg->adaptive_debug & 8)
           wl = 0.f;
         float s = we + wc + wj + wb + wl;
         if (s > 1e-6f) {
@@ -1798,7 +1815,7 @@ static int upscale_adaptive(const uint8_t *in, int sw, int sh, uint8_t *out,
             }
           }
         if (lp) {
-          float nf = compress_strength > 1.f ? 1.f / sqrtf(compress_strength)
+          float nf = g_cfg->compress_strength > 1.f ? 1.f / sqrtf(g_cfg->compress_strength)
                                              : 1.f;
           nf += (1.f - nf) * ramp01(lp[3], .55f, .95f);
           float w2 = lp[3] * nf;
@@ -1855,7 +1872,7 @@ static int upscale_adaptive(const uint8_t *in, int sw, int sh, uint8_t *out,
      v6: stronger -s: 0.020*(s-1) capped 0.16 (019fba1b tuning).  Hourglass
      removal 0.60, speckle 0.60.  Tangential AA removed: it over-smooths
      diagonal edges and increases reconstruction MSE by ~45%. */
-  float sharp = clampf((compress_strength - 1.f) * .020f, 0.f, .16f);
+  float sharp = clampf((g_cfg->compress_strength - 1.f) * .020f, 0.f, .16f);
   int ok = refine_downsample_consistency(hr, in, sw, sh, dw, dh, 3, .55f,
                                          sharp, &cm);
   if (ok) {
@@ -1865,7 +1882,7 @@ static int upscale_adaptive(const uint8_t *in, int sw, int sh, uint8_t *out,
        keep.  Only soft policies need this cleanup. */
     if (policy != POLICY_SCALE2X && policy != POLICY_NEAREST)
       remove_hourglass_basis(hr, dw, dh, in, sw, sh, .60f, cm.w_hg);
-    suppress_speckle_pm(hr, dw, dh, in, sw, sh, adb_nospeckle ? 0.f : .60f, cm.w_hg);
+    suppress_speckle_pm(hr, dw, dh, in, sw, sh, g_cfg->adb_nospeckle ? 0.f : .60f, cm.w_hg);
     write_hr_rgba(hr, dw, dh, out);
   }
   free(hr);
@@ -1933,12 +1950,8 @@ enum {
   CK_NEAREST,
   CK_AUTO
 };
-static int blur_kernel_kind = BK_AUTO;
-static int blur_curve_kind = CK_AUTO;
 static float curve_param = 0.f; /* <=0: family default (exp/log k, sqrt p) */
 /* Resolved parameters, for the final report. */
-static int fitted_kernel = BK_GAUSSIAN, fitted_curve = CK_LINEAR;
-static float fitted_sigma = .75f, fitted_cp = 0.f;
 /* v4.9.1: the v4.9 decouple (base render at sigma r/min(K,8)) was
    REVERTED.  It suppressed the v4.8 neon skirt, but any base rendered
    crisper than the assumed blur also re-quantizes the source lattice:
@@ -1950,7 +1963,6 @@ static float fitted_sigma = .75f, fitted_cp = 0.f;
    drag amplitude, coverage gate, contour consensus, hull clamp), NOT
    by smuggling a crisper image into the low-trust blend.  The hook is
    kept (zeroed) so the fit tables and sigma plumbing stay valid. */
-static float adb_sigma_div = 0.f, adb_assumed_sigma = 0.f;
 
 static const char *kernel_name(int k) {
   return k == BK_BOX       ? "box"
@@ -2178,7 +2190,6 @@ static double image_pm_mse(const uint8_t *a, const uint8_t *b, int w, int h,
    offenders).  Candidates are scored mse * (1 + PENALTY * deficit^2), so
    widening edges below the goal is worth more than the MSE it costs, but
    never free. */
-static float edge_goal = 0.f;
 static float measure_edge_width30(const uint8_t *img, int w, int h,
                                   float scale_px) {
   /* Width of a rendered edge = (range over a window that spans the whole
@@ -2294,7 +2305,7 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
     if (*kk != BK_AUTO && kernels[ki] != *kk)
       continue;
     for (size_t si = 0; si < sizeof sigmas / sizeof sigmas[0]; si++) {
-      if (blur_radius_set && fabsf(sigmas[si] - *sigma) > 1e-6f)
+      if (g_cfg->blur_radius_set && fabsf(sigmas[si] - *sigma) > 1e-6f)
         continue;
       if (!render_soft(train, tw, th, recon, sw, sh, kernels[ki], sigmas[si],
                        CK_LINEAR, 0.f))
@@ -2315,7 +2326,7 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
       if (*kk != BK_AUTO && kernels[ki] != *kk)
         continue;
       for (size_t si = 0; si < sizeof sigmas / sizeof sigmas[0]; si++) {
-        if (blur_radius_set && fabsf(sigmas[si] - *sigma) > 1e-6f)
+        if (g_cfg->blur_radius_set && fabsf(sigmas[si] - *sigma) > 1e-6f)
           continue;
         double score = s1[ki * 6 + si];
         if (score <= 0 || score > thr)
@@ -2405,12 +2416,12 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
 
 static int upscale_autoblur(const uint8_t *in, int sw, int sh, uint8_t *out,
                             int dw, int dh) {
-  int kk = blur_kernel_kind, ck = blur_curve_kind;
-  float sigma = blur_radius, cp = curve_param;
-  int fit_needed = kk == BK_AUTO || ck == CK_AUTO || !blur_radius_set ||
+  int kk = g_cfg->blur_kernel_kind, ck = g_cfg->blur_curve_kind;
+  float sigma = g_cfg->blur_radius, cp = curve_param;
+  int fit_needed = kk == BK_AUTO || ck == CK_AUTO || !g_cfg->blur_radius_set ||
                    (cp <= 0.f &&
                     (ck == CK_EXP || ck == CK_LOG || ck == CK_SQRT) &&
-                    blur_curve_kind != CK_AUTO);
+                    g_cfg->blur_curve_kind != CK_AUTO);
   if (fit_needed) {
     if (!auto_tune_soft_params(in, sw, sh, &kk, &sigma, &ck, &cp))
       return 0;
@@ -2419,26 +2430,26 @@ static int upscale_autoblur(const uint8_t *in, int sw, int sh, uint8_t *out,
             "autoblur manual: kernel=%s sigma=%.2f curve=%s param=%.2f "
             "(all four pinned by -k/-r/-c/-p; validation fit skipped)\n",
             kernel_name(kk), sigma, curve_name(ck), cp);
-  fitted_kernel = kk;
-  fitted_sigma = sigma;
-  fitted_curve = ck;
-  fitted_cp = cp;
-  if (adb_sigma_div > 0.f) {
-    adb_assumed_sigma = sigma;
-    sigma = clampf(sigma / adb_sigma_div, .6f, sigma);
-    fitted_sigma = sigma;
+  g_cfg->fitted_kernel = kk;
+  g_cfg->fitted_sigma = sigma;
+  g_cfg->fitted_curve = ck;
+  g_cfg->fitted_cp = cp;
+  if (g_cfg->adb_sigma_div > 0.f) {
+    g_cfg->adb_assumed_sigma = sigma;
+    sigma = clampf(sigma / g_cfg->adb_sigma_div, .6f, sigma);
+    g_cfg->fitted_sigma = sigma;
     fprintf(stderr,
             "autodeblur base sigma %.2f = assumed %.2f / %.1f (v4.9 hook, inactive in v4.9.1; "
             "assumed value still sizes windows/gates)\n",
-            sigma, adb_assumed_sigma, adb_sigma_div);
+            sigma, g_cfg->adb_assumed_sigma, g_cfg->adb_sigma_div);
   }
   int ok = render_soft(in, sw, sh, out, dw, dh, kk, sigma, ck, cp);
-  if (ok && edge_goal > 0.f && blur_radius_set)
+  if (ok && g_cfg->edge_goal > 0.f && g_cfg->blur_radius_set)
     fprintf(stderr,
             "edge-goal %.2f: sigma pinned by -r (%.2f), escalation "
             "skipped -- manual wins over goal\n",
-            edge_goal, sigma);
-  if (ok && edge_goal > 0.f && !blur_radius_set) {
+            g_cfg->edge_goal, sigma);
+  if (ok && g_cfg->edge_goal > 0.f && !g_cfg->blur_radius_set) {
     /* Goal-first, measured at the TARGET resolution: the validation-proxy
        fit is systematically biased to little blur (a sharper reconstruction
        trivially matches the sharp target), so enforce the user's goal
@@ -2452,11 +2463,11 @@ static int upscale_autoblur(const uint8_t *in, int sw, int sh, uint8_t *out,
       fprintf(stderr,
               "autoblur edge-goal %.2f src px: strong-edge width p30 = %.2f "
               "(sigma %.2f)%s\n",
-              edge_goal, w30, sigma, w30 >= edge_goal ? " OK" : "");
-      if (w30 >= edge_goal || sigma >= 2.5f)
+              g_cfg->edge_goal, w30, sigma, w30 >= g_cfg->edge_goal ? " OK" : "");
+      if (w30 >= g_cfg->edge_goal || sigma >= 2.5f)
         break;
       sigma = fminf(sigma * 1.35f, 2.5f);
-      fitted_sigma = sigma;
+      g_cfg->fitted_sigma = sigma;
       if (!render_soft(in, sw, sh, out, dw, dh, kk, sigma, ck, cp)) {
         ok = 0;
         break;
@@ -2512,19 +2523,9 @@ static void sample_pm(const uint8_t *img, int w, int h, float x, float y,
    remap, 2 = Anime4K-style gradient push, 3 = analytical gradient push
    (inverted steepness semantics: 1=max deblur, higher=less deblur;
    whole-image consistent filter, no case-specific safety gates). */
-static int deblur_method = 0;
-static float deblur_steepness = 0.f; /* <=0: auto (-e adaptive or -s formula) */
-static int last_deblur_method = 0;   /* effective method of the last run */
-static float last_deblur_k = 0.f;    /* effective fixed steepness (0=adaptive) */
 /* v4.9.3: effective (post-cap) steepness statistics */
 static double adb_keff_sum = 0.0, adb_keff_w = 0.0;
 static float adb_keff_max = 0.f;
-static float adb_qconf = 0.f;
-static int adb_noamp = 0, adb_noter = 0;
-/* adb_nohull / adb_nospeckle declared above upscale_adaptive */
-static float deblur_texgain = 0.f; /* -T texgain */
-static float adb_srclo[3] = {0.f, 0.f, 0.f}, adb_srchi[3] = {1.f, 1.f, 1.f};
-static int autodeblur_is_photo = 0; /* set in upscale_autodeblur from class map */
 
 static void sample_f4(const float *img, int w, int h, float x, float y, float q[4]);
 /* autodeblur_analytic_pass -- the "analytical" deblur (method 3).
@@ -2651,7 +2652,7 @@ static int autodeblur_analytic_pass(uint8_t *out, int dw, int dh, float scale) {
   /* The assumed blur sizes the trace length so it spans a whole lobe end to
      end (global), not a fixed 2x2/6x6 tap.  Capped; early termination keeps
      crisp ramps and flats cheap. */
-  float sref0 = adb_assumed_sigma > 0.f ? adb_assumed_sigma : fitted_sigma;
+  float sref0 = g_cfg->adb_assumed_sigma > 0.f ? g_cfg->adb_assumed_sigma : g_cfg->fitted_sigma;
   float sref = sref0 > 1.f ? sref0 : 1.f;
   int maxR = clampi((int)(3.5f * scale * sref + 6.f), 8, 64);
   const float moveThresh = 1.0e-3f; /* per-step plateau detection threshold */
@@ -2747,11 +2748,11 @@ static int autodeblur_analytic_pass(uint8_t *out, int dw, int dh, float scale) {
      K semantics: 0 = auto, 1 = max (collapse to a point = quantize), larger =
      less deblur.  alpha = (K-1)/K is the transition retention. */
   float K;
-  if (deblur_steepness > 0.f)
-    K = deblur_steepness;
+  if (g_cfg->deblur_steepness > 0.f)
+    K = g_cfg->deblur_steepness;
   else
-    K = clampf(2.2f - 0.012f * (compress_strength - 1.f), 1.05f, 2.5f);
-  last_deblur_k = K;
+    K = clampf(2.2f - 0.012f * (g_cfg->compress_strength - 1.f), 1.05f, 2.5f);
+  g_cfg->last_deblur_k = K;
   float alpha = K <= 1.0001f ? 0.f : (K - 1.f) / K;
   fprintf(stderr,
           "autodeblur analytic K=%.3f (1=max/quantize, higher=less) "
@@ -2855,7 +2856,6 @@ static float probit01(float p) {
 /* v6: trust gate further widened .04/.30 (was .03/.10 then .04/.22);
    narrow gate zeroed many wide-blur fits (r=6) -> parameter ignoring.
    Wide blur needs higher hi to keep fits. */
-static float trust_lo = .03f, trust_hi = .10f; /* debug override: CDG=lo,hi */
 
 /* v4.9.6 dip/line-profile helper: the box(h)-gauss(sig) dip shape,
    normalized to 1 at the centre (p = |position - line centre|). */
@@ -3124,37 +3124,35 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
   {
     const char *cdg = getenv("CDG");
     if (cdg)
-      sscanf(cdg, "%f,%f", &trust_lo, &trust_hi);
+      sscanf(cdg, "%f,%f", &g_cfg->trust_lo, &g_cfg->trust_hi);
     /* forensics isolation knobs: CELUP_NOAMP=1 disables narrow-
        feature amplitude restoration, CELUP_NOTER=1 disables the
        terrace cleanup, CELUP_NOHULL=1 disables the hull clamp,
        CELUP_NOSPECKLE=1 disables adaptive speckle suppression. */
     if (getenv("CELUP_NOAMP"))
-      adb_noamp = 1;
+      g_cfg->adb_noamp = 1;
     if (getenv("CELUP_NOTER"))
-      adb_noter = 1;
+      g_cfg->adb_noter = 1;
     if (getenv("CELUP_NOHULL"))
-      adb_nohull = 1;
+      g_cfg->adb_nohull = 1;
     if (getenv("CELUP_NOSPECKLE"))
-      adb_nospeckle = 1;
+      g_cfg->adb_nospeckle = 1;
   }
   /* sref = ASSUMED source blur (window sizing, shading gate).  When the
      reconstruction sigma was decoupled (v4.9) the assumed value is kept
-     separately: fitted_sigma is then the (smaller) base-render sigma. */
-  float sref0 = adb_assumed_sigma > 0.f ? adb_assumed_sigma : fitted_sigma;
+     separately: g_cfg->fitted_sigma is then the (smaller) base-render sigma. */
+  float sref0 = g_cfg->adb_assumed_sigma > 0.f ? g_cfg->adb_assumed_sigma : g_cfg->fitted_sigma;
   float sref = sref0 > 1.f ? sref0 : 1.f;
   int wide = scale * sref > 4.001f;
   int R = wide ? clampi((int)(1.25f * scale * sref + .5f), 2, 64)
                : clampi((int)(1.25f * scale + .5f), 2, 12);
   int NS = 2 * R + 1; /* R <= 64 -> NS <= 129 */
-  float kbase = deblur_steepness > 0.f
-                    ? deblur_steepness
-                    : clampf(1.f + .25f * (compress_strength - 1.f), 1.f, 3.f);
-  last_deblur_k = deblur_steepness > 0.f   ? deblur_steepness
-                  : edge_goal > 0.f        ? 0.f
+  float kbase = g_cfg->deblur_steepness > 0.f
+                    ? g_cfg->deblur_steepness
+                    : clampf(1.f + .25f * (g_cfg->compress_strength - 1.f), 1.f, 3.f);
+  g_cfg->last_deblur_k = g_cfg->deblur_steepness > 0.f   ? g_cfg->deblur_steepness
+                  : g_cfg->edge_goal > 0.f        ? 0.f
                                            : kbase;
-  adb_keff_sum = adb_keff_w = 0.0;
-  adb_keff_max = 0.f;
   /* Shading close-gate on the fitted ramp sigma s (output px):
      transitions far wider than a fitted-blur ramp are content softness.
      Smooth LINEAR shading is inert regardless -- its fitted mu is ~0
@@ -3543,8 +3541,8 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                  parameters" lie: summary echoed 64 while the cap
                  silently rendered ~7). */
               float k = kbase;
-              if (deblur_steepness <= 0.f && edge_goal > 0.f) {
-                float st = fmaxf(.6f, edge_goal * scale / 2.5f);
+              if (g_cfg->deblur_steepness <= 0.f && g_cfg->edge_goal > 0.f) {
+                float st = fmaxf(.6f, g_cfg->edge_goal * scale / 2.5f);
                 k = clampf(s / st, 1.f, 16.f);
               }
               k = fminf(k, s / .32f);
@@ -3579,7 +3577,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                    (line interiors move to the restored plateau) and
                    the effective step amplitude below, and the hull is
                    extended by exactly the corrected plateau. */
-                if (!adb_noamp && coh > .2f)
+                if (!g_cfg->adb_noamp && coh > .2f)
                   for (int side = 0; side < 2; side++) {
                     double iM = 0., oL = 0., oN = 0.;
                     int nb = side == 0 ? li - 1 : li + 1;
@@ -3688,7 +3686,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                         continue;
                     }
                     float wsrc = fabsf(mus[li] - mus[nb]) / scale;
-                    double sig = fitted_sigma > .3f ? fitted_sigma : .3;
+                    double sig = g_cfg->fitted_sigma > .3f ? g_cfg->fitted_sigma : .3;
                     double att =
                         erf((double)wsrc / (2.8284271 * sig));
                     /* junction/tip windows misread the flank geometry,
@@ -3774,7 +3772,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                     /* never extrapolate past the colours the SOURCE
                        itself proves (premultiplied-linear range) */
                     if (c < 3)
-                      Pc[c] = clampf(Pc[c], adb_srclo[c], adb_srchi[c]);
+                      Pc[c] = clampf(Pc[c], g_cfg->adb_srclo[c], g_cfg->adb_srchi[c]);
                     else
                       Pc[c] = clampf(Pc[c], 0.f, 1.f);
                     offv[c] = Pc[c] - Pin[c];
@@ -3963,8 +3961,8 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 /* compress2x2: use the same k_ana steepening as 019fbf78.
                    K maps steepness: K<=1 -> quantize, K>1 -> soften. */
                 float k_ana = k;
-                if (deblur_steepness > 0.f) {
-                  float K = deblur_steepness;
+                if (g_cfg->deblur_steepness > 0.f) {
+                  float K = g_cfg->deblur_steepness;
                   if (K <= 1.0001f)
                     k_ana = 1e5f;
                   else
@@ -4025,7 +4023,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                      nothing to steepen or restore there.  Relax the
                      gate for exactly this class (the multi-crossing
                      and coh gates still apply below). */
-                  float tl = trust_lo, thh = trust_hi;
+                  float tl = g_cfg->trust_lo, thh = g_cfg->trust_hi;
                   if (li > 0 || li + 1 < NL) {
                     tl *= 2.5f;
                     thh *= 2.5f;
@@ -4082,7 +4080,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                         x, y, NL, jl[li], jr[li], dl, dr, W, mu, s, k,
                         z0, ufit0, nu, wS, ed > 1e-9 ? sqrt(en / ed) : -1.,
                         Ld2, coh, Teff, ab_a, ab_c, ab_b, sp_dbg, off0r, off1r,
-                        adb_noamp ? -9 : (int)0);
+                        g_cfg->adb_noamp ? -9 : (int)0);
               }
             }
           }
@@ -4351,20 +4349,14 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                          geometry it destroyed (k -> 1 there = rounded
                          tips); on straight shaded ramps (its target)
                          mu_std reads < .35 and it never engaged. */
-        if (deblur_steepness <= 0.f && edge_goal > 0.f) {
-          float st = fmaxf(.6f, edge_goal * scale / 2.5f);
+        if (g_cfg->deblur_steepness <= 0.f && g_cfg->edge_goal > 0.f) {
+          float st = fmaxf(.6f, g_cfg->edge_goal * scale / 2.5f);
           k = clampf(s / st, 1.f, 16.f);
         }
         k = fminf(k, s / .32f);
         /* v4.9.3 effective-k bookkeeping (the report used to echo the
            REQUESTED steepness even when the sawtooth cap replaced it
            almost everywhere -- "ignoring parameters"). */
-        if (w > 1e-3f) {
-          adb_keff_sum += (double)k * w;
-          adb_keff_w += (double)w;
-          if (k > adb_keff_max)
-            adb_keff_max = k;
-        }
         /* Anchored evaluation (v4.8) on the consensus fit. */
         float z0 = (0.f - mu) / s;
         float ufit0 = phi1(z0), nu;
@@ -4496,7 +4488,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
            lands on the next stroke's ramp: no same-side saturation),
            and dark interiors are untouched (core depth is the
            restoration terms' job). */
-        float wpeel = 0.f, atap[4] = {0, 0, 0, 0}, lvlT = 0.f;
+        float wpeel = 0.f, atap[4] = {0, 0, 0, 0};
 #ifndef CELUP_NOPEEL_ENV
         {
           static int nopeel = -1;
@@ -4572,7 +4564,6 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 best = 1.05f * Ld;
               for (int c = 0; c < 4; c++)
                 atap[c] = o[c] + best * d2[c] / Ld;
-              lvlT = best;
               wpeel = w * sat * okm;
             }
           }
@@ -4598,9 +4589,9 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
               continue;
             if (c < 3) {
               float lo = clampf(to_linear[LOH[8 * idx + c]] + dlo,
-                                adb_srclo[c], adb_srchi[c]),
+                                g_cfg->adb_srclo[c], g_cfg->adb_srchi[c]),
                     hi = clampf(to_linear[LOH[8 * idx + 4 + c]] + dhi,
-                                adb_srclo[c], adb_srchi[c]);
+                                g_cfg->adb_srclo[c], g_cfg->adb_srchi[c]);
               int lv = to_srgb[clampi((int)(clampf(lo, 0.f, 1.f) *
                                             4096.f),
                                       0, 4096)] -
@@ -4696,7 +4687,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
               dot += (q_bil[c] - p_colors[ai][c]) * (p_colors[bi][c] - p_colors[ai][c]);
             float t_val = clampf(dot / best_dist, 0.f, 1.f);
             float u_val = 0.f;
-            float K = deblur_steepness > 0.f ? deblur_steepness : (k > 1.0001f ? 1.f + 3.6f / (k - 1.f) : 1e6f);
+            float K = g_cfg->deblur_steepness > 0.f ? g_cfg->deblur_steepness : (k > 1.0001f ? 1.f + 3.6f / (k - 1.f) : 1e6f);
             if (K < 1.f) K = 1.f;
             if (K <= 1.0001f) {
               if (t_val < 0.5f) u_val = 0.f;
@@ -4726,15 +4717,15 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           zno = noz;
         }
         for (int c = 0; c < 4; c++) {
-          float blo = adb_nohull ? 0.f : (c < 3 ? to_linear[LOH[8 * idx + c]]
+          float blo = g_cfg->adb_nohull ? 0.f : (c < 3 ? to_linear[LOH[8 * idx + c]]
                             : LOH[8 * idx + c] * (1.f / 255.f)),
-              bhi = adb_nohull ? 1.f : (c < 3 ? to_linear[LOH[8 * idx + 4 + c]]
+              bhi = g_cfg->adb_nohull ? 1.f : (c < 3 ? to_linear[LOH[8 * idx + 4 + c]]
                             : LOH[8 * idx + 4 + c] * (1.f / 255.f));
           /* v4.9.4 soft hull: expand by deblur confidence w and qconf gate. */
           {
-            float hexpand = w * adb_qconf * .55f;
-            float slo = c < 3 ? adb_srclo[c] : 0.f,
-                  shi = c < 3 ? adb_srchi[c] : 1.f;
+            float hexpand = w * g_cfg->adb_qconf * .55f;
+            float slo = c < 3 ? g_cfg->adb_srclo[c] : 0.f,
+                  shi = c < 3 ? g_cfg->adb_srchi[c] : 1.f;
             blo -= hexpand * fmaxf(blo - slo, 0.f);
             bhi += hexpand * fmaxf(shi - bhi, 0.f);
           }
@@ -4807,7 +4798,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
              colour; steepen in z-space: mm = Phi(zg * Phi^-1(m)). */
           float num = 0.f, den = 0.f, calh = 0.f;
           for (int c = 0; c < 3; c++) {
-            float Aq = vbhi[c] - vblo[c], rq = adb_srchi[c] - adb_srclo[c];
+            float Aq = vbhi[c] - vblo[c], rq = g_cfg->adb_srchi[c] - g_cfg->adb_srclo[c];
             num += (vv[c] - vblo[c]) * Aq;
             den += Aq * Aq;
             calh += rq * rq;
@@ -4871,7 +4862,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                verbatim (the -l 0.5 crisp probe: hide the treads and
                the staircase detector goes toothless), so the
                completion fades out there. */
-            float qq = ss01((adb_qconf - .60f) * (1.f / .30f)) *
+            float qq = ss01((g_cfg->adb_qconf - .60f) * (1.f / .30f)) *
                        ss01((sref - 1.2f) * (1.f / .8f));
             /* huge local hull span = a true step lives here, not a
                smooth-gradient fragment (skin/hair shading spans far
@@ -4893,7 +4884,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                  admission floor), so extend to the extremes outright
                  whenever the step-span gate fires at all. */
             float rmp = ss01((alh - .22f * calh) * (1.f / .45f)) *
-                        ss01((adb_qconf - .5f) * (1.f / .3f));
+                        ss01((g_cfg->adb_qconf - .5f) * (1.f / .3f));
             /* v4.9.9 washed-core full extension ("remove the highest
                caps"): the model claims this pixel sits DEEP on a
                plateau (|z0| > 2.2) yet the finished colour still
@@ -4968,8 +4959,8 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
             }
             float elo3[3], ehi3[3];
             for (int c = 0; c < 3; c++) {
-              elo3[c] = vblo[c] + rcp * (adb_srclo[c] - vblo[c]);
-              ehi3[c] = vbhi[c] + rcp * (adb_srchi[c] - vbhi[c]);
+              elo3[c] = vblo[c] + rcp * (g_cfg->adb_srclo[c] - vblo[c]);
+              ehi3[c] = vbhi[c] + rcp * (g_cfg->adb_srchi[c] - vbhi[c]);
             }
             /* v4.9.9 evidence broadening: inside deep wash the erf
                trust w is ~0 BY CONSTRUCTION (the wash is what the erf
@@ -5045,8 +5036,8 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           ZM[idx] = zmw;
           if (zrmp > 1e-3f)
             for (int c = 0; c < 3; c++) {
-              float elo = vblo[c] + zrmp * (adb_srclo[c] - vblo[c]),
-                    ehi = vbhi[c] + zrmp * (adb_srchi[c] - vbhi[c]);
+              float elo = vblo[c] + zrmp * (g_cfg->adb_srclo[c] - vblo[c]),
+                    ehi = vbhi[c] + zrmp * (g_cfg->adb_srchi[c] - vbhi[c]);
               int lv = to_srgb[clampi((int)(clampf(elo, 0.f, 1.f) *
                                             4096.f),
                                       0, 4096)] -
@@ -5092,7 +5083,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                     ? sqrtf(aVX / aWL * (aVX / aWL) +
                             aVY / aWL * (aVY / aWL))
                     : 0.f;
-            fprintf(wm, "%d %d %.5f %.5f %.5f %.5f %.5f %.4f %.4f\n",
+            fprintf(wm, "%d %d %.5f %.5f %.5f %.5f %.4f %.4f\n",
                     x, y, w, w2v, nu, ufit0, wpeel, pabs_d);
           }
         }
@@ -5149,7 +5140,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
          = qconf * wS so unfitted texture/flats stay verbatim, and the
          hull clamp below still bounds the result. */
       float navg[4] = {0, 0, 0, 0}, qn = 0.f;
-      if (!adb_noter && adb_qconf > 1e-3f && pf[0] > 1e-3f && wsum > 1e-6f) {
+      if (!g_cfg->adb_noter && g_cfg->adb_qconf > 1e-3f && pf[0] > 1e-3f && wsum > 1e-6f) {
         /* Skirt gate: terraces live on the ramp skirts (between the
            quant steps); near the contour core (|z0| < ~1) smoothing
            along the normal would bleed the corrected stroke colour
@@ -5169,7 +5160,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           tw2 += nk[no + 2];
         }
         float inv = tw2 > 1e-6f ? 1.f / tw2 : 0.f;
-        qn = adb_qconf * pf[0] * skirt * .7f *
+        qn = g_cfg->adb_qconf * pf[0] * skirt * .7f *
              (1.f - ss01((ZM[idx] - .05f) * (1.f / .25f)));
         for (int c = 0; c < 4; c++)
           navg[c] = qn * (navg[c] * inv - A[4 * idx + c]);
@@ -5190,15 +5181,15 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
            evaluation, but the smoothed delta can still leave the hull
            by transport.  No output may leave the locally observed
            colour range -- enforced here by construction. */
-        float blo = adb_nohull ? 0.f : (c < 3 ? to_linear[LOH[8 * idx + c]]
+        float blo = g_cfg->adb_nohull ? 0.f : (c < 3 ? to_linear[LOH[8 * idx + c]]
                           : LOH[8 * idx + c] * (1.f / 255.f)),
-              bhi = adb_nohull ? 1.f : (c < 3 ? to_linear[LOH[8 * idx + 4 + c]]
+              bhi = g_cfg->adb_nohull ? 1.f : (c < 3 ? to_linear[LOH[8 * idx + 4 + c]]
                           : LOH[8 * idx + 4 + c] * (1.f / 255.f));
         /* v4.9.4 soft hull: expand by deblur confidence pf[0] and qconf gate. */
         {
-          float hexpand = fmaxf(pf[0], 0.f) * adb_qconf * .55f;
-          float slo = c < 3 ? adb_srclo[c] : 0.f,
-                shi = c < 3 ? adb_srchi[c] : 1.f;
+          float hexpand = fmaxf(pf[0], 0.f) * g_cfg->adb_qconf * .55f;
+          float slo = c < 3 ? g_cfg->adb_srclo[c] : 0.f,
+                shi = c < 3 ? g_cfg->adb_srchi[c] : 1.f;
           blo -= hexpand * fmaxf(blo - slo, 0.f);
           bhi += hexpand * fmaxf(shi - bhi, 0.f);
         }
@@ -5391,7 +5382,7 @@ static int autodeblur_gradient_pass(uint8_t *out, int dw, int dh, float scale) {
   /* The assumed blur sizes the trace length so it spans a whole lobe end to
      end (global), not a fixed 2x2/6x6 tap.  Capped; early termination keeps
      crisp ramps and flats cheap. */
-  float sref0 = adb_assumed_sigma > 0.f ? adb_assumed_sigma : fitted_sigma;
+  float sref0 = g_cfg->adb_assumed_sigma > 0.f ? g_cfg->adb_assumed_sigma : g_cfg->fitted_sigma;
   float sref = sref0 > 1.f ? sref0 : 1.f;
   int maxR = clampi((int)(3.5f * scale * sref + 6.f), 8, 64);
   const float moveThresh = 1.0e-3f; /* per-step plateau detection threshold */
@@ -5487,11 +5478,11 @@ static int autodeblur_gradient_pass(uint8_t *out, int dw, int dh, float scale) {
      K semantics: 0 = auto, 1 = max (collapse to a point = quantize), larger =
      less deblur.  alpha = (K-1)/K is the transition retention. */
   float K;
-  if (deblur_steepness > 0.f)
-    K = deblur_steepness;
+  if (g_cfg->deblur_steepness > 0.f)
+    K = g_cfg->deblur_steepness;
   else
-    K = clampf(2.2f - 0.012f * (compress_strength - 1.f), 1.05f, 2.5f);
-  last_deblur_k = K;
+    K = clampf(2.2f - 0.012f * (g_cfg->compress_strength - 1.f), 1.05f, 2.5f);
+  g_cfg->last_deblur_k = K;
   float alpha = K <= 1.0001f ? 0.f : (K - 1.f) / K;
   fprintf(stderr,
           "autodeblur analytic K=%.3f (1=max/quantize, higher=less) "
@@ -5619,8 +5610,8 @@ static int autodeblur_analog(uint8_t *out, int dw, int dh) {
     }
   /* 4. deblur value: v = -g; q = 1/v; g = 1/(1-q).  v=1 is the max push. */
   float qv;
-  if (deblur_steepness > 0.f)
-    qv = 1.f / deblur_steepness; /* -g 1 -> max, higher -> weaker */
+  if (g_cfg->deblur_steepness > 0.f)
+    qv = 1.f / g_cfg->deblur_steepness; /* -g 1 -> max, higher -> weaker */
   else
     qv = 0.85f; /* auto: a strong-but-not-quantising default */
   if (qv > 0.99999f)
@@ -5628,7 +5619,7 @@ static int autodeblur_analog(uint8_t *out, int dw, int dh) {
   if (qv < 0.f)
     qv = 0.f;
   float g = 1.f / (1.f - qv);
-  last_deblur_k = deblur_steepness > 0.f ? deblur_steepness : -1.f;
+  g_cfg->last_deblur_k = g_cfg->deblur_steepness > 0.f ? g_cfg->deblur_steepness : -1.f;
   /* 5. re-render from the edited gradient. */
   for (int y = 0; y < dh; y++)
     for (int x = 0; x < dw; x++) {
@@ -5684,31 +5675,31 @@ static float estimate_qconf(const uint8_t *in, int sw, int sh) {
 static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
                               int dw, int dh) {
   /* v4.9.1: the v4.9 base-sigma decouple is REVERTED. */
-  adb_sigma_div = 0.f;
-  adb_assumed_sigma = 0.f;
-  adb_qconf = estimate_qconf(in, sw, sh);
-  if (adb_qconf > 1e-3f)
+  g_cfg->adb_sigma_div = 0.f;
+  g_cfg->adb_assumed_sigma = 0.f;
+  g_cfg->adb_qconf = estimate_qconf(in, sw, sh);
+  if (g_cfg->adb_qconf > 1e-3f)
     fprintf(stderr,
             "source quantization: qconf=%.2f (hard-quantized; terrace "
             "smoothing engaged on trusted ramps)\n",
-            adb_qconf);
+            g_cfg->adb_qconf);
   for (int c = 0; c < 3; c++) {
-    adb_srclo[c] = 1e30f;
-    adb_srchi[c] = -1e30f;
+    g_cfg->adb_srclo[c] = 1e30f;
+    g_cfg->adb_srchi[c] = -1e30f;
   }
   for (long k = 0; k < (long)sw * sh; k++) {
     float q[4];
     raw_pm(in, sw, sh, (int)(k % sw), (int)(k / sw), q);
     for (int c = 0; c < 3; c++) {
-      if (q[c] < adb_srclo[c])
-        adb_srclo[c] = q[c];
-      if (q[c] > adb_srchi[c])
-        adb_srchi[c] = q[c];
+      if (q[c] < g_cfg->adb_srclo[c])
+        g_cfg->adb_srclo[c] = q[c];
+      if (q[c] > g_cfg->adb_srchi[c])
+        g_cfg->adb_srchi[c] = q[c];
     }
   }
   if (!upscale_autoblur(in, sw, sh, out, dw, dh))
     return 0;
-  int method = deblur_method;
+  int method = g_cfg->deblur_method;
   if (method)
     fprintf(stderr, "autodeblur method %s (manual)\n",
             method == 1 ? "remap" : method == 2 ? "push" : method == 3 ? "analytical" : method == 4 ? "gradient" : method == 5 ? "compress2x2" : "?");
@@ -5725,8 +5716,8 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
       if (train && recon)
         for (int m = 1; m <= 5; m++) {
           if (m == 3 || m == 4) continue; /* separate functions */
-          if (!render_soft(train, tw, th, recon, sw, sh, fitted_kernel,
-                           fitted_sigma, fitted_curve, fitted_cp))
+          if (!render_soft(train, tw, th, recon, sw, sh, g_cfg->fitted_kernel,
+                           g_cfg->fitted_sigma, g_cfg->fitted_curve, g_cfg->fitted_cp))
             continue;
           if (!autodeblur_pass(recon, sw, sh, (float)sw / tw, m, train, tw, th))
             continue;
@@ -5744,7 +5735,7 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
               method == 1 ? "remap" : method == 2 ? "push" : method == 5 ? "compress2x2" : "?");
     }
   }
-  last_deblur_method = method;
+  g_cfg->last_deblur_method = method;
   if (method == 3)
     return autodeblur_analog(out, dw, dh);
   if (method == 4)
@@ -5970,7 +5961,7 @@ static int upscale_sdf(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
     }
   }
   float tt_dbg = 0.f, tb_dbg = 0.f, ax_dbg = 0.f;
-  float wfac = 1.f - .12f * compress_strength;
+  float wfac = 1.f - .12f * g_cfg->compress_strength;
   wfac = clampf(wfac, .45f, 1.f);
   float yscale = (float)sh / dh, xscale = (float)sw / dw;
   size_t nout = (size_t)dw * dh;
@@ -6304,7 +6295,6 @@ static float j2b_resampler(float x, float wa, float wb) {
    snapping each output pixel onto the nearest source colour, re-quantising
    the edge to the output lattice; lowering STR toward ~0.1-0.3 (and, if
    needed, WB toward ~0.80) smooths the contour out. */
-static float j2b_wa = .50f, j2b_wb = .88f, j2b_str = 1.0f, j2b_ar = 1.0f;
 
 /* Parameterised jinc2 render so the auto-tuner can sweep explicit values. */
 static void jinc2_render(const uint8_t *in, int sw, int sh, uint8_t *out,
@@ -6373,7 +6363,7 @@ static void jinc2_render(const uint8_t *in, int sw, int sh, uint8_t *out,
 /* Wrapper: resolves the global/env parameter values then renders. */
 static void upscale_jinc2_bilateral(const uint8_t *in, int sw, int sh,
                                     uint8_t *out, int dw, int dh) {
-  float WA = j2b_wa, WB = j2b_wb, STR = j2b_str, AR = j2b_ar;
+  float WA = g_cfg->j2b_wa, WB = g_cfg->j2b_wb, STR = g_cfg->j2b_str, AR = g_cfg->j2b_ar;
   {
     const char *e = getenv("CELUP_J2B_WA");
     if (e)
@@ -6460,8 +6450,8 @@ static void auto_tune_j2b(const uint8_t *in, int sw, int sh) {
   float hard = j2b_hardness(in, sw, sh);
   for (int i = 0; i < NW; i++)
     for (int j = 0; j < NS; j++) {
-      jinc2_render(train, tw, th, recon, sw, sh, j2b_wa, WBs[i], STRs[j],
-                   j2b_ar);
+      jinc2_render(train, tw, th, recon, sw, sh, g_cfg->j2b_wa, WBs[i], STRs[j],
+                   g_cfg->j2b_ar);
       double mse = image_pm_mse(recon, in, sw, sh, 2);
       double score = mse * (1. + 2.5 * hard * STRs[j]);
       scores[i][j] = score;
@@ -6489,12 +6479,12 @@ static void auto_tune_j2b(const uint8_t *in, int sw, int sh) {
           bs = j;
         }
       }
-  j2b_wb = WBs[bw];
-  j2b_str = STRs[bs];
+  g_cfg->j2b_wb = WBs[bw];
+  g_cfg->j2b_str = STRs[bs];
   fprintf(stderr,
           "jinc2_auto selected WB=%.2f STR=%.2f (hardness %.2f; score %.8g "
           "MSE %.8g)\n",
-          j2b_wb, j2b_str, hard, best,
+          g_cfg->j2b_wb, g_cfg->j2b_str, hard, best,
           best / (1. + 2.5 * hard * STRs[best_s]));
   free(train);
   free(recon);
@@ -6830,7 +6820,7 @@ static void hr_box_unsharp(float *hr, float *tmp, int dw, int dh, float amount,
                            const class_map_t *cm, int sw, int sh) {
   if (amount <= 0.f)
     return;
-  int rad = clampi((int)(blur_radius + 1.5f), 1, 3);
+  int rad = clampi((int)(g_cfg->blur_radius + 1.5f), 1, 3);
   for (int y = 0; y < dh; y++)
     for (int x = 0; x < dw; x++) {
       float *q = tmp + 4 * ((size_t)y * dw + x);
@@ -7221,9 +7211,9 @@ static int upscale_deconv(const uint8_t *in, int sw, int sh, uint8_t *out,
     free(hr);
     return 0;
   }
-  int iters = clampi((int)(8.f + 2.f * compress_strength + 1.5f * blur_radius),
+  int iters = clampi((int)(8.f + 2.f * g_cfg->compress_strength + 1.5f * g_cfg->blur_radius),
                      8, 48);
-  float sharp = clampf((compress_strength - 1.f) * 0.012f, 0.f, 0.45f);
+  float sharp = clampf((g_cfg->compress_strength - 1.f) * 0.012f, 0.f, 0.45f);
   int ok = refine_downsample_consistency(hr, in, sw, sh, dw, dh, iters, .64f,
                                          sharp, &cm);
   if (ok) {
@@ -7376,10 +7366,12 @@ static int upscale_dehourglass(const uint8_t *in, int sw, int sh, uint8_t *out,
     {
       for (int y=0; y<dh; y++) {
         int cy = (int)((y + 0.5f) * (float)sh / dh);
-        if (cy<0) cy=0; if (cy>=sh) cy=sh-1;
+        if (cy < 0) cy = 0;
+        if (cy >= sh) cy = sh - 1;
         for (int x=0; x<dw; x++) {
           int cx = (int)((x + 0.5f) * (float)sw / dw);
-          if (cx<0) cx=0; if (cx>=sw) cx=sw-1;
+          if (cx < 0) cx = 0;
+          if (cx >= sw) cx = sw - 1;
           size_t k = (size_t)cy * sw + cx;
           float wc = cm.w_checker[k];
           if (wc > 0.35f) {
@@ -7500,7 +7492,7 @@ static int auto_tune_blurcompress_params(const uint8_t *in, int sw, int sh,
                                 1.0f, 1.4f, 2.0f, 2.8f, 4.0f};
   static const float strengths[] = {1.0f, 1.25f, 1.6f, 2.0f, 2.6f,
                                     3.5f, 5.0f, 7.5f, 11.0f, 16.0f};
-  float old_radius = blur_radius, old_strength = compress_strength;
+  float old_radius = g_cfg->blur_radius, old_strength = g_cfg->compress_strength;
   float best_radius = old_radius, best_strength = old_strength;
   double best = 1e300;
   for (size_t r = 0; r < sizeof radii / sizeof radii[0]; r++)
@@ -7509,8 +7501,8 @@ static int auto_tune_blurcompress_params(const uint8_t *in, int sw, int sh,
           !((r == 2 || r == 4 || r == 5 || r == 6) &&
             (s == 2 || s == 3 || s == 4 || s == 5 || s == 6)))
         continue;
-      blur_radius = radii[r];
-      compress_strength = strengths[s];
+      g_cfg->blur_radius = radii[r];
+      g_cfg->compress_strength = strengths[s];
       int ok = 1;
       if (auto_mode == 2)
         ok = upscale_deblurcompress(train, tw, th, recon, sw, sh);
@@ -7521,19 +7513,19 @@ static int auto_tune_blurcompress_params(const uint8_t *in, int sw, int sh,
       double score = ok ? image_pm_mse(recon, in, sw, sh, 2) : 1e300;
       if (score < best) {
         best = score;
-        best_radius = blur_radius;
-        best_strength = compress_strength;
+        best_radius = g_cfg->blur_radius;
+        best_strength = g_cfg->compress_strength;
       }
     }
 
-  blur_radius = best_radius;
-  compress_strength = best_strength;
+  g_cfg->blur_radius = best_radius;
+  g_cfg->compress_strength = best_strength;
   free(train);
   free(recon);
   fprintf(stderr,
           "Auto selected blur-radius=%.2f strength=%.2f "
           "(validation MSE %.8g).\n",
-          blur_radius, compress_strength, best);
+          g_cfg->blur_radius, g_cfg->compress_strength, best);
   (void)old_radius;
   (void)old_strength;
   return best < 1e299;
@@ -7608,7 +7600,7 @@ static void upscale_triangle(const uint8_t *in, int sw, int sh, uint8_t *out,
 static void upscale_smooth(const uint8_t *in, int sw, int sh, uint8_t *out,
                            int dw, int dh) {
   float spread = 1.f;
-  if (blur_radius_set) spread = clampf(blur_radius, 0.5f, 3.5f);
+  if (g_cfg->blur_radius_set) spread = clampf(g_cfg->blur_radius, 0.5f, 3.5f);
   int SS;
   if (spread <= 0.8f) SS = 2;
   else if (spread <= 1.3f) SS = 4;
@@ -7738,7 +7730,6 @@ static int upscale(const uint8_t *in, int sw, int sh, uint8_t *out, int dw,
       alpha brighter than every neighbour by > 3x + 24 and no neighbour
       reaching half its alpha.  Genuine dots/sparkles are >= 2 px and
       always have a comparable-alpha neighbour, so they survive. */
-static float alpha_clean_floor = 10.f;
 static void alpha_despeckle(uint8_t *px, int w, int h, int floor_) {
   size_t n = (size_t)w * h;
   for (size_t k = 0; k < n; k++)
@@ -7911,10 +7902,6 @@ static void print_help(const char *argv0) {
       "                            compress2x2 = bilinear 2x2 block\n"
       "                            projection (best on photos, blurry\n"
       "                            corners on pixel art)\n"
-      "  -T, --texgain G           autodeblur lattice-texture crispening\n"
-      "                            FLOAT 0..1 (default 0=off).  Hull-clamped\n"
-      "                            crispening applied only where the 1D step\n"
-      "                            model abstained (AUTODEBLUR_NOTES queue #1).\n"
       "  -g, --deblur-steepness K  autodeblur slope multiplier FLOAT 1..64\n"
       "                            (default 0=auto); overrides -s and -e\n"
       "                            per-edge adaptation; anchored evaluation\n"
@@ -8061,6 +8048,24 @@ static int upscale_hybrid(const uint8_t *in, int sw, int sh, uint8_t *out,
   }
 }
 int main(int ac, char **av) {
+  celup_config cfg_storage = {
+    .compress_strength = 2.f, .blur_radius = 1.f, .edge_goal = 0.f,
+    .deblur_steepness = 0.f, .blur_radius_set = 0, .auto_blurcompress = 0,
+    .checker_policy = POLICY_LOWPASS, .adaptive_debug = 0,
+    .blur_kernel_kind = BK_AUTO, .blur_curve_kind = CK_AUTO,
+    .deblur_method = 0, .max_mib = 512.f,
+    .j2b_wa = .50f, .j2b_wb = .88f, .j2b_str = 1.0f, .j2b_ar = 1.0f,
+    .alpha_clean_floor = 10.f,
+    .fitted_kernel = BK_GAUSSIAN, .fitted_curve = CK_LINEAR,
+    .fitted_sigma = .75f, .fitted_cp = 0.f,
+    .adb_sigma_div = 0.f, .adb_assumed_sigma = 0.f, .adb_qconf = 0.f,
+    .adb_noamp = 0, .adb_noter = 0, .adb_nohull = 0, .adb_nospeckle = 0,
+    .adb_srclo = {0.f, 0.f, 0.f}, .adb_srchi = {1.f, 1.f, 1.f},
+    .trust_lo = .03f, .trust_hi = .10f,
+    .last_deblur_method = 0, .last_deblur_k = 0.f,
+  };
+  g_cfg = &cfg_storage;
+
   const char *mode = "cubic";
   int mode_explicit = 0;
   for (int i = 1; i < ac; i++)
@@ -8077,7 +8082,7 @@ int main(int ac, char **av) {
   for (int i = 4; i < ac;) {
     if (!strcmp(av[i], "--auto-blurcompress") ||
         !strcmp(av[i], "--auto-tune") || !strcmp(av[i], "-a")) {
-      auto_blurcompress = 1;
+      g_cfg->auto_blurcompress = 1;
       if (!mode_explicit)
         mode = "deblurcompress";
       i++;
@@ -8093,53 +8098,53 @@ int main(int ac, char **av) {
     }
     else if (!strcmp(av[i], "--strength") || !strcmp(av[i], "-s")) {
       char *e;
-      compress_strength = strtof(av[i + 1], &e);
-      if (*e || compress_strength < 1.f || compress_strength > 100.f) {
+      g_cfg->compress_strength = strtof(av[i + 1], &e);
+      if (*e || g_cfg->compress_strength < 1.f || g_cfg->compress_strength > 100.f) {
         fprintf(stderr, "Strength must be in [1,100]\n");
         return 2;
       }
     } else if (!strcmp(av[i], "--blur-radius") || !strcmp(av[i], "-r")) {
       char *e;
-      blur_radius = strtof(av[i + 1], &e);
-      if (*e || blur_radius < .1f || blur_radius > 40.f) {
+      g_cfg->blur_radius = strtof(av[i + 1], &e);
+      if (*e || g_cfg->blur_radius < .1f || g_cfg->blur_radius > 40.f) {
         fprintf(stderr, "Blur radius must be in [.1,40]\n");
         return 2;
       }
-      blur_radius_set = 1;
+      g_cfg->blur_radius_set = 1;
     } else if (!strcmp(av[i], "--blur-kernel") || !strcmp(av[i], "-k")) {
       if (!strcmp(av[i + 1], "box"))
-        blur_kernel_kind = BK_BOX;
+        g_cfg->blur_kernel_kind = BK_BOX;
       else if (!strcmp(av[i + 1], "triangle"))
-        blur_kernel_kind = BK_TRIANGLE;
+        g_cfg->blur_kernel_kind = BK_TRIANGLE;
       else if (!strcmp(av[i + 1], "gaussian"))
-        blur_kernel_kind = BK_GAUSSIAN;
+        g_cfg->blur_kernel_kind = BK_GAUSSIAN;
       else if (!strcmp(av[i + 1], "bspline"))
-        blur_kernel_kind = BK_BSPLINE;
+        g_cfg->blur_kernel_kind = BK_BSPLINE;
       else if (!strcmp(av[i + 1], "auto"))
-        blur_kernel_kind = BK_AUTO;
+        g_cfg->blur_kernel_kind = BK_AUTO;
       else {
         fprintf(stderr, "Unknown blur kernel: %s\n", av[i + 1]);
         return 2;
       }
     } else if (!strcmp(av[i], "--blur-curve") || !strcmp(av[i], "-c")) {
       if (!strcmp(av[i + 1], "linear"))
-        blur_curve_kind = CK_LINEAR;
+        g_cfg->blur_curve_kind = CK_LINEAR;
       else if (!strcmp(av[i + 1], "sigmoid"))
-        blur_curve_kind = CK_SIGMOID;
+        g_cfg->blur_curve_kind = CK_SIGMOID;
       else if (!strcmp(av[i + 1], "cubic"))
-        blur_curve_kind = CK_CUBIC;
+        g_cfg->blur_curve_kind = CK_CUBIC;
       else if (!strcmp(av[i + 1], "exp"))
-        blur_curve_kind = CK_EXP;
+        g_cfg->blur_curve_kind = CK_EXP;
       else if (!strcmp(av[i + 1], "log"))
-        blur_curve_kind = CK_LOG;
+        g_cfg->blur_curve_kind = CK_LOG;
       else if (!strcmp(av[i + 1], "sqrt"))
-        blur_curve_kind = CK_SQRT;
+        g_cfg->blur_curve_kind = CK_SQRT;
       else if (!strcmp(av[i + 1], "circle"))
-        blur_curve_kind = CK_CIRCLE;
+        g_cfg->blur_curve_kind = CK_CIRCLE;
       else if (!strcmp(av[i + 1], "nearest"))
-        blur_curve_kind = CK_NEAREST;
+        g_cfg->blur_curve_kind = CK_NEAREST;
       else if (!strcmp(av[i + 1], "auto"))
-        blur_curve_kind = CK_AUTO;
+        g_cfg->blur_curve_kind = CK_AUTO;
       else {
         fprintf(stderr, "Unknown blur curve: %s\n", av[i + 1]);
         return 2;
@@ -8153,65 +8158,65 @@ int main(int ac, char **av) {
       }
     } else if (!strcmp(av[i], "--checker-policy") || !strcmp(av[i], "-P")) {
       if (!strcmp(av[i + 1], "lowpass"))
-        checker_policy = POLICY_LOWPASS;
+        g_cfg->checker_policy = POLICY_LOWPASS;
       else if (!strcmp(av[i + 1], "bilinear"))
-        checker_policy = POLICY_BILINEAR;
+        g_cfg->checker_policy = POLICY_BILINEAR;
       else if (!strcmp(av[i + 1], "nearest"))
-        checker_policy = POLICY_NEAREST;
+        g_cfg->checker_policy = POLICY_NEAREST;
       else if (!strcmp(av[i + 1], "mitchell"))
-        checker_policy = POLICY_MITCHELL;
+        g_cfg->checker_policy = POLICY_MITCHELL;
       else if (!strcmp(av[i + 1], "scale2x"))
-        checker_policy = POLICY_SCALE2X;
+        g_cfg->checker_policy = POLICY_SCALE2X;
       else if (!strcmp(av[i + 1], "auto"))
-        checker_policy = POLICY_AUTO;
+        g_cfg->checker_policy = POLICY_AUTO;
       else {
         fprintf(stderr, "Unknown checker policy: %s\n", av[i + 1]);
         return 2;
       }
     } else if (!strcmp(av[i], "--adaptive-debug") || !strcmp(av[i], "-d")) {
       char *e;
-      adaptive_debug = (int)strtol(av[i + 1], &e, 10);
-      if (*e || adaptive_debug < 0 || adaptive_debug > 15) {
+      g_cfg->adaptive_debug = (int)strtol(av[i + 1], &e, 10);
+      if (*e || g_cfg->adaptive_debug < 0 || g_cfg->adaptive_debug > 15) {
         fprintf(stderr, "adaptive-debug must be in [0,15]\n");
         return 2;
       }
     } else if (!strcmp(av[i], "--alpha-clean") || !strcmp(av[i], "-A")) {
       char *e;
-      alpha_clean_floor = strtof(av[i + 1], &e);
-      if (*e || alpha_clean_floor < 0.f || alpha_clean_floor > 64.f) {
+      g_cfg->alpha_clean_floor = strtof(av[i + 1], &e);
+      if (*e || g_cfg->alpha_clean_floor < 0.f || g_cfg->alpha_clean_floor > 64.f) {
         fprintf(stderr, "alpha-clean must be in [0,64]\n");
         return 2;
       }
     } else if (!strcmp(av[i], "--edge-goal") || !strcmp(av[i], "-e")) {
       char *e;
-      edge_goal = strtof(av[i + 1], &e);
-      if (*e || edge_goal < 0.f || edge_goal > 8.f) {
+      g_cfg->edge_goal = strtof(av[i + 1], &e);
+      if (*e || g_cfg->edge_goal < 0.f || g_cfg->edge_goal > 8.f) {
         fprintf(stderr, "edge-goal must be in [0,8] (src px; 0=off)\n");
         return 2;
       }
     } else if (!strcmp(av[i], "--deblur-steepness") || !strcmp(av[i], "-g")) {
       char *e;
-      deblur_steepness = strtof(av[i + 1], &e);
-      if (*e || (deblur_steepness != 0.f &&
-                 (deblur_steepness < 1.f || deblur_steepness > 64.f))) {
+      g_cfg->deblur_steepness = strtof(av[i + 1], &e);
+      if (*e || (g_cfg->deblur_steepness != 0.f &&
+                 (g_cfg->deblur_steepness < 1.f || g_cfg->deblur_steepness > 64.f))) {
         fprintf(stderr,
                 "deblur-steepness must be 0 (auto) or in [1,64]\n");
         return 2;
       }
     } else if (!strcmp(av[i], "--deblur-method") || !strcmp(av[i], "-D")) {
       if (!strcmp(av[i + 1], "auto"))
-        deblur_method = 0;
+        g_cfg->deblur_method = 0;
       else if (!strcmp(av[i + 1], "remap") ||
                !strcmp(av[i + 1], "remake")) /* common typo of remap */
-        deblur_method = 1;
+        g_cfg->deblur_method = 1;
       else if (!strcmp(av[i + 1], "push"))
-        deblur_method = 2;
+        g_cfg->deblur_method = 2;
       else if (!strcmp(av[i + 1], "analytical"))
-        deblur_method = 3;
+        g_cfg->deblur_method = 3;
       else if (!strcmp(av[i + 1], "gradient"))
-        deblur_method = 4;
+        g_cfg->deblur_method = 4;
       else if (!strcmp(av[i + 1], "compress2x2"))
-        deblur_method = 5;
+        g_cfg->deblur_method = 5;
       else {
         fprintf(stderr, "Unknown deblur method: %s\n", av[i + 1]);
         return 2;
@@ -8225,17 +8230,17 @@ int main(int ac, char **av) {
         return 2;
       }
       if (!strcmp(av[i], "--j2b-wa"))
-        j2b_wa = v;
+        g_cfg->j2b_wa = v;
       else if (!strcmp(av[i], "--j2b-wb"))
-        j2b_wb = v;
+        g_cfg->j2b_wb = v;
       else if (!strcmp(av[i], "--j2b-str"))
-        j2b_str = v;
+        g_cfg->j2b_str = v;
       else
-        j2b_ar = v;
+        g_cfg->j2b_ar = v;
     } else if (!strcmp(av[i], "--max-mib") || !strcmp(av[i], "-M")) {
       char *e;
-      max_mib = strtof(av[i + 1], &e);
-      if (*e || max_mib < 32.f || max_mib > 65536.f) {
+      g_cfg->max_mib = strtof(av[i + 1], &e);
+      if (*e || g_cfg->max_mib < 32.f || g_cfg->max_mib > 65536.f) {
         fprintf(stderr, "max-mib must be in [32,65536]\n");
         return 2;
       }
@@ -8264,7 +8269,7 @@ int main(int ac, char **av) {
     fprintf(stderr, "Unknown mode: %s\n", mode);
     return 2;
   }
-  if (auto_blurcompress && strcmp(mode, "blurcompress") &&
+  if (g_cfg->auto_blurcompress && strcmp(mode, "blurcompress") &&
       strcmp(mode, "safeblurcompress") && strcmp(mode, "deblurcompress")) {
     fprintf(stderr,
             "--auto-blurcompress only applies to blurcompress, "
@@ -8291,7 +8296,7 @@ int main(int ac, char **av) {
     fprintf(stderr, "WebP decode failed\n");
     return 1;
   }
-  alpha_despeckle(in, w, h, (int)(alpha_clean_floor + .5f));
+  alpha_despeckle(in, w, h, (int)(g_cfg->alpha_clean_floor + .5f));
   int ow = (int)(w * scale + .5), oh = (int)(h * scale + .5);
   if (ow < 1 || oh < 1 || ow > 16384 || oh > 16384 ||
       (size_t)ow * oh > SIZE_MAX / 4) {
@@ -8315,8 +8320,8 @@ int main(int ac, char **av) {
                      !strcmp(mode, "sdf") || !strcmp(mode, "msdf") || !strcmp(mode, "dsdf");
     double in_bytes =
         (double)w * h * (classified ? 96.0 : (!strcmp(mode, "autoblur") ||
-                                        !strcmp(mode, "autodeblur") &&
-      strcmp(mode, "jinc2_bilateral") && strcmp(mode, "jinc2_auto")) ? 24.0
+                                        !strcmp(mode, "autodeblur")) &&
+      strcmp(mode, "jinc2_bilateral") && strcmp(mode, "jinc2_auto") ? 24.0
                                                                       : 4.0);
     double out_bytes =
         (double)ow * oh * (iterative          ? 36.0
@@ -8329,17 +8334,17 @@ int main(int ac, char **av) {
                                                        : 4.0);
     double estimated =
         (in_bytes + out_bytes + 32.0 * 1024 * 1024) / (1024.0 * 1024.0);
-    if (estimated > max_mib) {
+    if (estimated > g_cfg->max_mib) {
       fprintf(stderr,
               "Refusing %dx%d output: estimated peak %.0f MiB exceeds "
               "--max-mib %.0f MiB. Use a smaller scale, increase --max-mib "
               "only if RAM is available, or use a tiled output backend.\n",
-              ow, oh, estimated, max_mib);
+              ow, oh, estimated, g_cfg->max_mib);
       WebPFree(in);
       return 1;
     }
   }
-  if (auto_blurcompress &&
+  if (g_cfg->auto_blurcompress &&
       !auto_tune_blurcompress_params(
           in, w, h, !strcmp(mode, "deblurcompress")   ? 2
                     : !strcmp(mode, "safeblurcompress") ? 1
@@ -8460,24 +8465,24 @@ int main(int ac, char **av) {
   fclose(f);
   WebPFree(enc);
   printf("Done: %dx%d -> %dx%d, mode=%s, strength=%.2f, blur-radius=%.2f", w,
-         h, ow, oh, mode, compress_strength, blur_radius);
+         h, ow, oh, mode, g_cfg->compress_strength, g_cfg->blur_radius);
   if (!strcmp(mode, "adaptive")) {
     static const char *names[] = {"lowpass", "bilinear", "nearest",
                                   "mitchell", "scale2x", "auto"};
-    printf(", checker-policy=%s", names[checker_policy]);
-  } else if (!strcmp(mode, "autoblur") || !strcmp(mode, "autodeblur") &&
+    printf(", checker-policy=%s", names[g_cfg->checker_policy]);
+  } else if ((!strcmp(mode, "autoblur") || !strcmp(mode, "autodeblur")) &&
       strcmp(mode, "jinc2_bilateral") && strcmp(mode, "jinc2_auto")) {
     printf(", kernel=%s sigma=%.2f curve=%s param=%.2f",
-           kernel_name(fitted_kernel), fitted_sigma, curve_name(fitted_curve),
-           fitted_cp);
+           kernel_name(g_cfg->fitted_kernel), g_cfg->fitted_sigma, curve_name(g_cfg->fitted_curve),
+           g_cfg->fitted_cp);
     if (!strcmp(mode, "autodeblur") &&
       strcmp(mode, "jinc2_bilateral") && strcmp(mode, "jinc2_auto")) {
-      printf(", method=%s", last_deblur_method == 2 ? "push" : last_deblur_method == 3 ? "analytical" : last_deblur_method == 4 ? "gradient" : last_deblur_method == 5 ? "compress2x2" : "remap");
-      if (last_deblur_k > 0.f)
-        printf(", steepness=%.2f%s", last_deblur_k,
-               deblur_steepness > 0.f ? "(manual)" : "");
+      printf(", method=%s", g_cfg->last_deblur_method == 2 ? "push" : g_cfg->last_deblur_method == 3 ? "analytical" : g_cfg->last_deblur_method == 4 ? "gradient" : g_cfg->last_deblur_method == 5 ? "compress2x2" : "remap");
+      if (g_cfg->last_deblur_k > 0.f)
+        printf(", steepness=%.2f%s", g_cfg->last_deblur_k,
+               g_cfg->deblur_steepness > 0.f ? "(manual)" : "");
       else
-        printf(", steepness=adaptive(-e %.2f)", edge_goal);
+        printf(", steepness=adaptive(-e %.2f)", g_cfg->edge_goal);
     }
   }
   printf("\n");
