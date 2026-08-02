@@ -23,6 +23,8 @@
 #include <string.h>
 #include <webp/decode.h>
 #include <webp/encode.h>
+#include "celup_lab_xbrz.h"
+#include "celup_lab_xbr.h"
 
 static float to_linear[256];
 static uint8_t to_srgb[4097];
@@ -34,7 +36,7 @@ static int blur_radius_set = 0;
 /* If set, tune blurcompress parameters from the input image itself. */
 static int auto_blurcompress = 0;
 /* Conservative peak-RSS guard; overridden by --max-mib. */
-static float max_mib = 512.f;
+static float max_mib = 2048.f;
 /* Reconstruction policy for checker/Nyquist-ambiguous cells in the adaptive
    mode.  LOWPASS is the natural-image default; SCALE2X is the crisp pixel-art
    option; AUTO picks between those two from global image statistics. */
@@ -5680,7 +5682,23 @@ static void upscale_edgecompress(const uint8_t *in, int sw, int sh,
         q[c] = base[c] + conf * (target[c] - base[c]);
         q[c] = clampf(q[c], lo[c], hi[c]);
       }
-      put(out + 4 * ((size_t)y * dw + x), q[0], q[1], q[2], q[3]);
+      /* Enforce strict local 3x3 envelope clamp to guarantee zero halos */
+        float sdf_lo[4] = {1e30f, 1e30f, 1e30f, 1e30f};
+        float sdf_hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
+        for (int dy = -1; dy <= 1; dy++) {
+          for (int dx = -1; dx <= 1; dx++) {
+            float p[4];
+            raw_pm(out, dw, dh, clampi(x + dx, 0, dw - 1), clampi(y + dy, 0, dh - 1), p);
+            for (int c = 0; c < 4; c++) {
+              if (p[c] < sdf_lo[c]) sdf_lo[c] = p[c];
+              if (p[c] > sdf_hi[c]) sdf_hi[c] = p[c];
+            }
+          }
+        }
+        for (int c = 0; c < 4; c++) {
+          q[c] = clampf(q[c], sdf_lo[c] - 1.5e-3f, sdf_hi[c] + 1.5e-3f);
+        }
+        put(out + 4 * ((size_t)y * dw + x), q[0], q[1], q[2], q[3]);
     }
   }
 }
@@ -6994,7 +7012,158 @@ static void print_help(const char *argv0) {
       "verbatim.\n",
       argv0);
 }
+
+/* xBR / xBRZ pixel art upscalers */
+static int upscale_xbr(const uint8_t *in, int sw, int sh, uint8_t *out,
+                       int dw, int dh) {
+  int f = (int)roundf((float)dw / (float)sw);
+  return xbr_scale(in, sw, sh, out, dw, dh, f) == 0;
+}
+
+static int upscale_xbrz(const uint8_t *in, int sw, int sh, uint8_t *out,
+                        int dw, int dh) {
+  int f = (int)roundf((float)dw / (float)sw);
+  return xbrz_scale(in, sw, sh, out, dw, dh, f) == 0;
+}
+
+/* Supersampled smooth mode - 4x4 area avg of triangle */
+static void upscale_smooth(const uint8_t *in, int sw, int sh, uint8_t *out,
+                           int dw, int dh) {
+  float spread = 1.f;
+  if (blur_radius_set) spread = clampf(blur_radius, 0.5f, 3.f);
+  int SS = spread > 1.8f ? 4 : (spread > 1.2f ? 3 : 2);
+  float inv = 1.f / (float)(SS * SS);
+  for (int y = 0; y < dh; y++) {
+    for (int x = 0; x < dw; x++) {
+      float acc[4] = {0,0,0,0};
+      for (int sy_sub = 0; sy_sub < SS; sy_sub++) {
+        for (int sx_sub = 0; sx_sub < SS; sx_sub++) {
+          float ox = (sx_sub + 0.5f) / (float)SS;
+          float oy = (sy_sub + 0.5f) / (float)SS;
+          float ox_eff = 0.5f + (ox - 0.5f) * spread;
+          float oy_eff = 0.5f + (oy - 0.5f) * spread;
+          float sx = ((float)x + ox_eff) * (float)sw / dw - 0.5f;
+          float sy = ((float)y + oy_eff) * (float)sh / dh - 0.5f;
+          int ix = (int)floorf(sx), iy = (int)floorf(sy);
+          float fx = sx - ix, fy = sy - iy;
+          float p[4][4], l[4];
+          for (int j = 0; j < 2; j++)
+            for (int i = 0; i < 2; i++) {
+              int k = j * 2 + i;
+              raw_pm(in, sw, sh, ix + i, iy + j, p[k]);
+              l[k] = .2126f * p[k][0] + .7152f * p[k][1] + .0722f * p[k][2] + .5f * p[k][3];
+            }
+          float gx = l[1] + l[3] - l[0] - l[2], gy = l[2] + l[3] - l[0] - l[1];
+          const float *a,*b,*c;
+          float wa,wb,wc;
+          if (gx * gy < 0) {
+            if (fx >= fy) { a=p[0]; b=p[1]; c=p[3]; wa=1-fx; wb=fx-fy; wc=fy; }
+            else { a=p[0]; b=p[2]; c=p[3]; wa=1-fy; wb=fy-fx; wc=fx; }
+          } else {
+            if (fx + fy <= 1) { a=p[0]; b=p[1]; c=p[2]; wa=1-fx-fy; wb=fx; wc=fy; }
+            else { a=p[3]; b=p[2]; c=p[1]; wa=fx+fy-1; wb=1-fx; wc=1-fy; }
+          }
+          for (int k = 0; k < 4; k++)
+            acc[k] += inv * (wa * a[k] + wb * b[k] + wc * c[k]);
+        }
+      }
+      put(out + 4 * ((size_t)y * dw + x), acc[0], acc[1], acc[2], acc[3]);
+    }
+  }
+}
+
+/* Intelligent multi-class classifier for hybrid mode */
+typedef enum {
+  IMG_TYPE_PIXEL_ART = 0,
+  IMG_TYPE_LINE_ART = 1,
+  IMG_TYPE_NATURAL_PHOTO = 2
+} image_type_t;
+
+static image_type_t classify_image_type(const uint8_t *in, int sw, int sh) {
+  size_t n_pixels = (size_t)sw * sh;
+  size_t sample_step = n_pixels / 50000 + 1;
+
+  /* 1. Unique color count */
+  uint32_t unique_colors[512];
+  int num_unique = 0;
+  for (size_t i = 0; i < n_pixels; i += sample_step) {
+    const uint8_t *p = in + i * 4;
+    uint32_t c = ((uint32_t)p[0]) | ((uint32_t)p[1] << 8) |
+                 ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    int found = 0;
+    for (int k = 0; k < num_unique; k++) {
+      if (unique_colors[k] == c) {
+        found = 1;
+        break;
+      }
+    }
+    if (!found) {
+      if (num_unique < 512)
+        unique_colors[num_unique++] = c;
+      else {
+        num_unique = 513;
+        break;
+      }
+    }
+  }
+
+  /* Hard pixel art check */
+  if (num_unique <= 256 && sw <= 512 && sh <= 512) {
+    return IMG_TYPE_PIXEL_ART;
+  }
+
+  /* 2. Structure tensor directional edge coherence check */
+  class_map_t cm;
+  if (build_class_map(in, sw, sh, &cm)) {
+    double sum_edge = 0.0, sum_coh = 0.0;
+    size_t count = 0;
+    for (size_t k = 0; k < n_pixels; k += sample_step) {
+      float e = cm.w_edge[k];
+      float c = cm.w_checker[k];
+      sum_edge += e;
+      if (e > 0.10f && c < 0.3f) {
+        float gx = cm.edge_gx[k], gy = cm.edge_gy[k];
+        float g2 = gx * gx + gy * gy;
+        if (g2 > 0.002f) {
+          sum_coh += e;
+        }
+      }
+      count++;
+    }
+    free_class_map(&cm);
+
+    double avg_edge = sum_edge / (count ? count : 1);
+    double avg_coh = sum_coh / (count ? count : 1);
+
+    /* Line art has clear directional contours */
+    if (avg_coh > 0.0005 || avg_edge > 0.005) {
+      return IMG_TYPE_LINE_ART;
+    }
+  }
+
+  return IMG_TYPE_NATURAL_PHOTO;
+}
+
+static int upscale_hybrid(const uint8_t *in, int sw, int sh, uint8_t *out,
+                          int dw, int dh, float scale) {
+  image_type_t type = classify_image_type(in, sw, sh);
+  int is_int_scale = (fabsf(scale - roundf(scale)) < 1e-4f);
+  int factor = (int)roundf(scale);
+
+  if (type == IMG_TYPE_PIXEL_ART && is_int_scale && factor >= 2 && factor <= 6) {
+    fprintf(stderr, "hybrid mode: classified as PIXEL_ART -> xBRZ %dx\n", factor);
+    return xbrz_scale(in, sw, sh, out, dw, dh, factor) == 0;
+  } else if (type == IMG_TYPE_NATURAL_PHOTO) {
+    fprintf(stderr, "hybrid mode: classified as NATURAL_PHOTO -> adaptive mode\n");
+    return upscale_adaptive(in, sw, sh, out, dw, dh);
+  } else {
+    fprintf(stderr, "hybrid mode: classified as LINE_ART / DRAWING -> autodeblur mode\n");
+    return upscale_autodeblur(in, sw, sh, out, dw, dh);
+  }
+}
+
 int main(int ac, char **av) {
+
   const char *mode = "cubic";
   int mode_explicit = 0;
   for (int i = 1; i < ac; i++)
@@ -7157,7 +7326,9 @@ int main(int ac, char **av) {
     }
     i += 2;
   }
-  if (strcmp(mode, "nearest") && strcmp(mode, "bilinear") &&
+  if (strcmp(mode, "hybrid") && strcmp(mode, "smart") && strcmp(mode, "auto") &&
+      strcmp(mode, "xbrz") && strcmp(mode, "xbr") && strcmp(mode, "smooth") &&
+      strcmp(mode, "nearest") && strcmp(mode, "bilinear") &&
       strcmp(mode, "linear") && strcmp(mode, "cubic") && strcmp(mode, "mitchell") &&
       strcmp(mode, "lanczos2") && strcmp(mode, "lanczos3") &&
       strcmp(mode, "compress") && strcmp(mode, "safecompress") &&
@@ -7263,7 +7434,27 @@ int main(int ac, char **av) {
     return 1;
   }
   int ok = 1;
-  if (!strcmp(mode, "nearest"))
+  if (!strcmp(mode, "hybrid") || !strcmp(mode, "smart") || !strcmp(mode, "auto"))
+    ok = upscale_hybrid(in, w, h, out, ow, oh, (float)scale);
+  else if (!strcmp(mode, "xbrz")) {
+    int f = (int)roundf((float)scale);
+    if (fabsf((float)scale - f) < 1e-4f && f >= 2 && f <= 6)
+      ok = upscale_xbrz(in, w, h, out, ow, oh);
+    else {
+      fprintf(stderr, "xbrz: scale %.2f not integer in [2,6]; fallback to bilinear\n", scale);
+      upscale_bilinear(in, w, h, out, ow, oh);
+    }
+  } else if (!strcmp(mode, "xbr")) {
+    int f = (int)roundf((float)scale);
+    if (fabsf((float)scale - f) < 1e-4f && f >= 2 && f <= 4)
+      ok = upscale_xbr(in, w, h, out, ow, oh);
+    else {
+      fprintf(stderr, "xbr: scale %.2f not integer in [2,4]; fallback to bilinear\n", scale);
+      upscale_bilinear(in, w, h, out, ow, oh);
+    }
+  } else if (!strcmp(mode, "smooth"))
+    upscale_smooth(in, w, h, out, ow, oh);
+  else if (!strcmp(mode, "nearest"))
     upscale_nearest(in, w, h, out, ow, oh);
   else if (!strcmp(mode, "bilinear"))
     upscale_bilinear(in, w, h, out, ow, oh);
