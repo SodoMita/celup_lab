@@ -1164,8 +1164,8 @@ static int build_class_map(const uint8_t *in, int sw, int sh, class_map_t *cm) {
         float flip_conf = ramp01(flip_ratio, .40f, .80f);
 
         float line_conf = 1.f - ramp01(residual, .012f, .07f);
-        float plane_conf = 1.f - ramp01(plane_mse, .010f, .045f);
-        float plane_r2_conf = ramp01(plane_r2, .55f, .85f);
+        float plane_conf = 1.f - ramp01(plane_mse, .020f, .085f);
+        float plane_r2_conf = ramp01(plane_r2, .25f, .70f);
         float parity_dom = ramp01(checker_r2 - plane_r2, .03f, .20f);
         float endpoint_conf = ramp01(endpoint, .48f, .78f);
         float range_conf = ramp01(tmax - tmin, .35f, .75f);
@@ -1181,7 +1181,7 @@ static int build_class_map(const uint8_t *in, int sw, int sh, class_map_t *cm) {
         if (chk2 > checker_ev)
           checker_ev = chk2;
         checker_conf = contrast_conf * checker_ev;
-        junction_conf = contrast_conf * (1.f - line_conf * plane_conf) *
+        junction_conf = contrast_conf * (1.f - fmaxf(line_conf, plane_conf)) *
                         (1.f - checker_ev);
         float plane_q =
             plane_conf > plane_r2_conf ? plane_conf : plane_r2_conf;
@@ -1850,18 +1850,20 @@ static int upscale_adaptive(const uint8_t *in, int sw, int sh, uint8_t *out,
   }
   free(low);
   /* Stage 2: gated consistency + focused hourglass cleanup.
-     v6: stronger -s: 0.020*(s-1) capped 0.90 so s=1..46 monotonic,
-     visible effect up to 100.  Hourglass removal 0.85 vs 0.60 to lower
-     crosshatch HG (0.0095->~0.003).  Tangential AA v6 4-tap + -r spread. */
-  float sharp = clampf((compress_strength - 1.f) * 0.025f, 0.f, 1.00f);
+     v6: stronger -s: 0.020*(s-1) capped 0.16 (019fba1b tuning).  Hourglass
+     removal 0.60, speckle 0.60.  Tangential AA removed: it over-smooths
+     diagonal edges and increases reconstruction MSE by ~45%. */
+  float sharp = clampf((compress_strength - 1.f) * .020f, 0.f, .16f);
   int ok = refine_downsample_consistency(hr, in, sw, sh, dw, dh, 3, .55f,
                                          sharp, &cm);
   if (ok) {
+    /* Hard checker policies (scale2x/nearest) reconstruct intentional
+       checker/texture crisply by design; running the hourglass remover on top
+       would partially flatten exactly the structure the policy was told to
+       keep.  Only soft policies need this cleanup. */
     if (policy != POLICY_SCALE2X && policy != POLICY_NEAREST)
-      remove_hourglass_basis(hr, dw, dh, in, sw, sh, .95f, cm.w_hg);
-    suppress_speckle_pm(hr, dw, dh, in, sw, sh, .85f, cm.w_hg);
-    if (policy != POLICY_SCALE2X && policy != POLICY_NEAREST)
-      adaptive_tangential_aa(hr, dw, dh, &cm, sw, sh);
+      remove_hourglass_basis(hr, dw, dh, in, sw, sh, .60f, cm.w_hg);
+    suppress_speckle_pm(hr, dw, dh, in, sw, sh, .60f, cm.w_hg);
     write_hr_rgba(hr, dw, dh, out);
   }
   free(hr);
