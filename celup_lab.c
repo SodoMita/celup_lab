@@ -3090,7 +3090,7 @@ static void sample_fn(const float *img, int w, int h, int nc, float x,
     }
 }
 static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
-                           int method) {
+                           int method, const uint8_t *in, int sw, int sh) {
   size_t n = (size_t)dw * dh;
   float *A = malloc(n * 4 * sizeof *A);
   float *DEL = malloc(n * 4 * sizeof *DEL);  /* flat + model colour delta */
@@ -3216,8 +3216,9 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
       float rho = lam > 1e-12f ? lam2 / lam : 0.f;
       /* Gate band tuned so long blurred arcs (rings/corner torture,
          face contours) keep full tangential averaging and only genuine
-         junctions/tips (rho >= ~.3 on a 3x3 tensor) lose it. */
-      float coh = 1.f - ss01((rho - .10f) * (1.f / .20f));
+         junctions/tips (rho >= ~.3 on a 3x3 tensor) lose it.
+         compress2x2 (method 5) bypasses this gate for uniform contours. */
+      float coh = (method == 5) ? 1.f : (1.f - ss01((rho - .10f) * (1.f / .20f)));
       float dirx = 1.f, diry = 0.f;
       if (lam > 1e-12f) {
         float vx = Jxy, vy = lam - Jxx;
@@ -3958,12 +3959,47 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                  plateau, evaluate the ORIGINAL profile there. */
               float z0 = (0.f - (float)mu) / s;
               float ufit0 = phi1(z0), nu;
-              if (method == 2 && k > 1.f)
+              if (method == 5) {
+                /* compress2x2: use the same k_ana steepening as 019fbf78.
+                   K maps steepness: K<=1 -> quantize, K>1 -> soften. */
+                float k_ana = k;
+                if (deblur_steepness > 0.f) {
+                  float K = deblur_steepness;
+                  if (K <= 1.0001f)
+                    k_ana = 1e5f;
+                  else
+                    k_ana = 1.f + 3.6f / (K - 1.f);
+                }
+                if (k_ana > 1e4f) {
+                  if (ufit0 < 0.5f) nu = 0.f;
+                  else if (ufit0 > 0.5f) nu = 1.f;
+                  else nu = 0.5f;
+                } else {
+                  nu = phi1(k_ana * z0);
+                }
+              } else if (method == 2 && k > 1.f)
                 nu = phi1(z0 + (ufit0 - .5f) * (k - 1.f) * 1.5f);
               else
                 nu = phi1(k * z0);
               nu = clampf(nu, 0.f, 1.f);
               wS = ss01((sb - s) / (sb - sa));
+              /* compress2x2 (method 5) uses a simplified trust gate:
+                 range-gated + crossing count, no erf RMSE check. */
+              if (method == 5) {
+                float lmed = .5f * (ul + ur);
+                int side = 0, cross = 0;
+                for (int j = 0; j < NS; j++) {
+                  if (side <= 0 && u[j] > lmed + .02f) {
+                    cross += side < 0;
+                    side = 1;
+                  } else if (side >= 0 && u[j] < lmed - .02f) {
+                    cross += side > 0;
+                    side = -1;
+                  }
+                }
+                wS *= 1.f - ss01(((float)cross - 2.25f) / 2.5f);
+                wS *= ss01((rng - 0.05f) / 0.10f);
+              } else
               /* Fit-trust: RMSE of the erf fit over the full lobe,
                  |du| weights (the weights concentrate the check on the
                  lobe core, which is what the steepening actually
@@ -4621,6 +4657,58 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
         float vv[4] = {0.f, 0.f, 0.f, 0.f},
               vblo[4] = {0.f, 0.f, 0.f, 0.f},
               vbhi[4] = {0.f, 0.f, 0.f, 0.f};
+        /* compress2x2 (method 5): compute bilinear 2x2 block projection delta.
+           For each output pixel, find the source 2x2 block, project onto the
+           two most-distant corner colors, and apply a steepening remap. */
+        float bil_delta[4] = {0.f, 0.f, 0.f, 0.f};
+        if (method == 5 && in) {
+          float sy = ((float)y + 0.5f) / scale - 0.5f;
+          float sx = ((float)x + 0.5f) / scale - 0.5f;
+          int ix = (int)floorf(sx), iy = (int)floorf(sy);
+          float fx = sx - (float)ix, fy = sy - (float)iy;
+          float p_colors[4][4], q_bil[4] = {0.f, 0.f, 0.f, 0.f};
+          for (int j = 0; j < 2; j++)
+            for (int i = 0; i < 2; i++) {
+              int k_cell = 2 * j + i;
+              float ww = (i ? fx : 1.f - fx) * (j ? fy : 1.f - fy);
+              raw_pm(in, sw, sh, ix + i, iy + j, p_colors[k_cell]);
+              for (int c = 0; c < 4; c++)
+                q_bil[c] += ww * p_colors[k_cell][c];
+            }
+          int ai = 0, bi = 1;
+          float best_dist = -1.f;
+          for (int a = 0; a < 4; a++)
+            for (int b = a + 1; b < 4; b++) {
+              float d_dist = 0.f;
+              for (int c = 0; c < 4; c++) {
+                float z = p_colors[b][c] - p_colors[a][c];
+                d_dist += z * z;
+              }
+              if (d_dist > best_dist) {
+                best_dist = d_dist;
+                ai = a;
+                bi = b;
+              }
+            }
+          if (best_dist > 1e-6f) {
+            float dot = 0.f;
+            for (int c = 0; c < 4; c++)
+              dot += (q_bil[c] - p_colors[ai][c]) * (p_colors[bi][c] - p_colors[ai][c]);
+            float t_val = clampf(dot / best_dist, 0.f, 1.f);
+            float u_val = 0.f;
+            float K = deblur_steepness > 0.f ? deblur_steepness : (k > 1.0001f ? 1.f + 3.6f / (k - 1.f) : 1e6f);
+            if (K < 1.f) K = 1.f;
+            if (K <= 1.0001f) {
+              if (t_val < 0.5f) u_val = 0.f;
+              else if (t_val > 0.5f) u_val = 1.f;
+              else u_val = 0.5f;
+            } else {
+              u_val = clampf((t_val - 0.5f) / (1.f - 1.f / K) + 0.5f, 0.f, 1.f);
+            }
+            for (int c = 0; c < 4; c++)
+              bil_delta[c] = (u_val - t_val) * (p_colors[bi][c] - p_colors[ai][c]);
+          }
+        }
         float zg = CELUP_ZG_DEF, zaa = CELUP_ZAA_DEF, zmw = 0.f,
               zrmp = 0.f;
         int zno = 0;
@@ -4684,12 +4772,19 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           float t0 = off0e[c], t1 = off1e[c], tc = 0.f;
           if (t0 * t1 > 0.f)
             tc = fabsf(t0) < fabsf(t1) ? t0 : t1;
-          float v = clampf(o[c] + w * ((nu - ufit0) * d2[c]) +
+          float v;
+          if (method == 5) {
+            /* compress2x2: apply bilinear 2x2 block projection delta,
+               hull-clamped for safety. */
+            v = clampf(o[c] + w * bil_delta[c], blo, bhi);
+          } else {
+            v = clampf(o[c] + w * ((nu - ufit0) * d2[c]) +
                                vr * (uf0 * (1.f - nu) * off0e[c] +
                                      uf1 * nu * off1e[c]) +
                                w2v * gInn * uft * tc,
                            blo, bhi);
-          if (wpeel > 0.f)
+          }
+          if (method != 5 && wpeel > 0.f)
             v = clampf(v + wpeel * (atap[c] - v), blo, bhi);
           vv[c] = v;
           vblo[c] = blo;
@@ -4864,6 +4959,13 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
             float wz = ss01((evz - .10f) * (1.f / .4f)) *
                        ss01((alh - .30f) * (1.f / .25f)) *
                        fmaxf(ss01((mmu - a) * (1.f / .7f)), qq);
+            /* compress2x2 (method 5) bypasses the erf-gain post-map:
+               the bilinear 2x2 block projection already handles the
+               deblur directly, so the value-space erf-gain is not
+               needed and would interfere with the block projection. */
+            if (method == 5) {
+              wz = 0.f;
+            }
             float elo3[3], ehi3[3];
             for (int c = 0; c < 3; c++) {
               elo3[c] = vblo[c] + rcp * (adb_srclo[c] - vblo[c]);
@@ -5609,7 +5711,7 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
   int method = deblur_method;
   if (method)
     fprintf(stderr, "autodeblur method %s (manual)\n",
-            method == 1 ? "remap" : "push");
+            method == 1 ? "remap" : method == 2 ? "push" : method == 3 ? "analytical" : method == 4 ? "gradient" : method == 5 ? "compress2x2" : "?");
   if (!method) {
     /* Auto-choice over the implemented deblur methods with the same
        self-supervised 2x-downscale proxy the blur fit uses: whichever
@@ -5621,15 +5723,16 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
       uint8_t *recon = malloc((size_t)sw * sh * 4);
       double bs = 1e300;
       if (train && recon)
-        for (int m = 1; m <= 2; m++) {
+        for (int m = 1; m <= 5; m++) {
+          if (m == 3 || m == 4) continue; /* separate functions */
           if (!render_soft(train, tw, th, recon, sw, sh, fitted_kernel,
                            fitted_sigma, fitted_curve, fitted_cp))
             continue;
-          if (!autodeblur_pass(recon, sw, sh, (float)sw / tw, m))
+          if (!autodeblur_pass(recon, sw, sh, (float)sw / tw, m, train, tw, th))
             continue;
           double s = image_pm_mse(recon, in, sw, sh, 2);
           fprintf(stderr, "autodeblur method %s proxy MSE %.8g\n",
-                  m == 1 ? "remap" : "push", s);
+                  m == 1 ? "remap" : m == 2 ? "push" : m == 5 ? "compress2x2" : "?", s);
           if (s < bs) {
             bs = s;
             method = m;
@@ -5638,7 +5741,7 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
       free(train);
       free(recon);
       fprintf(stderr, "autodeblur auto-selected %s\n",
-              method == 1 ? "remap" : "push");
+              method == 1 ? "remap" : method == 2 ? "push" : method == 5 ? "compress2x2" : "?");
     }
   }
   last_deblur_method = method;
@@ -5646,7 +5749,7 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
     return autodeblur_analog(out, dw, dh);
   if (method == 4)
     return autodeblur_gradient_pass(out, dw, dh, (float)dw / sw);
-  return autodeblur_pass(out, dw, dh, (float)dw / sw, method);
+  return autodeblur_pass(out, dw, dh, (float)dw / sw, method, in, sw, sh);
 }
 
 /* ---------------------------------------------------------------------------
@@ -7792,14 +7895,22 @@ static void print_help(const char *argv0) {
       "                            autoblur fit toward enough blur for smooth\n"
       "                            edges, and adapts autodeblur steepness\n"
       "                            per edge\n"
-      "  -D, --deblur-method M     autodeblur method auto|remap|push|compress2x2\n"
+      "  -D, --deblur-method M     autodeblur method auto|remap|push|analytical|gradient|compress2x2\n"
       "                            (v4.9.2: 'remake' accepted as alias;\n"
       "                            default auto = 2x proxy picks per image);\n"
       "                            remap = evaluate the slope-steepened\n"
       "                            profile fit at the pixel's own position,\n"
       "                            push = evaluate the original fit at a\n"
       "                            position displaced toward the nearer\n"
-      "                            plateau (Anime4K push)\n"
+      "                            plateau (Anime4K push),\n"
+      "                            analytical = PCA power-sigmoid deblur\n"
+      "                            (best on pixel art, catastrophic on\n"
+      "                            photos),\n"
+      "                            gradient = global gradient walk + u-remap\n"
+      "                            (best compromise),\n"
+      "                            compress2x2 = bilinear 2x2 block\n"
+      "                            projection (best on photos, blurry\n"
+      "                            corners on pixel art)\n"
       "  -T, --texgain G           autodeblur lattice-texture crispening\n"
       "                            FLOAT 0..1 (default 0=off).  Hull-clamped\n"
       "                            crispening applied only where the 1D step\n"
@@ -7820,7 +7931,7 @@ static void print_help(const char *argv0) {
       "                                                 = R/min(K,8) (v4.9)\n"
       "  curve        validation-proxy fit              -c (any value but auto)\n"
       "  curve param  fit                               -p P\n"
-      "  method       2x-downscale proxy MSE            -D remap|push\n"
+      "  method       2x-downscale proxy MSE            -D remap|push|analytical|gradient|compress2x2\n"
       "  steepness    -s formula, or -e per edge        -g K (exact float,\n"
       "                                                 1..64)\n"
       "  Only the unpinned parameters are fitted.  Every effective value is\n"
@@ -8095,11 +8206,12 @@ int main(int ac, char **av) {
         deblur_method = 1;
       else if (!strcmp(av[i + 1], "push"))
         deblur_method = 2;
-      else if (!strcmp(av[i + 1], "compress2x2") ||
-               !strcmp(av[i + 1], "analytical"))
+      else if (!strcmp(av[i + 1], "analytical"))
         deblur_method = 3;
       else if (!strcmp(av[i + 1], "gradient"))
         deblur_method = 4;
+      else if (!strcmp(av[i + 1], "compress2x2"))
+        deblur_method = 5;
       else {
         fprintf(stderr, "Unknown deblur method: %s\n", av[i + 1]);
         return 2;
@@ -8360,7 +8472,7 @@ int main(int ac, char **av) {
            fitted_cp);
     if (!strcmp(mode, "autodeblur") &&
       strcmp(mode, "jinc2_bilateral") && strcmp(mode, "jinc2_auto")) {
-      printf(", method=%s", last_deblur_method == 2 ? "push" : last_deblur_method == 3 ? "analytical" : last_deblur_method == 4 ? "gradient" : "remap");
+      printf(", method=%s", last_deblur_method == 2 ? "push" : last_deblur_method == 3 ? "analytical" : last_deblur_method == 4 ? "gradient" : last_deblur_method == 5 ? "compress2x2" : "remap");
       if (last_deblur_k > 0.f)
         printf(", steepness=%.2f%s", last_deblur_k,
                deblur_steepness > 0.f ? "(manual)" : "");
