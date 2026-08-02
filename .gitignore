@@ -3,8 +3,19 @@ __pycache__/
 *.pyc
 celup_lab
 celup_lab_baseline
+celup_18
 *.o
 docs/*.png
+docs/*.webp
 *.png
+# test fixtures are regenerated bit-exactly by tests/make_test_sources.py
+tests/*_src.webp
 tests/*.webp
 tests/*.png
+tests/miya_face*.webp
+# generated comparison-sheet outputs
+images/comparison_sheets/
+comparison_sheets/
+comparison_sheets_examples.md
+# regenerable regression working output (the *_MASTER_*.txt are pinned refs)
+autodeblur_regression.txt

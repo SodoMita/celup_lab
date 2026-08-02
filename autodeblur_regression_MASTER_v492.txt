@@ -1,0 +1,52 @@
+fixture          mae_base   sharp_rt  hull_viol
+step48            0.00236      1.200        192
+cornerstar48      0.02413      2.162         57
+huearc48          0.00002      1.000          0
+rampnoise48       0.00007      1.022          0
+twoline48         0.00619      1.640          0
+caps48            0.00935      1.483          2
+diagline48(2.3,g16)          -          -          -  jump95=0.016
+huearc48 keep = 1.000 (deblur 0.9798 / base 0.9798)
+rampnoise48 hf_noise = 0.00334
+
+{
+ "_meta": "autodeblur regression fingerprint",
+ "step48": {
+  "mae_vs_base": 0.0023564393188436742,
+  "sharp_ratio": 1.1999401402611107,
+  "hull_viol": 192
+ },
+ "cornerstar48": {
+  "mae_vs_base": 0.024129498259148573,
+  "sharp_ratio": 2.1618165974013155,
+  "hull_viol": 57
+ },
+ "huearc48": {
+  "mae_vs_base": 2.3697791330156977e-05,
+  "sharp_ratio": 1.0,
+  "hull_viol": 0,
+  "hue_sat_base": 0.9798238226264502,
+  "hue_sat_deblur": 0.979818507073214,
+  "hue_keep": 0.9999945749908163
+ },
+ "rampnoise48": {
+  "mae_vs_base": 6.716060349788407e-05,
+  "sharp_ratio": 1.0219288405793985,
+  "hull_viol": 0,
+  "hf_noise": 0.003344138573480748
+ },
+ "twoline48": {
+  "mae_vs_base": 0.006185286279078363,
+  "sharp_ratio": 1.6401850268977858,
+  "hull_viol": 0
+ },
+ "caps48": {
+  "mae_vs_base": 0.009348304787243893,
+  "sharp_ratio": 1.4831749647919565,
+  "hull_viol": 2
+ },
+ "diagline48": {
+  "jump95": 0.016253087552557586,
+  "hue_sat": null
+ }
+}
