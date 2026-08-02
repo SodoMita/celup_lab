@@ -44,7 +44,7 @@ MAX_STEP = {                                # AA-band adjacent-step budget
     'nearest': 1.01, 'bilinear': .45, 'triangle': .45, 'cubic': .55,
     'mitchell': .65, 'lanczos3': .75, 'adaptive': .75, 'sdf': .85, 'msdf': .85, 'dsdf': .85,
     'autoblur': .45, 'autodeblur': .65, 'deblurcompress': .85,
-    'hourglasscompress': .85}
+    'hourglasscompress': .85, 'jinc2_bilateral': .75, 'jinc2_auto': .75}
 
 
 def lin(x):

@@ -1580,3 +1580,56 @@ Implement a **strict checker/crossing fallback mode** instead of another deblur:
 - Only apply deconv/detail boost where `patch_two_colour_confidence` is high and checker/junction confidence is low.
 
 This should trade some sharpness for artifact removal, which matches the user's latest feedback: current outputs are still too hourglass-prone even when sharper.
+
+# v4.9.6 update (2026-08-01): xBRZ pixel-art upscaler
+
+New `--mode xbrz`: Zenju xBRZ 1.8 cellular-automata upscaler, C port.
+Supports integer scale factors 2..6.  Preserves sharp corners and
+diagonal lines without the staircases that Lanczos/bicubic create on
+pixel art.
+
+Architecture:
+- 4x4 kernel with corner preprocessing (direction bias, dominant threshold)
+- Per-scale blend patterns (2x-6x) with 5 blend types: shallow/steep/both/diagonal/corner
+- Rotation support for all 4 corners of each output block
+- YCbCr distance LUT (5-bit compressed, ~128KB) for perceptual color matching
+- Alpha-weighted distance for transparency handling
+
+Comparison sheet: `comparison_sheets/sheet_xbrz_compare.webp` shows xBRZ vs
+bilinear/cubic/lanczos3/scale2x/autodeblur on the poor smiley at 2x.
+
+Build:
+  cc -O3 -DNDEBUG -std=c99 -march=native celup_lab.c celup_lab_xbrz.c -o celup_lab \
+    $(pkg-config --cflags --libs libwebp) -lm
+
+## xBRZ Implementation Notes
+
+The xBRZ implementation in `celup_lab_xbrz.c` is a C port of Zenju's xBRZ 1.8
+algorithm via the bell345/xbrz-rs Rust port. Key features:
+
+1. **YCbCr Perceptual Distance**: Uses a 5-bit compressed LUT (~128KB) for
+   fast perceptual color comparison. Handles alpha transparency by weighting
+   the distance based on alpha differences.
+
+2. **Corner Preprocessing**: Analyzes a 4x4 kernel around each source pixel
+   to determine which corners of the output block need blending. Uses
+   direction bias and dominant thresholds to distinguish shallow vs steep
+   edges.
+
+3. **Per-Scale Blend Patterns**: Each scale factor (2x-6x) has 5 blend types:
+   - shallow: for gentle slopes
+   - steep: for sharp edges
+   - both: for diagonal edges
+   - diagonal: for 45-degree lines
+   - corner: for isolated corners
+
+4. **Rotation Support**: Each of the 4 corners (tl, tr, bl, br) gets its own
+   blend decision. The kernel and blend info are rotated so each corner is
+   processed consistently.
+
+5. **Enhanced Corners**: Additional blend patterns provide stronger corner
+   handling for cleaner output.
+
+Performance: xBRZ is ~2-3x slower than bilinear but produces significantly
+better results on pixel art, preserving sharp corners and diagonal lines
+without staircases.

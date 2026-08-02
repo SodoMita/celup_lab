@@ -404,8 +404,8 @@ static void blur_pm(const uint8_t *in, int w, int h, int x, int y, float q[4]) {
   int r = (int)ceilf(3.f * blur_radius);
   if (r < 1)
     r = 1;
-  if (r > 12)
-    r = 12;
+  if (r > 32) /* v4.9.3: raised from 12 so large -r pins get full support */
+    r = 32;
   q[0] = q[1] = q[2] = q[3] = 0;
   float sum = 0, inv2 = 1.f / (2.f * blur_radius * blur_radius);
   for (int j = -r; j <= r; j++)
@@ -1431,7 +1431,10 @@ static void mitchell_bounded_sample(const uint8_t *in, int sw, int sh,
    only non-inventing choice is to remove the aliased band outright. */
 static float *alloc_lowpass_pm(const uint8_t *in, int sw, int sh,
                                float sigma) {
-  int r = clampi((int)ceilf(3.f * sigma), 1, 8);
+  /* v4.9.3: cap raised from 8 to 32 so large user-pinned sigmas (e.g.
+     -r 6) get their full kernel support instead of a hard truncated
+     Gaussian that re-quantizes the source lattice into staircase. */
+  int r = clampi((int)ceilf(3.f * sigma), 1, 32);
   size_t n = (size_t)sw * sh;
   float *tmp = malloc(n * 4 * sizeof *tmp), *dst = malloc(n * 4 * sizeof *dst);
   float *ker = malloc((size_t)(2 * r + 1) * sizeof *ker);
@@ -2060,6 +2063,11 @@ static float kernel_profile_1d(int kind, float sigma, float x) {
   }
 }
 
+/* v4.9.3: cap raised 8 -> 32.  The old cap truncated the Gaussian/B-spline
+   tails whenever sigma > ~2.7 (Gaussian: 3*2.7=8), producing a hard-edged
+   effective kernel that re-quantized the source lattice into visible
+   staircase on diagonal contours.  At sigma=6 the old cap captured ~82% of
+   the Gaussian mass; the new cap captures ~100%. */
 static int kernel_support_1d(int kind, float sigma) {
   switch (kind) {
   case BK_BOX: {
@@ -2068,7 +2076,7 @@ static int kernel_support_1d(int kind, float sigma) {
   }
   case BK_TRIANGLE: {
     float s = 1.1f * sigma + .5f;
-    return clampi((int)ceilf(s < 1.f ? 1.f : s), 1, 8);
+    return clampi((int)ceilf(s < 1.f ? 1.f : s), 1, 32);
   }
   case BK_BSPLINE: {
     float s = .9f * sigma + .25f;
@@ -2258,7 +2266,20 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
     return 0;
   }
   static const int kernels[] = {BK_BOX, BK_TRIANGLE, BK_GAUSSIAN, BK_BSPLINE};
-  static const float sigmas[] = {.15f, .30f, .50f, .75f, 1.10f, 1.60f};
+  /* When the user pins -r, that value is the ONLY sigma candidate (the
+     fixed grid below would skip every entry if the pinned value is not in
+     it, leaving kernel/curve fitting entirely bypassed). */
+  float pinned_sigma[1] = { *sigma };
+  const float *sigmas;
+  size_t n_sigmas;
+  static const float sigma_grid[] = {.15f, .30f, .50f, .75f, 1.10f, 1.60f};
+  if (blur_radius_set) {
+    sigmas = pinned_sigma;
+    n_sigmas = 1;
+  } else {
+    sigmas = sigma_grid;
+    n_sigmas = sizeof sigma_grid / sizeof sigma_grid[0];
+  }
   static const struct {
     int kind;
     float param;
@@ -2284,7 +2305,7 @@ static int auto_tune_soft_params(const uint8_t *in, int sw, int sh, int *kk,
                        CK_LINEAR, 0.f))
         continue;
       double score = image_pm_mse(recon, in, sw, sh, 2);
-      s1[ki * 6 + si] = score;
+      s1[ki * n_sigmas + si] = score;
       if (score < best) {
         best = score;
         best_k = kernels[ki];
@@ -3065,15 +3086,24 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
             hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f},
             mean[4] = {0, 0, 0, 0};
       for (int j = 0; j < NS; j++) {
-        float t = (float)(j - R), acc[4] = {0, 0, 0, 0};
+        float t = (float)(j - R), acc[4] = {0, 0, 0, 0}, wsum = 0.f;
+        /* v4.9.5: Gaussian tangential weights instead of uniform box.
+           Box filter creates hard edges at the tangent span boundary,
+           which can leave mild staircase residues on long diagonals.
+           Gaussian (sigma = Teff*0.6) tapers smoothly, giving center
+           samples more weight and producing cleaner contour averages. */
+        float tsigma = fmaxf((float)Teff * 0.6f, 0.5f);
+        float tinv2 = 1.f / (2.f * tsigma * tsigma);
         for (int to = -Teff; to <= Teff; to++) {
           float q[4];
           sample_pm(out, dw, dh, (float)x + t * dirx + (float)to * tanx,
                     (float)y + t * diry + (float)to * tany, q);
+          float wt = expf(-(float)(to * to) * tinv2);
           for (int c = 0; c < 4; c++)
-            acc[c] += q[c];
+            acc[c] += wt * q[c];
+          wsum += wt;
         }
-        float inv = 1.f / (2 * Teff + 1);
+        float inv = wsum > 1e-20f ? 1.f / wsum : 0.f;
         for (int c = 0; c < 4; c++) {
           C[j][c] = acc[c] * inv;
           mean[c] += C[j][c];
@@ -4863,6 +4893,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                   c0blo_dbg);
       }
     }
+  }
   /* Pass 2: tangential smoothing of the residual delta.  Fit jitter is
      already absorbed by the pass-1.5 consensus; this only polishes the
      small delta noise of the flat-flatten path and any rounding of the
@@ -4998,6 +5029,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
       }
       put(dst + 4 * idx, res[0], res[1], res[2], res[3]);
     }
+  }
   memcpy(out, dst, n * 4);
   free(dst);
   free(LOH);
@@ -6984,6 +7016,17 @@ static void print_help(const char *argv0) {
       "  dsdf          discrete/geometric signed distance field of plane\n"
       "                curves (Carrera et al. A1/G1 DSDF)\n"
       "  nearest       pixel art / hard 1px texture\n"
+      "  xbrz          Zenju xBRZ 1.8: cellular-automata pixel-art upscaler;\n"
+      "                integer scale 2..6, sharp corners, no halos\n"
+      "  xbr           Hyllian xBR: simpler cellular-automata pixel-art upscaler;\n"
+      "                integer scale 2..4, sharp corners, no halos\n"
+      "  jinc2_bilateral  Hyllian Jinc2-Bilateral: windowed-jinc 2-lobe +\n"
+      "                bilateral edge-preserving reconstruction (any scale);\n"
+      "                low ringing / hourglass, smooth diagonals\n"
+      "  jinc2_auto    jinc2_bilateral with WB/STR auto-tuned per image by a\n"
+      "                2x-downscale proxy (picks the lowest-stepladder pair\n"
+      "                among near-best reconstruction MSE)\n"
+      "  superxbr      Super XBR reference (this build: jinc2-bilateral)\n"
       "\n"
       "Modes -- other (accepted, but expect artifacts on art):\n"
       "  bilinear linear cubic mitchell lanczos2 lanczos3 blur\n"
@@ -7021,6 +7064,16 @@ static void print_help(const char *argv0) {
       "  -d, --adaptive-debug N    class-map debug bitmask 0..15: 1 drops\n"
       "                            the edge class, 2 checker, 4 junction,\n"
       "                            8 line; 0 = normal render\n"
+      "\n"
+      "Options (jinc2_bilateral / superxbr) -- all in [0,1]:\n"
+      "  --j2b-wa A                window A, default .50 (raise => more blur)\n"
+      "  --j2b-wb B                window B, default .88 (lower toward ~.80\n"
+      "                            kills the dither/staircase on flat art)\n"
+      "  --j2b-str S               bilateral strength, default 1.0 (lower to\n"
+      "                            ~.1-.3 reduces the stepladder on flat /\n"
+      "                            gradient-free images; also settable via\n"
+      "                            CELUP_J2B_STR)\n"
+      "  --j2b-ar R                anti-ringing amount, default 1.0 (0=off)\n"
       "\n"
       "Options (autoblur / autodeblur):\n"
       "  -k, --blur-kernel K       kernel box|triangle|gaussian|bspline|auto\n"
@@ -7395,6 +7448,22 @@ int main(int ac, char **av) {
         fprintf(stderr, "edge-goal must be in [0,8] (src px; 0=off)\n");
         return 2;
       }
+    } else if (!strcmp(av[i], "--j2b-wa") || !strcmp(av[i], "--j2b-wb") ||
+               !strcmp(av[i], "--j2b-str") || !strcmp(av[i], "--j2b-ar")) {
+      char *e;
+      float v = strtof(av[i + 1], &e);
+      if (*e || v < 0.f || v > 1.f) {
+        fprintf(stderr, "%s must be in [0,1]\n", av[i]);
+        return 2;
+      }
+      if (!strcmp(av[i], "--j2b-wa"))
+        j2b_wa = v;
+      else if (!strcmp(av[i], "--j2b-wb"))
+        j2b_wb = v;
+      else if (!strcmp(av[i], "--j2b-str"))
+        j2b_str = v;
+      else
+        j2b_ar = v;
     } else if (!strcmp(av[i], "--deblur-steepness") || !strcmp(av[i], "-g")) {
       char *e;
       deblur_steepness = strtof(av[i + 1], &e);
