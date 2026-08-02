@@ -3832,6 +3832,177 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
   return 1;
 }
 
+/* ---------------------------------------------------------------------------
+   autodeblur method 3 (ANALOG): a full-gradient analytical deblur.
+
+   The model: reconstruct image as gradients of 2 4-channel colours; push
+   each pair of starts and ends of gradients towards each other to increase
+   steepness.  There is no per-pixel gate anywhere: the WHOLE-image gradient
+   is produced, edited analytically, and the image is re-sampled from the
+   edited gradient.
+
+   Pipeline (all at target resolution on the premultiplied-linear base A):
+   1. PRODUCE the full image gradient: compute the global colour axis as the
+      dominant 4-D eigenvector (power iteration) of the colour covariance of
+      A, and project every pixel onto it:  p = (A-mean) . axis.
+   2. Reconstruct the scalar level field u = normalized p over the image.
+      For a 2-colour source u is exactly the blend coordinate (0 on one
+      plateau, 1 on the other) and its 0.5 isophote is the geometric edge
+      centre.
+   3. EDIT the gradient (the "push"): apply the monotone power-sigmoid
+      remap  up = R(u) = u^g / (u^g + (1-u)^g).  R pushes the start (u=0)
+      and end (u=1) of every transition toward each other: steepness grows
+      with g, and at the limit g -> inf R is a hard threshold that
+      QUANTISES the image to its two local colours.  The deblur value is
+      INVERTED for this method: v = -g, q = 1/v, g = 1/(1-q).  So v=1
+      (q=1) is the MAXIMUM push; v>1 (q<1) is WEAKER; 0 is auto.
+   4. SAMPLE from the edited gradient:  out = A + (up - u) * span * axis.
+      Because f = mean + p*axis along the axis, this equals
+      mean + (pmin + up*span)*axis: the along-axis colour component is
+      exactly remapped by R(u) (so plateaus land on the two source colours
+      and quantise at v=1), and every perpendicular colour component passes
+      through UNCHANGED (hue texture, alpha, off-axis detail kept).  No
+      Poisson ring, no overshoot: (up-u) in [-1,1] and span is the measured
+      axis range, so the output cannot leave the source's own colour range
+      along the axis for a 2-colour source.
+--------------------------------------------------------------------------- */
+
+static float powersigmoid_float(float u, float g) {
+  /* R(u) = 1 / (1 + exp(g * ln((1-u)/u))); stable for large g. */
+  if (g <= 1.0001f)
+    return u;
+  if (u <= 1e-9f)
+    return 0.f;
+  if (u >= 1.f - 1e-9f)
+    return 1.f;
+  float e = g * logf((1.f - u) / u);
+  if (e > 80.f)
+    return 0.f;
+  if (e < -80.f)
+    return 1.f;
+  return 1.f / (1.f + expf(e));
+}
+
+static int autodeblur_analog(uint8_t *out, int dw, int dh) {
+  size_t n = (size_t)dw * dh;
+  float *A = malloc(n * 4 * sizeof *A);
+  uint8_t *dst = malloc(n * 4);
+  if (!A || !dst) {
+    free(A);
+    free(dst);
+    return 0;
+  }
+  /* 1. read the base render as premultiplied-linear floats. */
+  for (int y = 0; y < dh; y++)
+    for (int x = 0; x < dw; x++) {
+      float q[4];
+      raw_pm(out, dw, dh, x, y, q);
+      for (int c = 0; c < 4; c++)
+        A[4 * ((size_t)y * dw + x) + c] = q[c];
+    }
+  /* 2. colour covariance -> dominant 4-D axis (power iteration). */
+  double mean[4] = {0, 0, 0, 0};
+  for (size_t k = 0; k < n; k++)
+    for (int c = 0; c < 4; c++)
+      mean[c] += A[4 * k + c];
+  for (int c = 0; c < 4; c++)
+    mean[c] /= (double)n;
+  double cov[4][4];
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 4; c++)
+      cov[r][c] = 0.0;
+  for (size_t k = 0; k < n; k++) {
+    double d[4];
+    for (int c = 0; c < 4; c++)
+      d[c] = A[4 * k + c] - mean[c];
+    for (int r = 0; r < 4; r++)
+      for (int c = 0; c < 4; c++)
+        cov[r][c] += d[r] * d[c];
+  }
+  double axis[4] = {1, 0, 0, 0}, anorm;
+  for (int it = 0; it < 16; it++) {
+    double v[4] = {0, 0, 0, 0}, mx = 0;
+    for (int r = 0; r < 4; r++) {
+      for (int c = 0; c < 4; c++)
+        v[r] += cov[r][c] * axis[c];
+      if (fabs(v[r]) > mx)
+        mx = fabs(v[r]);
+    }
+    if (mx < 1e-300)
+      break;
+    for (int c = 0; c < 4; c++)
+      axis[c] = v[c] / mx;
+  }
+  anorm = 0.0;
+  for (int c = 0; c < 4; c++)
+    anorm += axis[c] * axis[c];
+  if (anorm < 1e-12) {
+    axis[0] = 1.f;
+    axis[1] = axis[2] = axis[3] = 0.f;
+    anorm = 1.0;
+  } else
+    anorm = sqrt(anorm);
+  for (int c = 0; c < 4; c++)
+    axis[c] /= anorm;
+  /* 3. projection p and its range. */
+  double pmin = 1e300, pmax = -1e300;
+  for (size_t k = 0; k < n; k++) {
+    double p = 0.0;
+    for (int c = 0; c < 4; c++)
+      p += (A[4 * k + c] - mean[c]) * axis[c];
+    if (p < pmin)
+      pmin = p;
+    if (p > pmax)
+      pmax = p;
+  }
+  double span = (pmax > pmin) ? (pmax - pmin) : 1e-9;
+  /* Global per-channel hull of the base (its plateaus reach the source's
+     two colours): a safe, non-per-pixel clamp so the re-render can never
+     leave the source's own per-channel range (no new colours/halo). */
+  float glo[4] = {1e30f, 1e30f, 1e30f, 1e30f}, ghi[4] = {-1e30f, -1e30f,
+                                                          -1e30f, -1e30f};
+  for (size_t k = 0; k < n; k++)
+    for (int c = 0; c < 4; c++) {
+      if (A[4 * k + c] < glo[c])
+        glo[c] = A[4 * k + c];
+      if (A[4 * k + c] > ghi[c])
+        ghi[c] = A[4 * k + c];
+    }
+  /* 4. deblur value: v = -g; q = 1/v; g = 1/(1-q).  v=1 is the max push. */
+  float qv;
+  if (deblur_steepness > 0.f)
+    qv = 1.f / deblur_steepness; /* -g 1 -> max, higher -> weaker */
+  else
+    qv = 0.85f; /* auto: a strong-but-not-quantising default */
+  if (qv > 0.99999f)
+    qv = 0.99999f;
+  if (qv < 0.f)
+    qv = 0.f;
+  float g = 1.f / (1.f - qv);
+  last_deblur_k = deblur_steepness > 0.f ? deblur_steepness : -1.f;
+  /* 5. re-render from the edited gradient. */
+  for (int y = 0; y < dh; y++)
+    for (int x = 0; x < dw; x++) {
+      size_t k = (size_t)y * dw + x;
+      double p = 0.0;
+      for (int c = 0; c < 4; c++)
+        p += (A[4 * k + c] - mean[c]) * axis[c];
+      float u = clampf((float)((p - pmin) / span), 0.f, 1.f);
+      float up = powersigmoid_float(u, g);
+      float res[4];
+      for (int c = 0; c < 4; c++) {
+        res[c] = A[4 * k + c] + (up - u) * (float)span * (float)axis[c];
+        res[c] = clampf(res[c], glo[c], ghi[c]);
+        res[c] = clampf(res[c], 0.f, 1.f);
+      }
+      put(dst + 4 * k, res[0], res[1], res[2], res[3]);
+    }
+  memcpy(out, dst, n * 4);
+  free(dst);
+  free(A);
+  return 1;
+}
+
 static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
                               int dw, int dh) {
   /* v6.4 photo detection: if image is photo-like (not pixel-art, many soft links, many colours), reduce deblur strength to avoid plateau quantization */
@@ -3896,7 +4067,7 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
   }
   last_deblur_method = method;
   if (method == 3)
-    return autodeblur_analytic_pass(out, dw, dh, (float)dw / sw);
+    return autodeblur_analog(out, dw, dh);
   return autodeblur_pass(out, dw, dh, (float)dw / sw, method);
 }
 
@@ -6609,7 +6780,7 @@ int main(int ac, char **av) {
            fitted_cp);
     if (!strcmp(mode, "autodeblur") &&
       strcmp(mode, "jinc2_bilateral") && strcmp(mode, "jinc2_auto")) {
-      printf(", method=%s", last_deblur_method == 2 ? "push" : "remap");
+      printf(", method=%s", last_deblur_method == 2 ? "push" : last_deblur_method == 3 ? "analytical" : "remap");
       if (last_deblur_k > 0.f)
         printf(", steepness=%.2f%s", last_deblur_k,
                deblur_steepness > 0.f ? "(manual)" : "");
