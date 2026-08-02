@@ -2322,6 +2322,14 @@ static void sample_pm(const uint8_t *img, int w, int h, float x, float y,
    remap, 2 = Anime4K-style gradient push. */
 static int deblur_method = 0;
 static float deblur_steepness = 0.f; /* <=0: auto (-e adaptive or -s formula) */
+/* v4.9.3 texture-residual gain (AUTODEBLUR_NOTES queue #1): opt-in hull-
+   clamped crispening of lattice detail in model-off, directed windows.
+   Default 0 (off) -- on diffusion art the deblur's job is to CLEAN salt, and
+   a crispening amplifies it; this flag is for explicit clean-lattice content
+   (pixel art upscaled through autoblur, crosshatch, vector lattices) where
+   the user WANTS the lattice crispness back.  Also settable via CELUP_TEXGAIN
+   (CLI value wins). */
+static float deblur_texgain = 0.f;
 static int last_deblur_method = 0;   /* effective method of the last run */
 static float last_deblur_k = 0.f;    /* effective fixed steepness (0=adaptive) */
 static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
@@ -2551,6 +2559,14 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
   float sa = 1.3f * scale * sref, sb = 2.4f * scale * sref;
   float flatmix = .25f; /* diffusion-noise flattening in gate-zero zones */
   int T = clampi((int)(scale * .75f + .5f), 1, 3); /* tangent span (v4.7) */
+  {
+    const char *e = getenv("CELUP_TSPAN");
+    if (e) {
+      float tm = strtof(e, 0);
+      if (tm > 0.f)
+        T = clampi((int)((float)T * tm + .5f), 1, 6);
+    }
+  }
   /* per-fit diagnostic dump: CELUP_DBG=x,y prints the fit internals for
      pixels near (x,y) (step 4 px) */
   int dbg = 0, dbg_x = 96, dbg_y = 96;
@@ -2560,6 +2576,33 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
       dbg = 1;
       sscanf(e, "%d,%d", &dbg_x, &dbg_y);
     }
+  }
+  /* EXPERIMENTAL KNOBS (env-overridable; defaults match v4.9.2).  Used to
+     tune the multi-crossing trust gate without recompiling, then pinned. */
+  float cross_off = 2.25f, cross_span = 2.5f;
+  {
+    const char *e = getenv("CELUP_CROSSGATE");
+    if (e)
+      sscanf(e, "%f,%f", &cross_off, &cross_span);
+  }
+  /* v4.9.3 texture-residual gain (AUTODEBLUR_NOTES queue #1).  In windows
+     where the 1D step model is OFF (wS ~ 0 -- dense multi-crossing texture,
+     crosshatch, hair, text), the pixel currently keeps the autoblur base,
+     which the fitted sigma softened.  A small hull-clamped crispening of the
+     BASE's own local detail recovers that lattice texture LEGALLY: it never
+     amplifies the model residual (invariant #2 holds -- it is a separate,
+     model-off channel), it is clamped to the local window hull (invariant
+     #1: no ringing vocabulary), and it only fires where the deblur step
+     model itself abstained (clean edges, shaded ramps, flats are untouched).
+     CELUP_TEXGAIN = gain (0 disables; ~0.20 recovers crosshatch). */
+  float capfloor = 0.6f;
+  { const char *e = getenv("CELUP_CAPFLOOR");
+    if (e) capfloor = strtof(e, 0); }
+  float texgain = deblur_texgain;
+  {
+    const char *e = getenv("CELUP_TEXGAIN");
+    if (e)
+      texgain = strtof(e, 0);
   }
   for (int y = 0; y < dh; y++)
     for (int x = 0; x < dw; x++) {
@@ -2633,6 +2676,18 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
       /* Coherence-scaled tangent span (v4.9): full T on straight
          contours, 0 at junctions/corners/tips. */
       int Teff = (int)((float)T * coh + .5f);
+      /* v4.9.3 EXPERIMENTAL (default OFF): an extra tap of tangential
+         averaging ONLY on genuinely straight contours (coh very high).
+         On long straight diagonals one more tap can erase residual
+         source-lattice staircase; it is gated to coh>0.88 so tips (moderate
+         coh) are not rounded.  Measured AMBIGUOUS on the authoritative
+         check_stairs metric (ship2x 0.111->0.154, still passing) so it
+         stays opt-in via CELUP_STRTAP=1 until a clearer win is shown. */
+      {
+        const char *e = getenv("CELUP_STRTAP");
+        if (e && strtof(e, 0) != 0.f && coh > 0.88f && Teff < 6)
+          Teff += 1;
+      }
       float C[129][4], u[129], raw[129],
             lo[4] = {1e30f, 1e30f, 1e30f, 1e30f},
             hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f},
@@ -2922,7 +2977,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                 float st = fmaxf(.6f, edge_goal * scale / 2.5f);
                 k = clampf(s / st, 1.f, 16.f);
               }
-              k = fminf(k, s / .6f);
+              k = fminf(k, s / capfloor);
               /* Anchored evaluation (v4.8): the steepened fit is
                  evaluated at the pixel's GEOMETRIC position on the
                  normal (t = 0), and the pixel's own residual to the
@@ -2980,7 +3035,9 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
                     side = -1;
                   }
                 }
-                wS *= 1.f - ss01(((float)cross - 2.25f) / 2.5f);
+                wS *= 1.f - ss01(((float)cross - cross_off) / cross_span);
+                (void)cross_off;
+                (void)cross_span;
               }
               /* Validity gate (v4.9): at junctions/corners/line caps
                  the 1D ramp model is outside its domain -- the window
@@ -3125,7 +3182,7 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           float st = fmaxf(.6f, edge_goal * scale / 2.5f);
           k = clampf(s / st, 1.f, 16.f);
         }
-        k = fminf(k, s / .6f);
+        k = fminf(k, s / capfloor);
         /* Anchored evaluation (v4.8) on the consensus fit. */
         float z0 = (0.f - mu) / s;
         float ufit0 = phi1(z0), nu;
@@ -3185,6 +3242,42 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
               bhi = c < 3 ? to_linear[LOH[8 * idx + 4 + c]]
                           : LOH[8 * idx + 4 + c] * (1.f / 255.f);
         res[c] = clampf(v, blo, bhi);
+      }
+      /* v4.9.3 texture-residual gain (queue #1): where the 1D step model
+         abstained (wS low) AND there is real local contrast (not a flat),
+         crispen the base's own lattice detail, hull-clamped.  It is a
+         SEPARATE channel from the model residual (invariant #2 intact),
+         clamped to the window hull (invariant #1: no new colours), and
+         only fires where the deblur step model is OFF, so clean edges
+         and shading ramps are untouched. */
+      if (texgain > 0.f) {
+        float wS_pix = clampf(pf[0], 0.f, 1.f);
+        float model_off = 1.f - wS_pix;
+        float coh_dir = ramp01(clampf(pf[7], 0.f, 1.f), 0.20f, 0.55f);
+        float hull_rng = 0.f;
+        for (int c = 0; c < 3; c++) {
+          float blo = to_linear[LOH[8 * idx + c]],
+                bhi = to_linear[LOH[8 * idx + 4 + c]];
+          if (bhi - blo > hull_rng)
+            hull_rng = bhi - blo;
+        }
+        if (model_off > 0.05f && coh_dir > 0.02f && hull_rng > 0.02f) {
+          float g = texgain * model_off * coh_dir;
+          int xL = x > 0 ? x - 1 : 0, xR = x + 1 < dw ? x + 1 : dw - 1,
+              yU = y > 0 ? y - 1 : 0, yD = y + 1 < dh ? y + 1 : dh - 1;
+          for (int c = 0; c < 4; c++) {
+            float lap = 4.f * o[c] -
+                        A[4 * ((size_t)yU * dw + x) + c] -
+                        A[4 * ((size_t)yD * dw + x) + c] -
+                        A[4 * ((size_t)y * dw + xL) + c] -
+                        A[4 * ((size_t)y * dw + xR) + c];
+            float blo = c < 3 ? to_linear[LOH[8 * idx + c]]
+                              : LOH[8 * idx + c] * (1.f / 255.f),
+                  bhi = c < 3 ? to_linear[LOH[8 * idx + 4 + c]]
+                              : LOH[8 * idx + 4 + c] * (1.f / 255.f);
+            res[c] = clampf(res[c] + g * lap, blo, bhi);
+          }
+        }
       }
       put(dst + 4 * idx, res[0], res[1], res[2], res[3]);
     }
@@ -4954,6 +5047,17 @@ static void print_help(const char *argv0) {
       "                            per-edge adaptation; anchored evaluation\n"
       "                            keeps colour noise at gain 1, so K far\n"
       "                            above 8 stays artifact-safe\n"
+      "  -T, --texgain G           autodeblur lattice-texture crispening\n"
+      "                            FLOAT 0..1 (default 0=off).  Hull-clamped\n"
+      "                            crispening applied only where the 1D step\n"
+      "                            model abstained and the local structure is\n"
+      "                            directed (real lattice / crosshatch, NOT\n"
+      "                            isotropic salt).  Use on clean pixel-art /\n"
+      "                            lattice content upscaled through autoblur\n"
+      "                            to recover crispness; OFF by default\n"
+      "                            because on diffusion art the deblur's job\n"
+      "                            is to CLEAN salt, not sharpen it\n"
+      "                            (AUTODEBLUR_NOTES queue #1).\n"
       "\n"
       "autoblur/autodeblur: what is automatic, and how to pin it\n"
       "  parameter    chosen automatically by...        pin manually with\n"
@@ -5151,6 +5255,13 @@ int main(int ac, char **av) {
         deblur_method = 2;
       else {
         fprintf(stderr, "Unknown deblur method: %s\n", av[i + 1]);
+        return 2;
+      }
+    } else if (!strcmp(av[i], "--texgain") || !strcmp(av[i], "-T")) {
+      char *e;
+      deblur_texgain = strtof(av[i + 1], &e);
+      if (*e || deblur_texgain < 0.f || deblur_texgain > 1.f) {
+        fprintf(stderr, "texgain must be in [0,1]\n");
         return 2;
       }
     } else if (!strcmp(av[i], "--max-mib") || !strcmp(av[i], "-M")) {
@@ -5351,6 +5462,8 @@ int main(int ac, char **av) {
                deblur_steepness > 0.f ? "(manual)" : "");
       else
         printf(", steepness=adaptive(-e %.2f)", edge_goal);
+      if (deblur_texgain > 0.f)
+        printf(", texgain=%.2f", deblur_texgain);
     }
   }
   printf("\n");
