@@ -4801,21 +4801,33 @@ static float j2b_resampler(float x, float wa, float wb) {
     return wa * wb;
   return sinf(x * wa) * sinf(x * wb) / (x * x);
 }
+/* jinc2_bilateral tuning (Hyllian shader slider names).  Exposed as both
+   CLI flags and CELUP_J2B_* env vars.  On flat / gradient-free (hard
+   pixel-art) images the stepladder comes from the bilateral range term
+   snapping each output pixel onto the nearest source colour, re-quantising
+   the edge to the output lattice; lowering STR toward ~0.1-0.3 (and, if
+   needed, WB toward ~0.80) smooths the contour out. */
+static float j2b_wa = .50f, j2b_wb = .88f, j2b_str = 1.0f, j2b_ar = 1.0f;
 static void upscale_jinc2_bilateral(const uint8_t *in, int sw, int sh,
                                     uint8_t *out, int dw, int dh) {
-  const float WA = .5f, WB = .88f;
-  float wa = WA * CELUP_PI, wb = WB * CELUP_PI;
-  float STR = 1.0f, AR = 1.0f;
-  if (compress_strength > 1.f)
-    STR = 1.f + (compress_strength - 1.f) * .05f; /* -s gently raises STR */
+  float WA = j2b_wa, WB = j2b_wb, STR = j2b_str, AR = j2b_ar;
   {
-    const char *e = getenv("CELUP_J2B_STR");
+    const char *e = getenv("CELUP_J2B_WA");
+    if (e)
+      WA = strtof(e, NULL);
+    e = getenv("CELUP_J2B_WB");
+    if (e)
+      WB = strtof(e, NULL);
+    e = getenv("CELUP_J2B_STR");
     if (e)
       STR = strtof(e, NULL);
     e = getenv("CELUP_J2B_AR");
     if (e)
       AR = strtof(e, NULL);
   }
+  WA = WA < 0.f ? 0.f : (WA > 1.f ? 1.f : WA);
+  WB = WB < 0.f ? 0.f : (WB > 1.f ? 1.f : WB);
+  float wa = WA * CELUP_PI, wb = WB * CELUP_PI;
   float xscale = (float)sw / dw, yscale = (float)sh / dh;
   for (int y = 0; y < dh; y++) {
     float sy = (y + .5f) * yscale - .5f;
@@ -5129,6 +5141,16 @@ static void print_help(const char *argv0) {
       "                            the edge class, 2 checker, 4 junction,\n"
       "                            8 line; 0 = normal render\n"
       "\n"
+      "Options (jinc2_bilateral / superxbr) -- all in [0,1]:\n"
+      "  --j2b-wa A                window A, default .50 (raise => more blur)\n"
+      "  --j2b-wb B                window B, default .88 (lower toward ~.80\n"
+      "                            kills the dither/staircase on flat art)\n"
+      "  --j2b-str S               bilateral strength, default 1.0 (lower to\n"
+      "                            ~.1-.3 reduces the stepladder on flat /\n"
+      "                            gradient-free images; also settable via\n"
+      "                            CELUP_J2B_STR)\n"
+      "  --j2b-ar R                anti-ringing amount, default 1.0 (0=off)\n"
+      "\n"
       "Options (autoblur / autodeblur):\n"
       "  -k, --blur-kernel K       kernel box|triangle|gaussian|bspline|auto\n"
       "                            (default auto = fit)\n"
@@ -5332,6 +5354,22 @@ int main(int ac, char **av) {
         fprintf(stderr, "edge-goal must be in [0,8] (src px; 0=off)\n");
         return 2;
       }
+    } else if (!strcmp(av[i], "--j2b-wa") || !strcmp(av[i], "--j2b-wb") ||
+               !strcmp(av[i], "--j2b-str") || !strcmp(av[i], "--j2b-ar")) {
+      char *e;
+      float v = strtof(av[i + 1], &e);
+      if (*e || v < 0.f || v > 1.f) {
+        fprintf(stderr, "%s must be in [0,1]\n", av[i]);
+        return 2;
+      }
+      if (!strcmp(av[i], "--j2b-wa"))
+        j2b_wa = v;
+      else if (!strcmp(av[i], "--j2b-wb"))
+        j2b_wb = v;
+      else if (!strcmp(av[i], "--j2b-str"))
+        j2b_str = v;
+      else
+        j2b_ar = v;
     } else if (!strcmp(av[i], "--deblur-steepness") || !strcmp(av[i], "-g")) {
       char *e;
       deblur_steepness = strtof(av[i + 1], &e);
