@@ -8,7 +8,8 @@ inputs are the user's own assets from images/:
               (the same crop tests/make_miya_fixtures.py uses)
   smiley      "poor smiley.webp" (256x256 hard pixelated face)
   cat         cat.webp (400x400)
-  pikachu     pikachu.webp (474x831 cartoon)  -- the "1 other image"
+  femlineart  femlineart.webp center-cropped to the central square
+              (1350x1350)  -- the "1 other image"
 
 For each image the low-res source is upscaled by celup_lab at the chosen
 scale with every listed mode; the first row is the nearest (xN) source
@@ -46,10 +47,10 @@ MODE_LABELS = [m[0] for m in MODES]
 
 # image key -> (path, crop box or None, scale)
 IMAGES = {
-    "miya_face": ("images/miya_normal.webp", (240, 280, 560, 580), 2),
-    "smiley":    ("images/poor smiley.webp", None,                 4),
-    "cat":       ("images/cat.webp",         None,                 2),
-    "pikachu":   ("images/pikachu.webp",     None,                 2),
+    "miya_face":  ("images/miya_normal.webp", (240, 280, 560, 580), 2),
+    "smiley":     ("images/poor smiley.webp", None,                 4),
+    "cat":        ("images/cat.webp",         None,                 2),
+    "femlineart": ("images/femlineart.webp", (0, 459, 1350, 1809),  2),
 }
 
 
@@ -83,11 +84,17 @@ def load_source(path, box):
 def build_sheet(key, src, scale, td):
     out_imgs = []
     failures = {}
+    MAX_ROW_H = 1100  # cap each displayed row so huge sources stay manageable
     for label, mode, extra in MODES:
         out = td / f"{key}_{label}.webp"
         ok, err = run_mode(src, out, scale, mode, extra)
         if ok:
-            out_imgs.append((label, Image.open(out).convert("RGBA"), None))
+            img = Image.open(out).convert("RGBA")
+            w, h = img.size
+            if h > MAX_ROW_H:  # downscale very tall rows for a usable sheet
+                img = img.resize((max(1, w * MAX_ROW_H // h), MAX_ROW_H),
+                                 Image.Resampling.LANCZOS)
+            out_imgs.append((label, img, None))
         else:
             out_imgs.append((label, None, err))
     # reference = nearest upscale
