@@ -2681,7 +2681,7 @@ static void sample_fn(const float *img, int w, int h, int nc, float x,
     }
 }
 static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
-                           int method) {
+                           int method, const uint8_t *in, int sw, int sh) {
   size_t n = (size_t)dw * dh;
   float *A = malloc(n * 4 * sizeof *A);
   float *DEL = malloc(n * 4 * sizeof *DEL);  /* flat + model colour delta */
@@ -4250,6 +4250,58 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
         float vv[4] = {0.f, 0.f, 0.f, 0.f},
               vblo[4] = {0.f, 0.f, 0.f, 0.f},
               vbhi[4] = {0.f, 0.f, 0.f, 0.f};
+        float bil_delta[4] = {0.f, 0.f, 0.f, 0.f};
+        if (method == 3) {
+          float sy = ((float)y + 0.5f) / scale - 0.5f;
+          float sx = ((float)x + 0.5f) / scale - 0.5f;
+          int ix = (int)floorf(sx), iy = (int)floorf(sy);
+          float fx = sx - (float)ix, fy = sy - (float)iy;
+          float p_colors[4][4], q_bil[4] = {0.f, 0.f, 0.f, 0.f};
+          for (int j = 0; j < 2; j++)
+            for (int i = 0; i < 2; i++) {
+              int k_cell = 2 * j + i;
+              float ww = (i ? fx : 1.f - fx) * (j ? fy : 1.f - fy);
+              raw_pm(in, sw, sh, ix + i, iy + j, p_colors[k_cell]);
+              for (int c = 0; c < 4; c++)
+                q_bil[c] += ww * p_colors[k_cell][c];
+            }
+          int ai = 0, bi = 1;
+          float best_dist = -1.f;
+          for (int a = 0; a < 4; a++)
+            for (int b = a + 1; b < 4; b++) {
+              float d_dist = 0.f;
+              for (int c = 0; c < 4; c++) {
+                float z = p_colors[b][c] - p_colors[a][c];
+                d_dist += z * z;
+              }
+              if (d_dist > best_dist) {
+                best_dist = d_dist;
+                ai = a;
+                bi = b;
+              }
+            }
+          if (best_dist > 1e-6f) {
+            float dot = 0.f;
+            for (int c = 0; c < 4; c++)
+              dot += (q_bil[c] - p_colors[ai][c]) * (p_colors[bi][c] - p_colors[ai][c]);
+            float t_val = clampf(dot / best_dist, 0.f, 1.f);
+            
+            float u_val = 0.f;
+            float K = deblur_steepness > 0.f ? deblur_steepness : (k > 1.0001f ? 1.f + 3.6f / (k - 1.f) : 1e6f);
+            if (K < 1.f) K = 1.f;
+            if (K <= 1.0001f) {
+              if (t_val < 0.5f) u_val = 0.f;
+              else if (t_val > 0.5f) u_val = 1.f;
+              else u_val = 0.5f;
+            } else {
+              u_val = clampf((t_val - 0.5f) / (1.f - 1.f / K) + 0.5f, 0.f, 1.f);
+            }
+            
+            for (int c = 0; c < 4; c++) {
+              bil_delta[c] = (u_val - t_val) * (p_colors[bi][c] - p_colors[ai][c]);
+            }
+          }
+        }
         float zg = CELUP_ZG_DEF, zaa = CELUP_ZAA_DEF, zmw = 0.f,
               zrmp = 0.f;
         int zno = 0;
@@ -4305,17 +4357,17 @@ static int autodeblur_pass(uint8_t *out, int dw, int dh, float scale,
           float t0 = off0e[c], t1 = off1e[c], tc = 0.f;
           if (t0 * t1 > 0.f)
             tc = fabsf(t0) < fabsf(t1) ? t0 : t1;
+          float v;
           if (method == 3) {
-            vr = 0.f;
-            uft = 0.f;
-            wpeel = 0.f;
-          }
-          float v = clampf(o[c] + w * ((nu - ufit0) * d2[c]) +
+            v = clampf(o[c] + w * bil_delta[c], blo, bhi);
+          } else {
+            v = clampf(o[c] + w * ((nu - ufit0) * d2[c]) +
                                vr * (uf0 * (1.f - nu) * off0e[c] +
                                      uf1 * nu * off1e[c]) +
                                w2v * gInn * uft * tc,
                            blo, bhi);
-          if (wpeel > 0.f)
+          }
+          if (method != 3 && wpeel > 0.f)
             v = clampf(v + wpeel * (atap[c] - v), blo, bhi);
           vv[c] = v;
           vblo[c] = blo;
@@ -4731,7 +4783,7 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
           if (!render_soft(train, tw, th, recon, sw, sh, fitted_kernel,
                            fitted_sigma, fitted_curve, fitted_cp))
             continue;
-          if (!autodeblur_pass(recon, sw, sh, (float)sw / tw, m))
+          if (!autodeblur_pass(recon, sw, sh, (float)sw / tw, m, train, tw, th))
             continue;
           double s = image_pm_mse(recon, in, sw, sh, 2);
           fprintf(stderr, "autodeblur method %s proxy MSE %.8g\n",
@@ -4748,7 +4800,7 @@ static int upscale_autodeblur(const uint8_t *in, int sw, int sh, uint8_t *out,
     }
   }
   last_deblur_method = method;
-  return autodeblur_pass(out, dw, dh, (float)dw / sw, method);
+  return autodeblur_pass(out, dw, dh, (float)dw / sw, method, in, sw, sh);
 }
 
 /* ---------------------------------------------------------------------------
