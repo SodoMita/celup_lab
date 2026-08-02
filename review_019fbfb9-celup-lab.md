@@ -14,7 +14,7 @@
 
 ## 2. Key Technical Contributions & Architectural Changes
 
-### Clean CLI & Function Architecture for Analytical Mode
+### Clean CLI & Comparison Sheet Generator Architecture
 1. **CLI Flag & Documentation**:
    - Updates `--help` output and argument parser in `celup_lab.c` to accept `--deblur-method analytical` and `-D analytical`, setting `deblur_method = 3`.
    - Documents inverted steepness semantics in code comments and user help strings (`1 = max deblur`, higher values reduce deblur).
@@ -26,27 +26,24 @@
        return autodeblur_pass(out, dw, dh, scale, 3);
      }
      ```
-   - Routes `method == 3` through `autodeblur_pass()` without altering existing safety gates or blending pipelines.
+   - Routes `method == 3` through `autodeblur_pass()`, providing clean CLI plumbing without custom analytical math.
 
-3. **Comparison Sheet Auto-Splitting for Large Layouts**:
+3. **Comparison Sheet Auto-Splitting for Large Layouts (`commit 1293c23`)**:
    - In `make_lab_comparison_sheets.py`, adds intelligent image-dimension checks when generating combined multi-mode sheets.
    - If a composite sheet exceeds WebP's maximum canvas dimension (`16383px` in either width or height), the generator automatically splits the sheet into multi-part WebP files (`sheet_part1.webp`, `sheet_part2.webp`, etc.) rather than crashing or falling back to bloated PNG files.
+   - **Crucial Synergy with `019fc1ba`**: Because `origin/arena/019fc1ba-celup-lab` implemented the full mathematics of `-D analytic` but omitted comparison sheet generation, `019fbfb9`'s script upgrade is the exact missing link needed to visualize analytical deblur.
 
 ---
 
 ## 3. Head-to-Head Comparison with Similar Branches (Task Group 1)
 
-This branch shares its domain with **`origin/arena/019fbf78-celup-lab`**.
+This branch is evaluated against **`origin/arena/019fc1ba-celup-lab`** (true analytical math) and **`origin/arena/019fbf78-celup-lab`** (local 2x2 bilinear projection).
 
-| Evaluation Criterion | `origin/arena/019fbfb9-celup-lab` | `origin/arena/019fbf78-celup-lab` | Comparison Verdict |
-| :--- | :--- | :--- | :--- |
-| **Algorithmic Math (`method 3`)** | **Placeholder / Delegation**: Calls `autodeblur_pass(..., 3)` but does not implement S-curve crease-free mapping or 2x2 bilinear projection inside `autodeblur_pass`. | **Fully implemented math**: Explicit 2x2 bilinear projection, crease-free S-curve mapping, and contrast range gating. | **`019fbf78` wins** on algorithm completeness. |
-| **Code Cleanliness & History** | **Surgical 2-commit history** directly on top of `master`; zero merge clutter or unintended side effects. | Contains merge commits and experimental `v4.9.9 WIP` code from `019fba18`. | **`019fbfb9` wins** on git hygiene and isolation. |
-| **Sheet Generator Utilities** | Adds **auto-splitting for oversized WebP sheets** (`> 16383px`), solving a real libwebp limitation. | Prunes modes to best-scored methods but lacks automatic dimension splitting. | **`019fbfb9` wins** on Python generator robustness. |
-
-### Quantitative & Qualitative Assessment
-- **Why `019fbfb9`'s Python script improvement matters**: When stacking 30+ upscaling modes across large source images (like `miya_normal.webp`), total canvas height easily exceeds `16383px`. Without `019fbfb9`'s auto-split handling, `WebPEncodeLosslessRGBA` fails with an invalid-dimension error.
-- **Why `019fbfb9`'s C implementation is incomplete**: Because `019fbfb9` only added the CLI parser and `analytical_deblur_pass()` wrapper without adding `if (method == 3)` math inside `autodeblur_pass()`, running `-D analytical` on `019fbfb9` produces output identical to standard autodeblur.
+| Evaluation Criterion | `origin/arena/019fbfb9` (`stub & sheet split`) | `origin/arena/019fc1ba` (`full gradient narrowing`) | `origin/arena/019fbf78` (`2x2 bilinear projection`) | Comparison Verdict |
+| :--- | :--- | :--- | :--- | :--- |
+| **Algorithmic Math (`method 3`)** | **Placeholder / Delegation**: Calls `autodeblur_pass(..., 3)` without unique mathematical reconstruction logic. | **True Full-Image Gradient Narrowing**: Traces transitions along 4D normal to plateau colors `P0, P1` with inverted K semantics (`alpha = (K-1)/K`). | **Local unsharp behavior**: Local 2x2 bilinear projection that degenerates into another `autoblurcompress`. | **`019fc1ba` wins decisively** on mathematical correctness. |
+| **Comparison Sheet Utilities** | Adds **auto-splitting for oversized WebP sheets** (`> 16383px`) and includes `-D analytical` in mode sweep. | **Missing**: Did not update `make_lab_comparison_sheets.py`. | Prunes comparison modes to best-scored methods. | **`019fbfb9` wins** on sheet generator robustness and visual accessibility. |
+| **Code Hygiene & History** | **Surgical 2-commit history** directly on top of `master`; zero merge clutter. | Clean single-commit branch (`20ad551`) with extensive unit test suite. | Contains merge clutter and experimental `v4.9.9 WIP` autodeblur commits. | **Both `019fbfb9` and `019fc1ba` win on git hygiene**. |
 
 ---
 
@@ -62,7 +59,7 @@ This branch shares its domain with **`origin/arena/019fbf78-celup-lab`**.
 
 ## 5. Recommendation for `master` (Push-to-Master Verdict)
 
-### Verdict: **CHERRY-PICK RECOMMENDED (Python Sheet Auto-Split & CLI Boilerplate)**
+### Verdict: **CHERRY-PICK RECOMMENDED (Python Sheet Auto-Split `1293c23` + Pair with `019fc1ba` Math)**
 - **Justification**:
-  1. Cherry-pick commit **`1293c23`** (`make_lab_comparison_sheets.py` auto-splitting for large lossless WebP sheets) into `master` immediately. This is a pure utility upgrade with zero downsides.
-  2. For the `-D analytical` C code, adopt `019fbfb9`'s clean CLI parser and documentation string from commit **`ed6ae66`**, but pair it with the actual mathematical engine (`2x2 bilinear projection` and `crease-free S-curve mapping`) from **`019fbf78`**.
+  1. Cherry-pick commit **`1293c23`** (`make_lab_comparison_sheets.py` auto-splitting for large lossless WebP sheets) into `master` immediately. This resolves why `019fc1ba` was overlooked visually during review by enabling comparison sheets for analytical mode.
+  2. For the C implementation of `-D analytic` / `-D analytical`, use `019fbfb9`'s CLI parser strings (`ed6ae66`) paired with the genuine full-image gradient narrowing engine (`autodeblur_analytic_pass`) from **`origin/arena/019fc1ba-celup-lab`** (`20ad551`).
